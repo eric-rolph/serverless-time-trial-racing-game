@@ -8,6 +8,7 @@ node_modules/
 
 # Local wasm artifacts (CI builds canonical ones)
 /physics/out/
+/worker/assets/
 
 # Secrets — never commit credentials
 .env

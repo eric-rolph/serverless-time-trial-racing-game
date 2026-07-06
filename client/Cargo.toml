@@ -1,0 +1,44 @@
+[package]
+name = "sttr-client"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust client for the serverless time-trial racing game: wasmtime sim host, wgpu renderer, HID input, Ed25519 lap signing and WebSocket submission."
+
+[dependencies]
+# sim hosting
+wasmtime = "46"
+
+# rendering
+wgpu = "25"
+winit = "0.30"
+pollster = "0.4"
+glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+
+# input
+gilrs = "0.11"
+
+# signing / identity
+ed25519-dalek = "2"
+getrandom = "0.3"
+directories = "6"
+
+# submission
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# cli / errors
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.dev]
+# wgpu/wasmtime are unusable at opt-level 0 for a 400 Hz sim; keep deps optimized
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

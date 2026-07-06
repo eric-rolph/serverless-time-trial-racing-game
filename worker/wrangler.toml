@@ -1,0 +1,22 @@
+name = "sttr-referee"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+account_id = "0d47baeaa7616f08763e6ab8b13aec34"
+
+# 48k-tick replays take seconds of CPU — requires Workers Paid (30 s CPU).
+# On the free plan (10 ms) replay validation will exceed limits.
+
+kv_namespaces = [
+  { binding = "LEADERBOARD", id = "427a0d7959b741f3bda621d63196711b" }
+]
+
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+
+[[rules]]
+type = "Data"
+globs = ["**/*.bin"]
+
+[observability]
+enabled = true

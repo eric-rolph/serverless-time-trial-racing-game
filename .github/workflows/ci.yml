@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  worker:
+    name: Worker (typecheck + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm ci
+        working-directory: worker
+      - run: npm run check
+        working-directory: worker
+      - run: npm test
+        working-directory: worker
+
+  physics-native:
+    name: Physics kernel (native tests, ASan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: >
+          cmake -S physics -B physics/build -G Ninja
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build physics/build
+      - name: Run determinism + vehicle tests
+        run: ctest --test-dir physics/build --output-on-failure
+
+  physics-wasm:
+    name: Physics kernel (wasm build + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.10
+      - name: Build sim.wasm
+        run: bash physics/build_wasm.sh
+      - name: Wasm smoke test (node, same host class as Workers)
+        run: node physics/tests/wasm_smoke.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sim-wasm
+          path: physics/out/sim.wasm
+
+  client:
+    name: Rust client (check + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps for winit/gilrs
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+      - run: cargo check --locked
+        working-directory: client
+      - run: cargo test --locked
+        working-directory: client
+
+  trackgen:
+    name: Track generator (determinism check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r trackgen/requirements.txt
+      - name: Same seed twice => identical binary
+        run: |
+          python trackgen/generate_track.py --seed 12345 --out-dir /tmp/a
+          python trackgen/generate_track.py --seed 12345 --out-dir /tmp/b
+          python trackgen/pack_track.py /tmp/a/track.json
+          python trackgen/pack_track.py /tmp/b/track.json
+          cmp /tmp/a/track.bin /tmp/b/track.bin

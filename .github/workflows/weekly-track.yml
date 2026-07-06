@@ -1,0 +1,84 @@
+# The Automated Game Master: every Monday 00:00 UTC, generate a fresh procedural
+# track, compile it with the Box3D C17 kernel to wasm via Emscripten, and deploy
+# the referee Worker to Cloudflare's edge. The leaderboard rotates automatically
+# because KV keys are namespaced by track hash.
+
+name: Weekly Track Rotation
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Track seed override (default: ISO year+week)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Compute weekly seed
+        id: seed
+        run: |
+          SEED="${{ github.event.inputs.seed }}"
+          [ -z "$SEED" ] && SEED=$(date -u +%G%V)
+          echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+          echo "Track seed: $SEED"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r trackgen/requirements.txt
+
+      - name: Generate track
+        run: |
+          python trackgen/generate_track.py --seed ${{ steps.seed.outputs.seed }} \
+            --out-dir assets/tracks/week-${{ steps.seed.outputs.seed }}
+          python trackgen/pack_track.py \
+            assets/tracks/week-${{ steps.seed.outputs.seed }}/track.json
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.10
+
+      - name: Build sim.wasm (Box3D C17 -> Emscripten, strict IEEE fp)
+        run: bash physics/build_wasm.sh
+
+      - name: Wasm smoke test
+        run: node physics/tests/wasm_smoke.mjs
+
+      - name: Stage worker assets
+        run: |
+          mkdir -p worker/assets
+          cp physics/out/sim.wasm worker/assets/sim.wasm
+          cp assets/tracks/week-${{ steps.seed.outputs.seed }}/track.bin worker/assets/track.bin
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm ci
+        working-directory: worker
+
+      - name: Deploy referee Worker globally
+        run: npx wrangler deploy
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Commit generated track for provenance
+        run: |
+          git config user.name "game-master[bot]"
+          git config user.email "game-master@users.noreply.github.com"
+          git add assets/tracks/
+          git diff --cached --quiet || git commit -m "Weekly track rotation: seed ${{ steps.seed.outputs.seed }}"
+          git push
