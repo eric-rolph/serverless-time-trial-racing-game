@@ -1,0 +1,26 @@
+# Build outputs
+build/
+dist/
+target/
+*.o
+*.obj
+node_modules/
+
+# Local wasm artifacts (CI builds canonical ones)
+/physics/out/
+
+# Secrets — never commit credentials
+.env
+.dev.vars
+*.pem
+*.key
+
+# Tooling
+emsdk/
+__pycache__/
+.venv/
+.wrangler/
+
+# Editor
+.vscode/
+.idea/
