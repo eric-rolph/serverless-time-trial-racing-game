@@ -69,7 +69,13 @@ export function readBits(dv, bitOffset, size, signed) {
 export async function registerHidDevice(device) {
   if (sources.has(device)) return sources.get(device);
   if (!device.opened) await device.open();
-  const src = { axes: [], reportsSeen: 0, fields: buildAxisMap(device), lastRaw: "" };
+  const src = {
+    axes: [],
+    axesByReport: new Map(),
+    reportsSeen: 0,
+    fields: buildAxisMap(device),
+    lastRaw: "",
+  };
   sources.set(device, src);
   device.addEventListener("inputreport", (e) => {
     src.reportsSeen++;
@@ -80,11 +86,18 @@ export async function registerHidDevice(device) {
       src.lastRaw = `r${e.reportId}:` + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
       return;
     }
-    src.axes = fields.map((f) => {
-      const raw = readBits(e.data, f.bit, f.size, f.min < 0);
-      const span = f.max - f.min;
-      return span > 0 ? ((raw - f.min) / span) * 2 - 1 : 0;
-    });
+    // Devices interleave several report types (buttons in one, axes split
+    // across others) — merge per-report values into one stable array instead
+    // of letting the latest report overwrite everything.
+    src.axesByReport.set(
+      e.reportId,
+      fields.map((f) => {
+        const raw = readBits(e.data, f.bit, f.size, f.min < 0);
+        const span = f.max - f.min;
+        return span > 0 ? ((raw - f.min) / span) * 2 - 1 : 0;
+      }),
+    );
+    src.axes = [...src.axesByReport.keys()].sort((a, b) => a - b).flatMap((id) => src.axesByReport.get(id));
   });
   return src;
 }
@@ -128,11 +141,12 @@ export function hidDiagnostics() {
   return [...sources.entries()]
     .map(([d, s]) => {
       const vals = s.axes.length
-        ? ` [${s.axes.slice(0, 6).map((a) => a.toFixed(2)).join(",")}]`
+        ? ` [${s.axes.slice(0, 10).map((a) => a.toFixed(2)).join(",")}]`
         : s.lastRaw
           ? ` raw ${s.lastRaw}`
           : "";
-      return `${(d.productName || "device").slice(0, 22)}: ${s.fields.size ? [...s.fields.values()][0].length : 0} axes, ${s.reportsSeen} reports${vals}`;
+      const total = [...s.fields.values()].reduce((n, f) => n + f.length, 0);
+      return `${(d.productName || "device").slice(0, 22)}: ${total} axes, ${s.reportsSeen} reports${vals}`;
     })
     .join(" — ");
 }

@@ -95,7 +95,7 @@ export class Input {
       });
     }
     if (elapsed > 3200) {
-      if (c.best && c.bestDev > 0.25) {
+      if (c.best && c.bestDev > 0.15) {
         this.cal ??= {};
         this.cal[c.channel] = c.best;
         localStorage.setItem(CAL_KEY, JSON.stringify(this.cal));
@@ -105,9 +105,12 @@ export class Input {
             (c.noisy.size ? ` (ignored ${c.noisy.size} self-moving axes)` : ""),
         );
       } else {
-        this.onCalDone?.(
-          `${c.channel}: no movement seen (${c.noisy.size} noisy axes ignored) — wait for "move now", then move it`,
-        );
+        // Name the best candidate even when it missed the bar — this makes
+        // "nothing happened" failures diagnosable at a glance.
+        const seen = c.best
+          ? `largest movement: "${c.best.id.replace("WebHID ", "").split("(")[0].trim().slice(0, 22)}" axis ${c.best.axis} moved ${c.bestDev.toFixed(2)} (needs > 0.15)`
+          : "zero movement on every axis of every device";
+        this.onCalDone?.(`${c.channel}: not bound — ${seen}; ${c.noisy.size} noisy axes ignored`);
       }
       this.calibrating = null;
     }
