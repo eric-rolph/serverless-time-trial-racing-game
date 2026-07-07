@@ -53,9 +53,9 @@ export default {
       case "/":
         return json({
           service: "sttr-referee",
-          rev: 4,
+          rev: 5,
           track: trackHashHex,
-          endpoints: ["/api/submit (ws)", "/api/leaderboard", "/api/track/current", "/api/sim/current"],
+          endpoints: ["/api/submit (ws)", "/api/leaderboard", "/api/track/current", "/api/sim/current", "/api/replay?track&player"],
         });
 
       case "/api/sim/current":
@@ -66,6 +66,19 @@ export default {
             "access-control-allow-origin": "*",
           },
         });
+
+      case "/api/replay": {
+        const t = url.searchParams.get("track") ?? trackHashHex;
+        const player = url.searchParams.get("player") ?? "";
+        if (!/^[0-9a-f]{16}$/.test(t) || !/^[0-9a-f]{16}$/.test(player)) {
+          return json({ error: "bad track/player id" }, 400);
+        }
+        const bytes = await env.LEADERBOARD.get(`log:${t}:${player}`, "arrayBuffer");
+        if (!bytes) return json({ error: "no replay stored" }, 404);
+        return new Response(bytes, {
+          headers: { "content-type": "application/octet-stream", "access-control-allow-origin": "*" },
+        });
+      }
 
       case "/api/track/current":
         return new Response(trackBytes, {
@@ -220,7 +233,7 @@ async function processLog(
 
   // 5. Leaderboard ---------------------------------------------------------------
   const pubkeyHex = [...pubkey].map((b) => b.toString(16).padStart(2, "0")).join("");
-  const { rank } = await recordLap(env.LEADERBOARD, trackHashHex, {
+  const { improved, rank } = await recordLap(env.LEADERBOARD, trackHashHex, {
     pubkey: pubkeyHex,
     name: header.name,
     ticks: replay.lapTicks!,
@@ -228,6 +241,14 @@ async function processLog(
     submittedAt: new Date().toISOString(),
     flags: verdict.flags,
   });
+
+  // Replay viewer: persist the validated log so anyone can race this lap as a
+  // ghost. Input logs are public by design — they ARE the leaderboard entry.
+  if (improved) {
+    await env.LEADERBOARD.put(`log:${trackHashHex}:${pubkeyHex.slice(0, 16)}`, rawBytes.buffer as ArrayBuffer, {
+      expirationTtl: 30 * 24 * 3600,
+    });
+  }
 
   done({ type: "result", status: "accepted", lapTimeMs: ticksToMs(replay.lapTicks!), rank });
 }

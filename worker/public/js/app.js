@@ -4,7 +4,7 @@ import * as THREE from "../vendor/three.module.js";
 import { Sim, STATUS, DT_MS } from "./sim.js";
 import { parseTrack, buildTrackMeshes, Minimap, fnv1a64 } from "./track.js";
 import { Input, quantize } from "./input.js";
-import { buildLapLog, submitLap, fetchLeaderboard, fmtMs } from "./lap.js";
+import { buildLapLog, submitLap, fetchLeaderboard, fetchReplay, fmtMs } from "./lap.js";
 import { EngineAudio } from "./audio.js";
 import { FanatecFFB } from "./ffb.js";
 
@@ -105,7 +105,21 @@ function loadGhost() {
   }
 }
 
-function saveGhost(tickRecords, lapTicks) {
+/** Replay ticks through a scratch instance to get the per-tick lap-progress
+ *  curve (the delta-to-best lookup table). ~100 ms for a full lap. */
+async function buildProgress(dv, lapTicks) {
+  const scratch = await Sim.instantiate();
+  scratch.loadTrack(new Uint8Array(trackBuf));
+  scratch.reset();
+  const progress = new Float32Array(lapTicks);
+  for (let i = 0; i < lapTicks; i++) {
+    scratch.step(dv.getInt16(8 * i, true), dv.getUint16(8 * i + 2, true), dv.getUint16(8 * i + 4, true), dv.getUint16(8 * i + 6, true));
+    progress[i] = scratch.state().lapProgress;
+  }
+  return progress;
+}
+
+async function saveGhost(tickRecords, lapTicks) {
   const bytes = new Uint8Array(8 * lapTicks);
   const dv = new DataView(bytes.buffer);
   for (let i = 0; i < lapTicks; i++) {
@@ -114,20 +128,30 @@ function saveGhost(tickRecords, lapTicks) {
     dv.setUint16(8 * i + 4, tickRecords[i].brake, true);
     dv.setUint16(8 * i + 6, tickRecords[i].flags, true);
   }
-  // Rebuild the progress curve by replaying in a scratch instance (~100 ms).
-  return Sim.instantiate().then((scratch) => {
-    scratch.loadTrack(new Uint8Array(trackBuf));
-    scratch.reset();
-    const progress = new Float32Array(lapTicks);
-    for (let i = 0; i < lapTicks; i++) {
-      scratch.step(dv.getInt16(8 * i, true), dv.getUint16(8 * i + 2, true), dv.getUint16(8 * i + 4, true), dv.getUint16(8 * i + 6, true));
-      progress[i] = scratch.state().lapProgress;
-    }
-    localStorage.setItem(
-      BEST_KEY,
-      JSON.stringify({ lapTicks, ticksB64: b64encode(bytes), progressB64: b64encode(new Uint8Array(progress.buffer)) }),
-    );
-  });
+  const progress = await buildProgress(dv, lapTicks);
+  localStorage.setItem(
+    BEST_KEY,
+    JSON.stringify({ lapTicks, ticksB64: b64encode(bytes), progressB64: b64encode(new Uint8Array(progress.buffer)) }),
+  );
+}
+
+/** Replay viewer: download a leaderboard lap and race it as the ghost. */
+async function raceReplay(entry) {
+  try {
+    setStatus(`downloading ${entry.name}'s lap…`);
+    const buf = await fetchReplay(entry.pubkey.slice(0, 16));
+    const dv = new DataView(buf);
+    const tickCount = dv.getUint32(16, true);
+    const lapTicks = dv.getUint32(28 + 8 * tickCount, true);
+    const ticksDv = new DataView(buf, 20, 8 * tickCount);
+    const progress = await buildProgress(ticksDv, lapTicks);
+    sessionGhost = { lapTicks, ticks: ticksDv, progress };
+    sessionGhostName = entry.name;
+    await resetRun();
+    setStatus(`racing ${entry.name}'s ${fmtMs(entry.ms)} lap — beat the ghost! (R restarts, ghost stays)`, "ok");
+  } catch (err) {
+    setStatus(`replay: ${err.message}`, "bad");
+  }
 }
 
 // ---------------------------------------------------------------- game state
@@ -151,6 +175,9 @@ let ffb = null;
 let lastThrottle = 0;
 let sectorTicks = []; // ticks at S1/S2/S3 boundaries this run
 let prevCpMask = 0;
+let rolloverTicks = 0;
+let sessionGhost = null; // downloaded leaderboard lap (replay viewer)
+let sessionGhostName = null;
 
 async function resetRun() {
   sim.reset();
@@ -166,7 +193,8 @@ async function resetRun() {
   $("sectors").textContent = "";
   countdownMs = 3200;
 
-  ghost = loadGhost();
+  rolloverTicks = 0;
+  ghost = sessionGhost ?? loadGhost();
   ghostIdx = 0;
   if (ghost) {
     ghostSim ??= await Sim.instantiate().then((g) => (g.loadTrack(new Uint8Array(trackBuf)), g));
@@ -220,16 +248,27 @@ $("ffbConnect").addEventListener("click", async () => {
 $("ffbGain").addEventListener("input", () => { if (ffb) ffb.gain = Number($("ffbGain").value); });
 $("ffbInvert").addEventListener("change", () => { if (ffb) ffb.invert = $("ffbInvert").checked; });
 
+let boardEntries = [];
 async function refreshBoard() {
   try {
-    const entries = await fetchLeaderboard();
-    $("entries").innerHTML = entries.length
-      ? entries.slice(0, 10).map((e) => `<li><b>${fmtMs(e.ms)}</b> ${e.name.replace(/[<>&]/g, "")}</li>`).join("")
+    boardEntries = (await fetchLeaderboard()).slice(0, 10);
+    $("entries").innerHTML = boardEntries.length
+      ? boardEntries
+          .map(
+            (e, i) =>
+              `<li><b>${fmtMs(e.ms)}</b> ${e.name.replace(/[<>&]/g, "")} ` +
+              `<button class="race" data-i="${i}" title="race this lap as a ghost">▶</button></li>`,
+          )
+          .join("")
       : `<li class="sub">no laps yet — be first</li>`;
   } catch {
     $("entries").innerHTML = `<li class="sub">leaderboard unavailable</li>`;
   }
 }
+$("entries").addEventListener("click", (e) => {
+  const btn = e.target.closest("button.race");
+  if (btn) raceReplay(boardEntries[Number(btn.dataset.i)]);
+});
 refreshBoard();
 
 function fmtSectors(t) {
@@ -340,6 +379,15 @@ function advance(dtMs) {
     if (curr.pos[1] < fellOffY) {
       resetRun();
       setStatus("off into the void — respawned at the start line", "bad");
+      break;
+    }
+    // Rollover recovery: on its side/roof and stationary → respawn.
+    const [qx, , qz] = [curr.quat[0], curr.quat[1], curr.quat[2]];
+    const upY = 1 - 2 * (qx * qx + qz * qz);
+    rolloverTicks = upY < 0.35 && curr.speed < 1.0 ? rolloverTicks + 1 : 0;
+    if (rolloverTicks > 800) { // 2 s
+      resetRun();
+      setStatus("rolled over — respawned at the start line", "bad");
       break;
     }
   }

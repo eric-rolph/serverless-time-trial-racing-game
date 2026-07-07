@@ -25,6 +25,18 @@ MAX_GRADE = 0.08  # 8% — keeps the racing line drivable
 MIN_WIDTH_M = 8.0
 CHECKPOINT_FRACTIONS = (0.25, 0.5, 0.75)
 
+# Banking: corners lean into the turn, proportional to smoothed curvature.
+BANK_GAIN = 110.0  # rad of bank per (rad/m) of curvature
+MAX_BANK_RAD = 0.07  # ~4° — 8° proved flip-prone at speed
+CURVATURE_SMOOTH_WINDOW = 15  # samples (~37 m)
+
+# Kerbs: rumble strips on both edges through tight corners. The web client
+# mirrors KERB_KAPPA + the smoothing window to draw its striped visuals —
+# keep these three constants in sync with worker/public/js/track.js.
+KERB_KAPPA = 0.022  # 1/m — corners tighter than ~45 m radius get kerbs
+KERB_WIDTH_M = 1.1
+KERB_TOOTH_M = 0.02  # raised tooth height; alternating samples → rumble
+
 
 def catmull_rom_closed(points: np.ndarray, samples_per_seg: int = 200) -> np.ndarray:
     """Uniform Catmull-Rom through a closed control polygon."""
@@ -120,6 +132,22 @@ def generate(seed: int) -> dict:
         side = np.cross(up, tangent)
         side /= np.linalg.norm(side, axis=1, keepdims=True)
 
+        # Signed horizontal curvature (rad/m), heavily smoothed (circular).
+        t_next = np.roll(tangent, -1, axis=0)
+        kappa = (tangent[:, 0] * t_next[:, 2] - tangent[:, 2] * t_next[:, 0]) / SAMPLE_SPACING_M
+        kernel = np.ones(CURVATURE_SMOOTH_WINDOW) / CURVATURE_SMOOTH_WINDOW
+        kappa = np.convolve(np.tile(kappa, 3), kernel, mode="same")[n : 2 * n]
+
+        # Banking: rotate `up` about the tangent so the surface leans into the
+        # corner (inside edge drops). kappa > 0 = left turn; the normal must
+        # lean toward -side (left), hence the negation. side/up stay orthonormal.
+        bank = np.clip(-kappa * BANK_GAIN, -MAX_BANK_RAD, MAX_BANK_RAD)
+        cos_b, sin_b = np.cos(bank)[:, None], np.sin(bank)[:, None]
+        up_banked = up * cos_b + side * sin_b
+        side = np.cross(up_banked, tangent)
+        side /= np.linalg.norm(side, axis=1, keepdims=True)
+        up = up_banked / np.linalg.norm(up_banked, axis=1, keepdims=True)
+
         # Terrain ribbon: 4 vertex rows per sample (outer-L, edge-L, edge-R, outer-R).
         half = (width * 0.5)[:, None]
         rows = [
@@ -139,6 +167,39 @@ def generate(seed: int) -> dict:
                 # Wound so face normals point +Y (upward) for one-sided collision.
                 tris.append([a, c, b])
                 tris.append([b, c, d])
+        tris = list(tris)
+
+        # Kerbs: alternating-height rumble strips on BOTH edges through tight
+        # corners — the suspension chatter is the whole point (audio + FFB).
+        kerb_zone = np.abs(kappa) > KERB_KAPPA
+        verts_list = [verts]
+        base = len(verts)
+        for sign in (-1.0, 1.0):
+            i = 0
+            while i < n:
+                if not (kerb_zone[i] and kerb_zone[(i + 1) % n]):
+                    i += 1
+                    continue
+                # contiguous run of kerb samples
+                j = i
+                while j + 1 < n and kerb_zone[(j + 1) % n]:
+                    j += 1
+                if j - i >= 3:  # skip blips
+                    strip = []
+                    for k in range(i, j + 1):
+                        tooth = KERB_TOOTH_M * (k % 2)
+                        inner = pos[k] + side[k] * sign * (width[k] * 0.5)
+                        outer = pos[k] + side[k] * sign * (width[k] * 0.5 + KERB_WIDTH_M)
+                        strip.append(inner + up[k] * tooth)
+                        strip.append(outer + up[k] * tooth)
+                    for k in range(len(strip) // 2 - 1):
+                        a, b = base + 2 * k, base + 2 * k + 1
+                        c, d = base + 2 * k + 2, base + 2 * k + 3
+                        tris += [[a, c, b], [b, c, d]] if sign > 0 else [[a, b, c], [b, d, c]]
+                    verts_list.append(np.array(strip))
+                    base += len(strip)
+                i = j + 1
+        verts = np.vstack(verts_list)
         tris = np.array(tris, dtype=np.uint32)
 
         checkpoints = sorted(int(f * n) for f in CHECKPOINT_FRACTIONS)

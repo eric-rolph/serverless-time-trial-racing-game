@@ -85,6 +85,54 @@ export function buildTrackMeshes(track) {
     group.add(new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xdfe6f0 })));
   }
 
+  // Kerb visuals: red/white striped strips through tight corners. Mirrors the
+  // generator's rule (trackgen/generate_track.py: KERB_KAPPA, smoothing window)
+  // — the physical rumble geometry is in the terrain mesh; this is the paint.
+  const KERB_KAPPA = 0.022;
+  const KERB_SMOOTH = 15;
+  const KERB_WIDTH = 1.1;
+  const raw = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = track.tangent[i];
+    const t2 = track.tangent[(i + 1) % n];
+    raw[i] = (t[0] * t2[2] - t[2] * t2[0]) / 2.5;
+  }
+  const kappa = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let sum = 0;
+    for (let k = -((KERB_SMOOTH / 2) | 0); k <= (KERB_SMOOTH / 2) | 0; k++) sum += raw[(i + k + n) % n];
+    kappa[i] = sum / KERB_SMOOTH;
+  }
+  const kerbPos = [];
+  const kerbCol = [];
+  const red = [0.85, 0.2, 0.16], white = [0.92, 0.92, 0.9];
+  for (const sign of [-1, 1]) {
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      if (Math.abs(kappa[i]) <= KERB_KAPPA || Math.abs(kappa[j]) <= KERB_KAPPA) continue;
+      const col = i % 2 ? red : white;
+      const quad = [];
+      for (const s of [i, j]) {
+        const c = v3(track.center[s]), u = v3(track.up[s]), t = v3(track.tangent[s]);
+        const sd = new THREE.Vector3().crossVectors(u, t).normalize();
+        const inner = c.clone().addScaledVector(sd, sign * (track.width[s] * 0.5)).addScaledVector(u, 0.08);
+        const outer = c.clone().addScaledVector(sd, sign * (track.width[s] * 0.5 + KERB_WIDTH)).addScaledVector(u, 0.08);
+        quad.push(inner, outer);
+      }
+      // two tris: inner_i, outer_i, inner_j / outer_i, outer_j, inner_j
+      for (const vv of [quad[0], quad[1], quad[2], quad[1], quad[3], quad[2]]) {
+        kerbPos.push(vv.x, vv.y, vv.z);
+        kerbCol.push(...col);
+      }
+    }
+  }
+  if (kerbPos.length) {
+    const kg = new THREE.BufferGeometry();
+    kg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(kerbPos), 3));
+    kg.setAttribute("color", new THREE.BufferAttribute(new Float32Array(kerbCol), 3));
+    group.add(new THREE.Mesh(kg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })));
+  }
+
   // Start line + checkpoint gates: thin bright quads across the track.
   const gate = (i, color, opacity) => {
     const c = v3(track.center[i]), u = v3(track.up[i]), t = v3(track.tangent[i]);

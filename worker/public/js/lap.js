@@ -71,6 +71,14 @@ export async function fetchLeaderboard() {
   return (await r.json()).entries;
 }
 
+/** Download a leaderboard lap's validated input log (LAPLOG bytes). */
+export async function fetchReplay(player16) {
+  const r = await fetch(`/api/replay?player=${player16}`);
+  if (r.status === 404) throw new Error("no replay stored for this lap");
+  if (!r.ok) throw new Error(`replay: ${r.status}`);
+  return r.arrayBuffer();
+}
+
 export const fmtMs = (ms) => {
   const m = Math.floor(ms / 60000), s = Math.floor((ms % 60000) / 1000), f = Math.round(ms % 1000);
   return `${m}:${String(s).padStart(2, "0")}.${String(f).padStart(3, "0")}`;

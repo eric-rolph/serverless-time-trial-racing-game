@@ -92,6 +92,7 @@ for (const { name: key } of pending) {
         JSON.stringify({ pubkey: pubkeyHex, name: entry.name, ticks: lapTicks, ms: Math.round((lapTicks * 1000) / 400), submittedAt: entry.submittedAt, flags: entry.flags ?? [] }),
       );
       await kvPut(bestKey, String(lapTicks));
+      await kvPut(`log:${trackHashHex}:${pubkeyHex.slice(0, 16)}`, Buffer.from(log)); // replay viewer
       if (Number.isFinite(prevTicks)) await kvDelete(`lb:${trackHashHex}:${pad8(prevTicks)}:${pubkeyHex.slice(0, 16)}`);
       console.log(`ACCEPTED ${key}: ${entry.name} ${(lapTicks / 400).toFixed(3)}s (PB)`);
     } else {
