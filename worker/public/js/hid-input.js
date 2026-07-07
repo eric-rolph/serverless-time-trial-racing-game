@@ -41,7 +41,7 @@ export function buildAxisMap(device) {
             const simAxis = page === 0x02 && id >= 0xb0 && id <= 0xd0;
             const analogSpan = page !== 0x09 && max - min >= 255;
             if (genericAxis || simAxis || analogSpan) {
-              fields.push({ bit, size, min, max });
+              fields.push({ bit, size, min, max, usage });
             }
           }
           bit += size;
@@ -130,6 +130,32 @@ export function hidVirtualPads() {
     buttons: [],
     mapping: "",
     connected: device.opened,
+  }));
+}
+
+/** Full state dump for remote diagnostics (the panel's "send diagnostics"). */
+export function hidDump() {
+  return [...sources.entries()].map(([d, s]) => ({
+    product: d.productName,
+    vendorId: d.vendorId,
+    productId: d.productId,
+    opened: d.opened,
+    reportsSeen: s.reportsSeen,
+    lastRaw: s.lastRaw,
+    fields: [...s.fields.entries()].map(([rid, fs]) => ({
+      reportId: rid,
+      axes: fs.map((f) => ({
+        usage: `0x${(f.usage ?? 0).toString(16)}`,
+        bit: f.bit,
+        size: f.size,
+        min: f.min,
+        max: f.max,
+      })),
+    })),
+    axesByReport: [...s.axesByReport.entries()].map(([rid, vals]) => ({
+      reportId: rid,
+      values: vals.map((v) => +v.toFixed(3)),
+    })),
   }));
 }
 

@@ -67,6 +67,17 @@ export default {
           },
         });
 
+      case "/api/diag": {
+        // Remote-debug drop box: the setup panel uploads device state here so
+        // input problems can be diagnosed without screenshot ping-pong.
+        if (request.method !== "POST") return json({ error: "POST only" }, 405);
+        const body = await request.text();
+        if (body.length > 64 * 1024) return json({ error: "too large" }, 413);
+        const key = `diag:${new Date().toISOString()}`;
+        await env.LEADERBOARD.put(key, body, { expirationTtl: 7 * 24 * 3600 });
+        return json({ key });
+      }
+
       case "/api/replay": {
         const t = url.searchParams.get("track") ?? trackHashHex;
         const player = url.searchParams.get("player") ?? "";

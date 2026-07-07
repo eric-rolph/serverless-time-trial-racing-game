@@ -7,7 +7,7 @@ import { Input, quantize } from "./input.js";
 import { buildLapLog, submitLap, fetchLeaderboard, fetchReplay, fmtMs } from "./lap.js";
 import { EngineAudio } from "./audio.js";
 import { FanatecFFB } from "./ffb.js";
-import { addHidDevices, autoReconnectHid, hidDiagnostics, hidVirtualPads, registerHidDevice } from "./hid-input.js";
+import { addHidDevices, autoReconnectHid, hidDiagnostics, hidDump, hidVirtualPads, registerHidDevice } from "./hid-input.js";
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (text, cls = "info") => { $("statusText").textContent = text; $("statusText").className = cls; };
@@ -240,6 +240,29 @@ $("closeConfig").addEventListener("click", () => ($("config").style.display = "n
 $("clearCal").addEventListener("click", () => {
   input.clearCalibration();
   $("calMsg").textContent = "bindings cleared — detect each channel again";
+});
+$("sendDiag").addEventListener("click", async () => {
+  try {
+    const payload = {
+      ts: new Date().toISOString(),
+      ua: navigator.userAgent,
+      nativePads: [...(navigator.getGamepads?.() ?? [])]
+        .filter((g) => g && g.connected)
+        .map((g) => ({ id: g.id, mapping: g.mapping, axes: g.axes.map((a) => +a.toFixed(3)), buttons: g.buttons.length })),
+      hid: hidDump(),
+      bindings: input.cal,
+      lastCalibration: input.lastCalDebug ?? null,
+    };
+    const r = await fetch("/api/diag", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const { key } = await r.json();
+    $("calMsg").textContent = `diagnostics sent (${key}) — Claude can read it now`;
+  } catch (err) {
+    $("calMsg").textContent = `diag send failed: ${err.message}`;
+  }
 });
 $("addHid").addEventListener("click", async () => {
   try {

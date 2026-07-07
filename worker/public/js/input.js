@@ -63,6 +63,8 @@ export class Input {
       noisy: new Set(),
       best: null,
       bestDev: 0,
+      ticks: 0,
+      padsAtStart: pads.map((g) => `${g.id.slice(0, 30)}(${g.axes.length}ax)`),
       t0: performance.now(),
     };
     this.onCalDone = onDone;
@@ -73,6 +75,7 @@ export class Input {
   tickCalibration() {
     const c = this.calibrating;
     if (!c) return;
+    c.ticks++;
     const elapsed = performance.now() - c.t0;
     for (const gp of this.gamepads()) {
       let base = c.baselines.get(gp.index);
@@ -95,6 +98,16 @@ export class Input {
       });
     }
     if (elapsed > 3200) {
+      // Snapshot for remote diagnostics (sent via the panel's diag button).
+      this.lastCalDebug = {
+        channel: c.channel,
+        ticks: c.ticks,
+        elapsedMs: Math.round(elapsed),
+        bestDev: +c.bestDev.toFixed(3),
+        best: c.best ? { id: c.best.id, axis: c.best.axis } : null,
+        noisy: [...c.noisy],
+        padsAtStart: c.padsAtStart,
+      };
       if (c.best && c.bestDev > 0.15) {
         this.cal ??= {};
         this.cal[c.channel] = c.best;
@@ -142,14 +155,19 @@ export class Input {
 
   /** Latest sample as floats: steer -1..1, throttle/brake 0..1. */
   sample(dtSec) {
-    // Calibrated multi-device rig takes precedence.
-    if (this.cal?.steer) {
+    // Calibrated multi-device rig takes precedence — any bound channel
+    // activates it (unbound channels read 0 / fall back to keys).
+    if (this.cal && Object.keys(this.cal).length > 0) {
       const boundIds = new Set(CHANNELS.map((ch) => this.cal?.[ch]?.id).filter(Boolean));
       const present = [...boundIds].filter((id) => this.padById(id)).length;
+      // Keyboard stays usable for unbound channels (e.g. steer on keys while
+      // only pedals are bound).
+      const kbSteer = (this.keys.has("ArrowLeft") || this.keys.has("KeyA") ? -1 : 0) +
+                      (this.keys.has("ArrowRight") || this.keys.has("KeyD") ? 1 : 0);
       return {
-        steer: this.readChannel("steer", true) ?? 0,
-        throttle: this.readChannel("throttle", false) ?? 0,
-        brake: this.readChannel("brake", false) ?? 0,
+        steer: this.readChannel("steer", true) ?? kbSteer,
+        throttle: this.readChannel("throttle", false) ?? (this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0),
+        brake: this.readChannel("brake", false) ?? (this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0),
         handbrake: (this.readChannel("handbrake", false) ?? 0) > 0.5 || this.keys.has("Space"),
         device: `rig: ${present}/${boundIds.size} bound device(s) present`,
       };
