@@ -34,6 +34,14 @@ and redeploys the referee worldwide. Fresh leaderboard every week.
 | `trackgen/` | Python: seeded Catmull-Rom spline + terrain ribbon → TRK1 binary |
 | `docs/` | ARCHITECTURE, CONTRACTS (binding formats/ABI), DECISIONS (ADRs), SPEC-CHECKLIST |
 
+## Live deployment
+
+- Referee: `https://sttr-referee.ericrolph.workers.dev` (`/api/leaderboard`,
+  `/api/track/current`, `/api/sim/current`, `/api/submit` via WebSocket)
+- Always race with the **canonical** binaries the referee validates against:
+  `curl -O https://sttr-referee.ericrolph.workers.dev/api/sim/current` — a
+  self-built `sim.wasm` from a different compiler version will replay-mismatch.
+
 ## Quick start
 
 ```sh

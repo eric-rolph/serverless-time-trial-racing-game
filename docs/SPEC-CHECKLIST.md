@@ -79,7 +79,11 @@ Iteration counter and verification log at the bottom.
   sim_step-by-step, (b) Cloudflare edge V8 `sim_replay`, (c) Rust wasmtime —
   ADR-001's cross-platform determinism claim holds in practice.
 - Live artifacts: Worker `sttr-referee.ericrolph.workers.dev` (rev 4), KV entry
-  rank 1, GET /api/leaderboard returns it, GET /api/track/current serves TRK1.
+  rank 1, GET /api/leaderboard returns it, GET /api/track/current serves TRK1,
+  GET /api/sim/current serves the canonical binary (hash 5a45a4cbe4a24f45).
+- Live negative test: tampered lap-time claim with a VALID signature was
+  rejected `replay_mismatch/time_mismatch` — the edge replay, not crypto, is
+  what catches lying clients.
 - Honest residuals: (1) physical wheel hardware not exercised (no wheel attached
   during build; gilrs path is code-complete + keyboard fallback tested);
   (2) weekly cron fires next Monday — same steps as the manual deploy performed
