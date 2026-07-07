@@ -49,13 +49,18 @@ export class Input {
     return this.gamepads().find((g) => g.id === id) ?? null;
   }
 
-  /** Begin per-channel detection across ALL devices. */
+  /** Begin per-channel detection across ALL devices. Two phases:
+   *  0-700 ms  "hold still" — axes that move on their own get blacklisted
+   *            (some devices report rolling counters/noise as axes, which
+   *            would otherwise win every detection race);
+   *  0.7-3.2 s capture — largest deviation among quiet axes wins. */
   startCalibration(channel, onDone) {
     const pads = this.gamepads();
     if (!pads.length) return false;
     this.calibrating = {
       channel,
       baselines: new Map(pads.map((g) => [g.index, [...g.axes]])),
+      noisy: new Set(),
       best: null,
       bestDev: 0,
       t0: performance.now(),
@@ -68,6 +73,7 @@ export class Input {
   tickCalibration() {
     const c = this.calibrating;
     if (!c) return;
+    const elapsed = performance.now() - c.t0;
     for (const gp of this.gamepads()) {
       let base = c.baselines.get(gp.index);
       if (!base) {
@@ -76,26 +82,43 @@ export class Input {
       }
       gp.axes.forEach((v, i) => {
         const dev = Math.abs(v - base[i]);
+        const key = `${gp.index}:${i}`;
+        if (elapsed < 700) {
+          if (dev > 0.15) c.noisy.add(key); // self-moving axis: counter/noise
+          return;
+        }
+        if (c.noisy.has(key)) return;
         if (dev > c.bestDev) {
           c.bestDev = dev;
           c.best = { id: gp.id, axis: i, rest: base[i], ext: v };
         }
       });
     }
-    if (performance.now() - c.t0 > 2500) {
+    if (elapsed > 3200) {
       if (c.best && c.bestDev > 0.25) {
         this.cal ??= {};
         this.cal[c.channel] = c.best;
         localStorage.setItem(CAL_KEY, JSON.stringify(this.cal));
         const short = c.best.id.split("(")[0].trim().slice(0, 28);
-        this.onCalDone?.(`${c.channel} → "${short}" axis ${c.best.axis}`);
+        this.onCalDone?.(
+          `${c.channel} → "${short}" axis ${c.best.axis}` +
+            (c.noisy.size ? ` (ignored ${c.noisy.size} self-moving axes)` : ""),
+        );
       } else {
         this.onCalDone?.(
-          `${c.channel}: no movement seen on any device — wiggle it once first (browser hides idle devices), then retry`,
+          `${c.channel}: no movement seen (${c.noisy.size} noisy axes ignored) — wait for "move now", then move it`,
         );
       }
       this.calibrating = null;
     }
+  }
+
+  /** Human-readable current bindings for the setup panel. */
+  bindingSummary() {
+    if (!this.cal) return "no bindings yet";
+    return Object.entries(this.cal)
+      .map(([ch, c]) => `${ch}: ${c.id.replace("WebHID ", "").split("(")[0].trim().slice(0, 18)} ax${c.axis}`)
+      .join(" · ");
   }
 
   /** Read one calibrated channel from its own device. null = unbound/missing. */

@@ -225,11 +225,15 @@ addEventListener("pointerdown", () => audio.start());
 for (const btn of document.querySelectorAll("[data-cal]")) {
   btn.addEventListener("click", () => {
     const ch = btn.dataset.cal;
-    $("calMsg").textContent =
-      ch === "steer" ? "turn the wheel fully LEFT now…" : `press/pull the ${ch} fully now…`;
+    const action = ch === "steer" ? "turn the wheel fully LEFT" : `press/pull the ${ch} fully`;
     if (!input.startCalibration(ch, (msg) => ($("calMsg").textContent = msg))) {
       $("calMsg").textContent = "no devices visible — wiggle each one once (browser hides idle devices), then retry";
+      return;
     }
+    $("calMsg").textContent = `HOLD EVERYTHING STILL…`;
+    setTimeout(() => {
+      if (input.calibrating?.channel === ch) $("calMsg").textContent = `NOW ${action}!`;
+    }, 750);
   });
 }
 $("closeConfig").addEventListener("click", () => ($("config").style.display = "none"));
@@ -495,6 +499,7 @@ function frame(now) {
       : "none detected — wiggle each device once";
     const diag = hidDiagnostics();
     if (diag) $("hidDiag").textContent = diag + " — move a control; its report count should climb";
+    $("bindings").textContent = "bound → " + input.bindingSummary();
   }
 }
 
