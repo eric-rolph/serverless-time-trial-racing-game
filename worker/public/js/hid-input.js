@@ -25,16 +25,23 @@ export function buildAxisMap(device) {
         const usages = item.usages ?? [];
         for (let k = 0; k < count; k++) {
           const usage = usages[k] ?? (item.isRange ? (item.usageMinimum ?? 0) + k : undefined);
-          if (usage !== undefined && size >= 8) {
+          if (usage !== undefined && size >= 8 && fields.length < 24) {
             const page = usage >>> 16;
             const id = usage & 0xffff;
-            if (page === 0x01 && id >= 0x30 && id <= 0x39) {
-              fields.push({
-                bit,
-                size,
-                min: item.logicalMinimum ?? 0,
-                max: item.logicalMaximum ?? 2 ** size - 1,
-              });
+            const max = item.logicalMaximum ?? 2 ** size - 1;
+            const min = item.logicalMinimum ?? 0;
+            // Axis heuristic, deliberately generous — sim hardware scatters its
+            // axes across pages: Generic Desktop X..Slider, Simulation Controls
+            // (Steering 0xC8, Accel 0xC4, Brake 0xC5, Clutch 0xC6, Throttle
+            // 0xBB...), and Fanatec loves vendor-defined pages. Anything >= 8
+            // bits with a real analog span qualifies, except Button-page
+            // fields. Dead extra axes are harmless — the binder picks whatever
+            // MOVES.
+            const genericAxis = page === 0x01 && id >= 0x30 && id <= 0x38;
+            const simAxis = page === 0x02 && id >= 0xb0 && id <= 0xd0;
+            const analogSpan = page !== 0x09 && max - min >= 255;
+            if (genericAxis || simAxis || analogSpan) {
+              fields.push({ bit, size, min, max });
             }
           }
           bit += size;
@@ -62,12 +69,17 @@ export function readBits(dv, bitOffset, size, signed) {
 export async function registerHidDevice(device) {
   if (sources.has(device)) return sources.get(device);
   if (!device.opened) await device.open();
-  const src = { axes: [], reportsSeen: 0, fields: buildAxisMap(device) };
+  const src = { axes: [], reportsSeen: 0, fields: buildAxisMap(device), lastRaw: "" };
   sources.set(device, src);
   device.addEventListener("inputreport", (e) => {
-    const fields = src.fields.get(e.reportId);
-    if (!fields) return;
     src.reportsSeen++;
+    const fields = src.fields.get(e.reportId);
+    if (!fields) {
+      // Unknown report id — keep a hex peek so the layout can be diagnosed.
+      const bytes = new Uint8Array(e.data.buffer, e.data.byteOffset, Math.min(12, e.data.byteLength));
+      src.lastRaw = `r${e.reportId}:` + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+      return;
+    }
     src.axes = fields.map((f) => {
       const raw = readBits(e.data, f.bit, f.size, f.min < 0);
       const span = f.max - f.min;
@@ -108,10 +120,19 @@ export function hidVirtualPads() {
   }));
 }
 
-/** One-line health summary for the setup panel. */
+/** Health summary for the setup panel — live axis values make problems
+ *  self-evident: 0 reports = no data flow; 0 axes = descriptor not understood
+ *  (lastRaw hex shown for diagnosis); values frozen = wrong fields. */
 export function hidDiagnostics() {
   if (!sources.size) return null;
   return [...sources.entries()]
-    .map(([d, s]) => `${(d.productName || "device").slice(0, 22)}: ${s.axes.length} axes/${s.reportsSeen} reports`)
-    .join(" · ");
+    .map(([d, s]) => {
+      const vals = s.axes.length
+        ? ` [${s.axes.slice(0, 6).map((a) => a.toFixed(2)).join(",")}]`
+        : s.lastRaw
+          ? ` raw ${s.lastRaw}`
+          : "";
+      return `${(d.productName || "device").slice(0, 22)}: ${s.fields.size ? [...s.fields.values()][0].length : 0} axes, ${s.reportsSeen} reports${vals}`;
+    })
+    .join(" — ");
 }
