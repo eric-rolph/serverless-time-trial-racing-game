@@ -31,9 +31,19 @@ export class Input {
     addEventListener("keyup", (e) => this.keys.delete(e.code));
   }
 
-  /** All connected gamepads (each USB device of a rig is its own entry). */
+  /** Register a function returning a gamepad-shaped object (or null) — used
+   *  for WebHID-backed devices that Chrome hides from the Gamepad API once a
+   *  page opens them (the FFB wheel). */
+  setVirtualPad(fn) {
+    this.virtualPad = fn;
+  }
+
+  /** All connected input devices: native gamepads + WebHID virtual pads. */
   gamepads() {
-    return [...(navigator.getGamepads?.() ?? [])].filter((g) => g && g.connected);
+    const pads = [...(navigator.getGamepads?.() ?? [])].filter((g) => g && g.connected);
+    const virtual = this.virtualPad?.();
+    if (virtual?.connected) pads.push(virtual);
+    return pads;
   }
 
   padById(id) {

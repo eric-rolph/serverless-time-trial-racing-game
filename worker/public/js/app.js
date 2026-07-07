@@ -239,13 +239,17 @@ $("ffbConnect").addEventListener("click", async () => {
     if (ffb) {
       await ffb.stop();
       ffb = null;
+      input.setVirtualPad(null);
       $("ffbConnect").textContent = "connect wheel FFB";
       $("ffbMsg").textContent = "disconnected";
       return;
     }
     ffb = await FanatecFFB.connect();
+    // Chrome hides WebHID-opened devices from the Gamepad API — expose this
+    // device's decoded HID axes to the binder as a virtual pad instead.
+    input.setVirtualPad(() => ffb?.virtualPad() ?? null);
     $("ffbConnect").textContent = "disconnect FFB";
-    $("ffbMsg").textContent = `connected: ${ffb.device.productName || "Fanatec base"} — drive to feel torque`;
+    $("ffbMsg").textContent = `connected: ${ffb.device.productName || "Fanatec base"} — now re-detect steering above (move the wheel)`;
   } catch (err) {
     $("ffbMsg").textContent = `FFB: ${err.message}`;
   }
@@ -448,6 +452,11 @@ function frame(now) {
   if (ffb) {
     ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque(), dtMs / 1000);
     $("mFfb").value = ffb.smoothed / ffb.maxNm;
+    if ($("config").style.display === "block") {
+      $("ffbMsg").textContent =
+        `${ffb.device.productName || "wheel"}: ${ffb.axes.length} HID axes, ` +
+        `${ffb.reportsSeen} reports received${ffb.reportsSeen === 0 ? " — move the wheel to check data flow" : ""}`;
+    }
   }
 
   // ---- HUD
@@ -493,4 +502,5 @@ window.__sttr = {
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),
   input,
+  FanatecFFB,
 };
