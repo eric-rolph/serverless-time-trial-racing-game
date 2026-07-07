@@ -44,6 +44,7 @@ export default {
       case "/":
         return json({
           service: "sttr-referee",
+          rev: 4,
           track: trackHashHex,
           endpoints: ["/api/submit (ws)", "/api/leaderboard", "/api/track/current"],
         });
@@ -102,17 +103,31 @@ function handleSubmission(ws: WebSocket, env: Env, ctx: ExecutionContext): void 
       const h = header;
       settled = true;
       ctx.waitUntil(
-        processLog(ws, env, h, event.data as ArrayBuffer).catch((err) => {
-          ws.send(
-            JSON.stringify({ type: "result", status: "rejected", reason: "log_malformed", detail: String(err) }),
-          );
-          ws.close(1011);
-        }),
+        toBuffer(event.data)
+          .then((raw) => processLog(ws, env, h, raw))
+          .catch((err) => {
+            ws.send(
+              JSON.stringify({ type: "result", status: "rejected", reason: "log_malformed", detail: String(err) }),
+            );
+            ws.close(1011);
+          }),
       );
     } catch (err) {
       reject(err instanceof LogFormatError ? "log_malformed" : "internal", String(err));
     }
   });
+}
+
+/** Runtimes deliver WebSocket binary frames as ArrayBuffer, a view, or a Blob
+ *  depending on spec vintage — normalize all three, and name the type if it's
+ *  something else so the rejection detail is diagnosable. */
+async function toBuffer(data: unknown): Promise<ArrayBuffer> {
+  if (data instanceof ArrayBuffer) return data;
+  if (ArrayBuffer.isView(data)) {
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+  }
+  if (typeof Blob !== "undefined" && data instanceof Blob) return data.arrayBuffer();
+  throw new Error(`unsupported binary frame type: ${Object.prototype.toString.call(data)}`);
 }
 
 async function processLog(

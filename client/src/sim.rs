@@ -8,9 +8,11 @@ use wasmtime::{Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
 use crate::laplog::TickRecord;
 
-// §1.3 status bits
+// §1.3 status bits (full contract set; not all are consumed by the client yet)
+#[allow(dead_code)]
 pub const STATUS_RUNNING: u32 = 0x0000_0001;
 pub const STATUS_LAP_COMPLETE: u32 = 0x0000_0002;
+#[allow(dead_code)]
 pub const STATUS_OFF_TRACK: u32 = 0x0000_0004;
 pub const STATUS_LAP_INVALID: u32 = 0x0000_0008;
 pub const STATUS_ERROR: u32 = 0x8000_0000;
@@ -94,6 +96,12 @@ pub trait SimBackend {
     fn lap_time_ticks(&mut self) -> Result<u32>;
 }
 
+/// wasmtime 46 uses its own error type that does not interoperate with
+/// anyhow's trait bounds; funnel every wasm-boundary error through this.
+fn werr(e: wasmtime::Error) -> anyhow::Error {
+    anyhow!("wasm error: {e}")
+}
+
 /// Typed handles to every §1.1 export.
 pub struct Sim {
     store: Store<()>,
@@ -127,8 +135,9 @@ impl Sim {
             );
         }
         let engine = Engine::default();
-        let module = Module::from_file(&engine, path)
-            .with_context(|| format!("failed to compile wasm module '{}'", path.display()))?;
+        let module = Module::from_file(&engine, path).map_err(|e| {
+            anyhow!("failed to compile wasm module '{}': {e}", path.display())
+        })?;
 
         let mut store = Store::new(&engine, ());
         let mut linker: Linker<()> = Linker::new(&engine);
@@ -137,11 +146,11 @@ impl Sim {
         // for WASI means errno SUCCESS.
         linker
             .define_unknown_imports_as_default_values(&mut store, &module)
-            .context("failed to stub wasm imports")?;
+            .map_err(|e| anyhow!("failed to stub wasm imports: {e}"))?;
 
         let instance: Instance = linker
             .instantiate(&mut store, &module)
-            .context("failed to instantiate sim.wasm")?;
+            .map_err(|e| anyhow!("failed to instantiate sim.wasm: {e}"))?;
 
         let memory = instance
             .get_memory(&mut store, "memory")
@@ -149,8 +158,8 @@ impl Sim {
 
         macro_rules! func {
             ($name:literal) => {
-                instance.get_typed_func(&mut store, $name).with_context(|| {
-                    format!("sim.wasm missing or mistyped export '{}'", $name)
+                instance.get_typed_func(&mut store, $name).map_err(|e| {
+                    anyhow!("sim.wasm missing or mistyped export '{}': {e}", $name)
                 })?
             };
         }
@@ -172,11 +181,11 @@ impl Sim {
         };
         let mut sim = sim;
 
-        let abi = sim.f_abi_version.call(&mut sim.store, ())?;
+        let abi = sim.f_abi_version.call(&mut sim.store, ()).map_err(werr)?;
         if abi != EXPECTED_ABI_VERSION {
             bail!("sim.wasm ABI version {abi}, client expects {EXPECTED_ABI_VERSION}");
         }
-        let state_size = sim.f_state_size.call(&mut sim.store, ())?;
+        let state_size = sim.f_state_size.call(&mut sim.store, ()).map_err(werr)?;
         if state_size as usize != SIM_STATE_SIZE {
             bail!("sim_state_size() = {state_size}, contract says {SIM_STATE_SIZE}");
         }
@@ -185,7 +194,10 @@ impl Sim {
 
     /// Copy a host buffer into wasm memory via sim_alloc; returns the wasm ptr.
     fn write_blob(&mut self, bytes: &[u8]) -> Result<u32> {
-        let ptr = self.f_alloc.call(&mut self.store, bytes.len() as u32)?;
+        let ptr = self
+            .f_alloc
+            .call(&mut self.store, bytes.len() as u32)
+            .map_err(werr)?;
         if ptr == 0 {
             bail!("sim_alloc({}) returned null", bytes.len());
         }
@@ -200,7 +212,8 @@ impl Sim {
         let ptr = self.write_blob(track_bytes)?;
         let rc = self
             .f_load_track
-            .call(&mut self.store, (ptr, track_bytes.len() as u32))?;
+            .call(&mut self.store, (ptr, track_bytes.len() as u32))
+            .map_err(werr)?;
         if rc != 0 {
             bail!("sim_load_track rejected track blob (rc = {rc})");
         }
@@ -209,15 +222,17 @@ impl Sim {
 
     /// Car to spawn pose, tick = 0.
     pub fn reset(&mut self) -> Result<()> {
-        Ok(self.f_reset.call(&mut self.store, ())?)
+        self.f_reset.call(&mut self.store, ()).map_err(werr)
     }
 
     /// One 400 Hz tick with quantized inputs (§2); returns status bits (§1.3).
     pub fn step_quantized(&mut self, steer: i16, throttle: u16, brake: u16, flags: u16) -> Result<u32> {
-        Ok(self.f_step.call(
-            &mut self.store,
-            (steer as i32, throttle as u32, brake as u32, flags as u32),
-        )?)
+        self.f_step
+            .call(
+                &mut self.store,
+                (steer as i32, throttle as u32, brake as u32, flags as u32),
+            )
+            .map_err(werr)
     }
 
     /// Replay a full tick log inside the kernel at max speed (§1.1 sim_replay).
@@ -228,11 +243,13 @@ impl Sim {
             blob.extend_from_slice(&t.to_bytes());
         }
         let ptr = self.write_blob(&blob)?;
-        Ok(self.f_replay.call(&mut self.store, (ptr, ticks.len() as u32))?)
+        self.f_replay
+            .call(&mut self.store, (ptr, ticks.len() as u32))
+            .map_err(werr)
     }
 
     fn read_state(&mut self) -> Result<SimState> {
-        let ptr = self.f_state_ptr.call(&mut self.store, ())? as usize;
+        let ptr = self.f_state_ptr.call(&mut self.store, ()).map_err(werr)? as usize;
         let mut buf = [0u8; SIM_STATE_SIZE];
         self.memory
             .read(&self.store, ptr, &mut buf)
@@ -241,8 +258,8 @@ impl Sim {
     }
 
     fn read_state_hash(&mut self) -> Result<u64> {
-        let lo = self.f_state_hash_lo.call(&mut self.store, ())? as u64;
-        let hi = self.f_state_hash_hi.call(&mut self.store, ())? as u64;
+        let lo = self.f_state_hash_lo.call(&mut self.store, ()).map_err(werr)? as u64;
+        let hi = self.f_state_hash_hi.call(&mut self.store, ()).map_err(werr)? as u64;
         Ok((hi << 32) | lo)
     }
 }
@@ -258,7 +275,7 @@ impl SimBackend for Sim {
         self.read_state_hash()
     }
     fn lap_time_ticks(&mut self) -> Result<u32> {
-        Ok(self.f_lap_time_ticks.call(&mut self.store, ())?)
+        self.f_lap_time_ticks.call(&mut self.store, ()).map_err(werr)
     }
 }
 
@@ -315,8 +332,10 @@ mod tests {
 
     #[test]
     fn missing_wasm_gives_clear_error() {
-        let err = Sim::load(Path::new("definitely/not/a/real/sim.wasm")).unwrap_err();
-        let msg = format!("{err}");
+        let msg = match Sim::load(Path::new("definitely/not/a/real/sim.wasm")) {
+            Ok(_) => panic!("load unexpectedly succeeded"),
+            Err(err) => format!("{err}"),
+        };
         assert!(msg.contains("sim.wasm not found"), "unhelpful error: {msg}");
         assert!(msg.contains("--sim-wasm"), "should mention the CLI flag: {msg}");
     }

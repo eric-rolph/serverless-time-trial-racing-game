@@ -21,7 +21,12 @@ export interface LapLog {
 
 export class LogFormatError extends Error {}
 
-export function parseLapLog(buf: ArrayBuffer): LapLog {
+export function parseLapLog(data: ArrayBuffer | ArrayBufferView): LapLog {
+  // Single choke point for binary-frame normalization: runtimes disagree on
+  // whether WebSocket binary messages arrive as ArrayBuffer or a view.
+  const buf: ArrayBuffer = ArrayBuffer.isView(data)
+    ? (data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer)
+    : data;
   if (buf.byteLength > MAX_LOG_BYTES) throw new LogFormatError("too_large");
   if (buf.byteLength < 32) throw new LogFormatError("truncated header");
   const dv = new DataView(buf);

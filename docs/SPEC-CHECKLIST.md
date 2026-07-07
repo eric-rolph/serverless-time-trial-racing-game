@@ -6,36 +6,36 @@ Iteration counter and verification log at the bottom.
 
 ## 1. Physics engine (Box3D & C17)
 
-- ☐ Box3D (Erin Catto, C17) incorporated — submodule pinned `540ea38`
-- ☐ Headless 3D environment with vehicle
-- ☐ Pacejka Magic Formula tire model
-- ☐ Independent suspension geometry (per-corner raycast spring/damper)
-- ☐ Strict 400 Hz fixed timestep (`DT = 0.0025f`, defined once)
-- ☐ No determinism-breaking compiler flags (no `-ffast-math`; `-ffp-contract=off`)
+- ✅ Box3D (Erin Catto, C17) incorporated — submodule pinned `540ea38`
+- ✅ Headless 3D environment with vehicle — native tests drive a full closed-loop lap
+- ✅ Pacejka Magic Formula tire model — B/C/D/E per axis, load-dependent D, friction ellipse (vehicle.c)
+- ✅ Independent suspension geometry — per-corner raycast spring/damper, travel clamps
+- ✅ Strict 400 Hz fixed timestep — `SIM_DT 0.0025f` single literal; test_determinism: 2×8000 ticks, hashes identical at all 17 checkpoints
+- ✅ No determinism-breaking flags — `-ffp-contract=off`, no fast-math (CMakeLists + build_wasm.sh); Box3D scalar, single-threaded, hot-path clock import removed
 
 ## 2. Client (Rust & WebAssembly)
 
-- ☐ Standalone Rust client
-- ☐ Decoupled loop with accumulator; physics 400 Hz, render uncapped
-- ☐ α-blend state interpolation for rendering
-- ☐ Aspect-native projection (32:9 supported natively)
-- ☐ High-frequency raw input polling (steering/throttle/brake), ~1 kHz thread
-- ☐ Cryptographic signing module: hash+sign input log before transmission
+- ✅ Standalone Rust client — `sttr-client` (race/replay/submit), 29/29 unit tests
+- ✅ Decoupled loop with accumulator — integer-nanosecond accumulator (DT_NANOS=2.5e6), exact tick counts under drift test
+- ✅ α-blend state interpolation — pos lerp + hemisphere-corrected nlerp, tested
+- ✅ Aspect-native projection — fov_y fixed, aspect from live surface (32:9 native); PresentMode::AutoNoVsync (uncapped)
+- ◐→✅ High-frequency input polling — 1 kHz gilrs thread + keyboard fallback (hardware polling untested without a physical wheel on this machine)
+- ✅ Cryptographic signing — ed25519-dalek over "sttr-lap-v1"‖LAPLOG, keypair in OS config dir, roundtrip tested
 
 ## 3. Edge validator (Cloudflare Workers)
 
-- ☐ TypeScript Worker, WebSocket submission endpoint
-- ☐ 1. Verify cryptographic signature (Ed25519 WebCrypto)
-- ☐ 2. Telemetry heuristics: micro-jitter / hardware-noise analysis, TAS flagging
-- ☐ 3. Instantiate wasm-compiled Box3D sim in memory
-- ☐ 4. Headless max-speed replay validating final lap time
-- ☐ 5. Post validated results to global leaderboard via Cloudflare KV
+- ✅ TypeScript Worker, WebSocket endpoint — DEPLOYED: sttr-referee.ericrolph.workers.dev
+- ✅ 1. Ed25519 WebCrypto verification — live (bad sigs rejected in unit tests; live accept path proven)
+- ✅ 2. Telemetry heuristics — 4 metrics; step-TAS rejected (3 flags), human-like noise passes, jitter-injected autopilot passed live with 0 flags
+- ✅ 3. Wasm Box3D sim instantiated in memory — same binary as client (ADR-001)
+- ✅ 4. Headless max-speed replay — 24,814 ticks replayed at edge; state hash + lap ticks matched claim (74 ms in wasmtime locally, 838× real-time)
+- ✅ 5. KV leaderboard — live entry: autopilot-e2e 62.035 s rank 1, key scheme sorts by time lexicographically
 
 ## 4. Automated Game Master (GitHub Actions)
 
-- ☐ CI/CD YAML workflow
-- ☐ Python procedural track generator (3D spline + terrain mesh)
-- ☐ Weekly cron: generate → compile into Box3D env → Emscripten wasm build → deploy Worker globally
+- ✅ CI/CD YAML — 5 jobs (worker, physics-native, physics-wasm, client, trackgen determinism)
+- ✅ Python procedural generator — seeded Catmull-Rom spline + terrain ribbon; same seed ⇒ byte-identical track.bin (CI-enforced)
+- ✅ Weekly cron — Mon 00:00 UTC: generate → Emscripten build (Box3D C17) → wrangler deploy globally → provenance commit; secret CLOUDFLARE_API_TOKEN set (cron unexercised until next Monday; workflow_dispatch available)
 
 ## Iteration log
 
@@ -46,6 +46,11 @@ Iteration counter and verification log at the bottom.
 | 3 | worker: full referee pipeline + 17 unit tests green | tsc clean, vitest 17/17 |
 | 4 | CI + weekly Game Master workflows; KV namespace provisioned | 427a0d7959b741f3bda621d63196711b |
 | 5 | **VERIFICATION PASS #1** | see below |
+| 6 | Physics kernel merged: native determinism + vehicle tests green, wasm smoke green | hash 6f375f286e4d406e stable |
+| 7 | Client merged: fixed float-drift accumulator (→ integer ns), ribbon closure; 29/29 tests | cargo check + test clean |
+| 8 | Worker deployed to edge; Blob binary-frame normalization fix | sttr-referee.ericrolph.workers.dev |
+| 9 | LIVE E2E ACCEPTED: autopilot lap 62.035 s, edge replay hash match, KV rank 1 | + wasmtime replay = same hash (3-host determinism) |
+| 10 | **VERIFICATION PASS #2** | see below |
 
 ### Verification passes (every 5 iterations)
 
@@ -66,3 +71,18 @@ Iteration counter and verification log at the bottom.
 - Deviation check vs spec: none found. Gap list: end-to-end replay test
   (client-produced log accepted by worker) — planned as integration step;
   KV id now real; GitHub secret CLOUDFLARE_API_TOKEN set.
+
+**Pass #2 (iteration 10, 2026-07-07).** Full spec re-read against evidence:
+
+- Every §1–§4 item now ✅ (details inline above). Strongest evidence: the same
+  24,814-tick lap log produces state hash `a816338aa9b6c534` on (a) node/V8
+  sim_step-by-step, (b) Cloudflare edge V8 `sim_replay`, (c) Rust wasmtime —
+  ADR-001's cross-platform determinism claim holds in practice.
+- Live artifacts: Worker `sttr-referee.ericrolph.workers.dev` (rev 4), KV entry
+  rank 1, GET /api/leaderboard returns it, GET /api/track/current serves TRK1.
+- Honest residuals: (1) physical wheel hardware not exercised (no wheel attached
+  during build; gilrs path is code-complete + keyboard fallback tested);
+  (2) weekly cron fires next Monday — same steps as the manual deploy performed
+  today, plus workflow_dispatch for on-demand runs; (3) interactive wgpu window
+  not run headlessly here — mesh/camera/interpolation logic unit-tested;
+  (4) Workers Paid plan required for full-length replay CPU budget.

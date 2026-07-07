@@ -186,6 +186,22 @@ impl Drop for WheelInput {
     }
 }
 
+/// The input backend chosen for a race session. The keyboard variant keeps
+/// the Arc so the window event loop can feed key transitions in.
+pub enum SelectedInput {
+    Wheel(WheelInput),
+    Keyboard(Arc<KeyboardInput>),
+}
+
+impl SelectedInput {
+    pub fn source(&self) -> &dyn InputSource {
+        match self {
+            SelectedInput::Wheel(w) => w,
+            SelectedInput::Keyboard(k) => k.as_ref(),
+        }
+    }
+}
+
 /// Names of gamepads gilrs can currently see (for auto-select + `devices`).
 pub fn detect_gamepads() -> Vec<String> {
     match Gilrs::new() {
