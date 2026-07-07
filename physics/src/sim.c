@@ -172,7 +172,7 @@ static void sTeardownWorld( void )
 	}
 }
 
-int32_t sim_load_track( uint32_t ptr, uint32_t len )
+int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 {
 	sTeardownWorld();
 	memset( &g_sim.state, 0, sizeof( g_sim.state ) );
@@ -415,6 +415,16 @@ static void sUpdateLap( uint32_t* status )
 	// Checkpoints: award checkpoint k when the nearest index reaches its
 	// sample (within the search window step) while on track, in order.
 	// Reaching a later checkpoint first = corner cut → LAP_INVALID.
+	//
+	// Signed shortest-path delta distinguishes a genuine forward move (with
+	// wrap) from a small backward move near the wrap point; the search window
+	// bounds |delta| well below n/2 for real motion.
+	int32_t delta = (int32_t)( ( idx + n - prev_idx ) % n );
+	if ( delta > (int32_t)( n / 2 ) )
+	{
+		delta -= (int32_t)n; // actually moved backward
+	}
+
 	uint32_t mask = sim->state.checkpoint_mask;
 	for ( uint32_t k = 0; k < t->checkpoint_count; ++k )
 	{
@@ -423,19 +433,9 @@ static void sUpdateLap( uint32_t* status )
 			continue;
 		}
 		uint32_t cp = t->checkpoints[k];
-		// Did we advance across cp this tick (forward direction)?
-		uint32_t from = prev_idx;
-		uint32_t to = idx;
-		int crossed;
-		if ( from <= to )
-		{
-			crossed = ( from < cp || from == cp ) && cp <= to;
-		}
-		else
-		{
-			// wrapped past the start line this tick
-			crossed = cp >= from || cp <= to;
-		}
+		// Forward offset from the previous index to the checkpoint sample.
+		uint32_t offset = ( cp + n - prev_idx ) % n;
+		int crossed = delta > 0 && offset > 0 && offset <= (uint32_t)delta;
 		if ( crossed )
 		{
 			if ( off_track )
@@ -592,9 +592,9 @@ uint32_t sim_step( int32_t steer, uint32_t throttle, uint32_t brake, uint32_t fl
 	return status;
 }
 
-uint32_t sim_state_ptr( void )
+sim_ptr_t sim_state_ptr( void )
 {
-	return (uint32_t)(uintptr_t)&g_sim.state;
+	return (sim_ptr_t)&g_sim.state;
 }
 
 uint32_t sim_state_size( void )

@@ -86,16 +86,21 @@ _Static_assert( sizeof( SimStateV1 ) == 200, "SimStateV1 must be 200 bytes" );
 // (via src/wasm_api.c); natively they are called directly by the tests.
 // ---------------------------------------------------------------------------
 
+// Pointer-sized integer for buffer addresses. On wasm32 uintptr_t IS uint32_t,
+// so the wasm export signatures match CONTRACTS §1.1 exactly (i32 params and
+// results). Native (x64) test builds get full-width pointers.
+typedef uintptr_t sim_ptr_t;
+
 // = SIM_ABI_VERSION
 uint32_t sim_abi_version( void );
 
 // Allocate a buffer inside the kernel heap for host→kernel data (track blob,
 // input log). Returns 0 on failure. Never freed individually in v1.
-uint32_t sim_alloc( uint32_t len );
+sim_ptr_t sim_alloc( uint32_t len );
 
 // Parse a TRK1 blob (CONTRACTS §8), build the static collision world and the
 // vehicle. 0 = ok, <0 = error (see SIM_ERR_*). Implicitly resets.
-int32_t sim_load_track( uint32_t ptr, uint32_t len );
+int32_t sim_load_track( sim_ptr_t ptr, uint32_t len );
 
 #define SIM_ERR_BAD_MAGIC ( -1 )
 #define SIM_ERR_BAD_VERSION ( -2 )
@@ -118,10 +123,10 @@ uint32_t sim_step( int32_t steer, uint32_t throttle, uint32_t brake, uint32_t fl
 // Run tick_count 8-byte records {i16 steer, u16 throttle, u16 brake, u16 flags}
 // at max speed. Does NOT reset first — the host calls sim_reset() before this.
 // Returns the final status bits (ORed lap-completion bits are sticky, see NOTES).
-uint32_t sim_replay( uint32_t log_ptr, uint32_t tick_count );
+uint32_t sim_replay( sim_ptr_t log_ptr, uint32_t tick_count );
 
 // Pointer (wasm linear-memory offset / native address) to the SimStateV1 block.
-uint32_t sim_state_ptr( void );
+sim_ptr_t sim_state_ptr( void );
 uint32_t sim_state_size( void );
 
 // FNV-1a-64 over: tick, chassis pos/quat/vel/angvel, all wheel state,
