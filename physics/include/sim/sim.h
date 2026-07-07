@@ -137,6 +137,10 @@ uint32_t sim_state_hash_hi( void );
 // Lap time in ticks; valid when the last sim_step returned LAP_COMPLETE.
 uint32_t sim_lap_time_ticks( void );
 
+// Steering rack torque (Nm at the rim) for force feedback. Output-only —
+// reads never affect simulation or hashes. Added in ABI 1.1; hosts may ignore.
+float sim_ffb_torque( void );
+
 // Native-test helper (not a wasm export): direct state access.
 const SimStateV1* sim_state( void );
 

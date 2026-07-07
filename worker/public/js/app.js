@@ -2,9 +2,11 @@
 // no install. Fixed 400 Hz accumulator + interpolated rendering (uncapped rAF).
 import * as THREE from "../vendor/three.module.js";
 import { Sim, STATUS, DT_MS } from "./sim.js";
-import { parseTrack, buildTrackMeshes, Minimap } from "./track.js";
+import { parseTrack, buildTrackMeshes, Minimap, fnv1a64 } from "./track.js";
 import { Input, quantize } from "./input.js";
 import { buildLapLog, submitLap, fetchLeaderboard, fmtMs } from "./lap.js";
+import { EngineAudio } from "./audio.js";
+import { FanatecFFB } from "./ffb.js";
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (text, cls = "info") => { $("statusText").textContent = text; $("statusText").className = cls; };
@@ -15,6 +17,7 @@ const [sim, trackResp] = await Promise.all([Sim.load(), fetch("/api/track/curren
 const trackBuf = await trackResp.arrayBuffer();
 const track = parseTrack(trackBuf);
 sim.loadTrack(new Uint8Array(trackBuf));
+const trackHashHex = fnv1a64(track.bytes).toString(16).padStart(16, "0");
 
 $("name").value = localStorage.getItem("sttr-name") ?? "";
 $("name").addEventListener("change", () => localStorage.setItem("sttr-name", $("name").value));
@@ -33,20 +36,23 @@ sun.position.set(120, 180, 60);
 scene.add(sun);
 scene.add(buildTrackMeshes(track));
 
-const car = new THREE.Group();
-const chassis = new THREE.Mesh(
-  new THREE.BoxGeometry(1.9, 0.9, 4.4),
-  new THREE.MeshLambertMaterial({ color: 0xd9483b }),
-);
-chassis.position.y = 0.25;
-car.add(chassis);
-const cabin = new THREE.Mesh(
-  new THREE.BoxGeometry(1.4, 0.5, 1.8),
-  new THREE.MeshLambertMaterial({ color: 0x1a2333 }),
-);
-cabin.position.set(0, 0.85, -0.3);
-car.add(cabin);
+function buildCar(color, opacity = 1) {
+  const group = new THREE.Group();
+  const mat = (c) =>
+    new THREE.MeshLambertMaterial({ color: c, transparent: opacity < 1, opacity, depthWrite: opacity === 1 });
+  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.9, 4.4), mat(color));
+  chassis.position.y = 0.25;
+  group.add(chassis);
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.5, 1.8), mat(0x1a2333));
+  cabin.position.set(0, 0.85, -0.3);
+  group.add(cabin);
+  return group;
+}
+const car = buildCar(0xd9483b);
 scene.add(car);
+const ghostCar = buildCar(0xbfd9ff, 0.35);
+ghostCar.visible = false;
+scene.add(ghostCar);
 
 const wheelMeshes = [];
 for (let i = 0; i < 4; i++) {
@@ -69,9 +75,65 @@ function resize() {
 addEventListener("resize", resize);
 resize();
 
+// ---------------------------------------------------------------- helpers
+const b64encode = (bytes) => {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+// ---------------------------------------------------------------- ghost (PB)
+const BEST_KEY = `sttr-best-${trackHashHex}`;
+const SECT_KEY = `sttr-sectors-${trackHashHex}`;
+let ghostSim = null;
+let ghost = null; // {lapTicks, ticks: DataView-able bytes, progress: Float32Array}
+let ghostIdx = 0;
+let ghostPrev = null;
+let ghostCurr = null;
+let deltaPtr = 0;
+
+function loadGhost() {
+  const stored = localStorage.getItem(BEST_KEY);
+  if (!stored) return null;
+  try {
+    const { lapTicks, ticksB64, progressB64 } = JSON.parse(stored);
+    const t = b64decode(ticksB64);
+    return { lapTicks, ticks: new DataView(t.buffer, t.byteOffset, t.byteLength), progress: new Float32Array(b64decode(progressB64).buffer) };
+  } catch {
+    return null;
+  }
+}
+
+function saveGhost(tickRecords, lapTicks) {
+  const bytes = new Uint8Array(8 * lapTicks);
+  const dv = new DataView(bytes.buffer);
+  for (let i = 0; i < lapTicks; i++) {
+    dv.setInt16(8 * i, tickRecords[i].steer, true);
+    dv.setUint16(8 * i + 2, tickRecords[i].throttle, true);
+    dv.setUint16(8 * i + 4, tickRecords[i].brake, true);
+    dv.setUint16(8 * i + 6, tickRecords[i].flags, true);
+  }
+  // Rebuild the progress curve by replaying in a scratch instance (~100 ms).
+  return Sim.instantiate().then((scratch) => {
+    scratch.loadTrack(new Uint8Array(trackBuf));
+    scratch.reset();
+    const progress = new Float32Array(lapTicks);
+    for (let i = 0; i < lapTicks; i++) {
+      scratch.step(dv.getInt16(8 * i, true), dv.getUint16(8 * i + 2, true), dv.getUint16(8 * i + 4, true), dv.getUint16(8 * i + 6, true));
+      progress[i] = scratch.state().lapProgress;
+    }
+    localStorage.setItem(
+      BEST_KEY,
+      JSON.stringify({ lapTicks, ticksB64: b64encode(bytes), progressB64: b64encode(new Uint8Array(progress.buffer)) }),
+    );
+  });
+}
+
 // ---------------------------------------------------------------- game state
 const input = new Input();
 const minimap = new Minimap($("minimap"), track);
+const audio = new EngineAudio();
 const fellOffY = Math.min(...track.center.map((c) => c[1])) - 25;
 let prev = sim.state();
 let curr = prev;
@@ -83,21 +145,47 @@ let last = performance.now();
 let bestMs = null;
 let lastMs = null;
 let inputOverride = null; // test hook: (state) => RawInput
+let countdownMs = 0; // > 0 → standing start in progress
+let cameraMode = "chase";
+let ffb = null;
+let lastThrottle = 0;
+let sectorTicks = []; // ticks at S1/S2/S3 boundaries this run
+let prevCpMask = 0;
 
-function resetRun() {
+async function resetRun() {
   sim.reset();
   prev = curr = sim.state();
   ticks = [];
   frozen = false;
   invalid = false;
   acc = 0;
-  setStatus("GO — set a time and it will be validated at the edge", "ok");
+  sectorTicks = [];
+  prevCpMask = 0;
+  deltaPtr = 0;
+  $("delta").textContent = "";
+  $("sectors").textContent = "";
+  countdownMs = 3200;
+
+  ghost = loadGhost();
+  ghostIdx = 0;
+  if (ghost) {
+    ghostSim ??= await Sim.instantiate().then((g) => (g.loadTrack(new Uint8Array(trackBuf)), g));
+    ghostSim.reset();
+    ghostPrev = ghostCurr = ghostSim.state();
+    ghostCar.visible = true;
+  } else {
+    ghostCar.visible = false;
+  }
 }
 
 addEventListener("keydown", (e) => {
+  audio.start();
   if (e.code === "KeyR") resetRun();
+  if (e.code === "KeyC") cameraMode = cameraMode === "chase" ? "hood" : "chase";
+  if (e.code === "KeyM") setStatus(audio.toggleMute() ? "muted" : "sound on");
   if (e.code === "KeyI") $("config").style.display = $("config").style.display === "block" ? "none" : "block";
 });
+addEventListener("pointerdown", () => audio.start());
 
 // Calibration UI
 for (const btn of document.querySelectorAll("[data-cal]")) {
@@ -111,6 +199,27 @@ for (const btn of document.querySelectorAll("[data-cal]")) {
 }
 $("closeConfig").addEventListener("click", () => ($("config").style.display = "none"));
 
+// FFB UI (WebHID, experimental)
+if (!FanatecFFB.supported()) $("ffbConnect").disabled = true;
+$("ffbConnect").addEventListener("click", async () => {
+  try {
+    if (ffb) {
+      await ffb.stop();
+      ffb = null;
+      $("ffbConnect").textContent = "connect wheel FFB";
+      $("ffbMsg").textContent = "disconnected";
+      return;
+    }
+    ffb = await FanatecFFB.connect();
+    $("ffbConnect").textContent = "disconnect FFB";
+    $("ffbMsg").textContent = `connected: ${ffb.device.productName || "Fanatec base"} — drive to feel torque`;
+  } catch (err) {
+    $("ffbMsg").textContent = `FFB: ${err.message}`;
+  }
+});
+$("ffbGain").addEventListener("input", () => { if (ffb) ffb.gain = Number($("ffbGain").value); });
+$("ffbInvert").addEventListener("change", () => { if (ffb) ffb.invert = $("ffbInvert").checked; });
+
 async function refreshBoard() {
   try {
     const entries = await fetchLeaderboard();
@@ -123,17 +232,40 @@ async function refreshBoard() {
 }
 refreshBoard();
 
+function fmtSectors(t) {
+  const best = JSON.parse(localStorage.getItem(SECT_KEY) ?? "[]");
+  return t
+    .map((ticks, i) => {
+      const ms = Math.round((ticks * 1000) / 400);
+      const d = best[i] ? ((ticks - best[i]) / 400).toFixed(2) : null;
+      return `S${i + 1} ${fmtMs(ms)}${d !== null ? ` (${d > 0 ? "+" : ""}${d})` : ""}`;
+    })
+    .join("  ");
+}
+
 async function onLapComplete() {
   frozen = true;
+  if (ffb) ffb.update(0, 0.1);
   const lapTicks = sim.lapTimeTicks();
   lastMs = Math.round((lapTicks * 1000) / 400);
-  bestMs = bestMs === null ? lastMs : Math.min(bestMs, lastMs);
+  const isPB = bestMs === null || lastMs < bestMs;
+  bestMs = isPB ? lastMs : bestMs;
+
+  // Sector bests + ghost are local-first: saved regardless of server verdict.
+  const boundaries = [...sectorTicks, lapTicks];
+  const sectors = boundaries.map((t, i) => t - (boundaries[i - 1] ?? 0));
+  const prevBest = JSON.parse(localStorage.getItem(SECT_KEY) ?? "[]");
+  localStorage.setItem(SECT_KEY, JSON.stringify(sectors.map((s, i) => Math.min(s, prevBest[i] ?? Infinity))));
+  if (isPB) await saveGhost(ticks, lapTicks);
+
   const log = buildLapLog(track.bytes, ticks.slice(0, lapTicks), sim.stateHash(), lapTicks);
   setStatus(`lap ${fmtMs(lastMs)} — submitting for edge validation…`);
   try {
     const result = await submitLap(log, $("name").value || "anon", (stage) => setStatus(`lap ${fmtMs(lastMs)} — referee: ${stage}…`));
     if (result.status === "accepted") {
       setStatus(`ACCEPTED ✔ ${fmtMs(result.lapTimeMs)} — world rank #${result.rank}. Press R to go again.`, "ok");
+    } else if (result.status === "pending") {
+      setStatus(`lap ${fmtMs(lastMs)} queued — validated within ~30 min (free-tier mode). Press R.`, "info");
     } else {
       setStatus(`rejected: ${result.reason}${result.detail ? ` (${result.detail})` : ""} — press R`, "bad");
     }
@@ -150,38 +282,75 @@ const camTarget = new THREE.Vector3(), camPos = new THREE.Vector3(0, 6, -12);
 /** Step physics by dtMs of wall time. Extracted from the rAF handler so tests
  *  (and the debug hook below) can pump the sim when rAF is throttled. */
 function advance(dtMs) {
-  if (!frozen) {
-    acc += dtMs;
-    while (acc >= DT_MS) {
-      acc -= DT_MS;
-      const raw = inputOverride ? inputOverride(curr) : input.sample(DT_MS / 1000);
-      const q = quantize(raw);
-      const status = sim.step(q.steer, q.throttle, q.brake, q.flags);
-      ticks.push(q);
-      prev = curr;
-      curr = sim.state();
-      if (status & STATUS.LAP_INVALID && !invalid) {
-        invalid = true;
-        setStatus("lap invalidated (corner cut) — press R to restart", "bad");
-      }
-      if (status & STATUS.LAP_COMPLETE) {
-        if (!invalid) onLapComplete();
-        else frozen = true;
-        break;
-      }
-      if (ticks.length >= 72000) {
-        frozen = true;
-        setStatus("3-minute limit reached — press R", "bad");
-        break;
-      }
-      // Fell off the world (no barriers in v1): auto-respawn at the line.
-      if (curr.pos[1] < fellOffY) {
-        resetRun();
-        setStatus("off into the void — respawned at the start line", "bad");
-        break;
-      }
+  if (countdownMs > 0) {
+    countdownMs -= dtMs;
+    const n = Math.ceil(countdownMs / 1000);
+    $("countdown").textContent = countdownMs <= 0 ? "GO" : String(n);
+    $("countdown").style.display = "block";
+    if (countdownMs <= 0) {
+      setStatus("GO — set a time; it will be validated at the edge", "ok");
+      setTimeout(() => ($("countdown").style.display = "none"), 700);
+    }
+    return;
+  }
+  if (frozen) return;
+  acc += dtMs;
+  while (acc >= DT_MS) {
+    acc -= DT_MS;
+    const raw = inputOverride ? inputOverride(curr) : input.sample(DT_MS / 1000);
+    lastThrottle = raw.throttle;
+    const q = quantize(raw);
+    const status = sim.step(q.steer, q.throttle, q.brake, q.flags);
+    ticks.push(q);
+    prev = curr;
+    curr = sim.state();
+
+    // Ghost runs one recorded tick per live tick — true side-by-side racing.
+    if (ghost && ghostIdx < ghost.lapTicks) {
+      const o = 8 * ghostIdx;
+      ghostSim.step(ghost.ticks.getInt16(o, true), ghost.ticks.getUint16(o + 2, true), ghost.ticks.getUint16(o + 4, true), ghost.ticks.getUint16(o + 6, true));
+      ghostPrev = ghostCurr;
+      ghostCurr = ghostSim.state();
+      ghostIdx++;
+    }
+
+    // Sector boundaries: new checkpoint bits appearing.
+    if (curr.checkpoints !== prevCpMask) {
+      sectorTicks.push(ticks.length);
+      prevCpMask = curr.checkpoints;
+      $("sectors").textContent = fmtSectors(
+        sectorTicks.map((t, i) => t - (sectorTicks[i - 1] ?? 0)),
+      );
+    }
+
+    if (status & STATUS.LAP_INVALID && !invalid) {
+      invalid = true;
+      setStatus("lap invalidated (corner cut) — press R to restart", "bad");
+    }
+    if (status & STATUS.LAP_COMPLETE) {
+      if (!invalid) onLapComplete();
+      else frozen = true;
+      break;
+    }
+    if (ticks.length >= 72000) {
+      frozen = true;
+      setStatus("3-minute limit reached — press R", "bad");
+      break;
+    }
+    if (curr.pos[1] < fellOffY) {
+      resetRun();
+      setStatus("off into the void — respawned at the start line", "bad");
+      break;
     }
   }
+}
+
+function poseGroup(group, prevS, currS, alpha) {
+  const lerp = (a, b) => a + (b - a) * alpha;
+  group.position.set(lerp(prevS.pos[0], currS.pos[0]), lerp(prevS.pos[1], currS.pos[1]), lerp(prevS.pos[2], currS.pos[2]));
+  tmpQa.set(...prevS.quat);
+  tmpQb.set(...currS.quat);
+  group.quaternion.slerpQuaternions(tmpQa, tmpQb, alpha);
 }
 
 function frame(now) {
@@ -191,13 +360,10 @@ function frame(now) {
   input.tickCalibration();
   advance(dtMs);
 
-  // ---- interpolated render (alpha blend between the two newest sim states)
   const alpha = Math.min(acc / DT_MS, 1);
   const lerp = (a, b) => a + (b - a) * alpha;
-  car.position.set(lerp(prev.pos[0], curr.pos[0]), lerp(prev.pos[1], curr.pos[1]), lerp(prev.pos[2], curr.pos[2]));
-  tmpQa.set(...prev.quat);
-  tmpQb.set(...curr.quat);
-  car.quaternion.slerpQuaternions(tmpQa, tmpQb, alpha);
+  poseGroup(car, prev, curr, alpha);
+  if (ghostCar.visible && ghostCurr) poseGroup(ghostCar, ghostPrev, ghostCurr, alpha);
 
   for (let i = 0; i < 4; i++) {
     const wp = prev.wheels[i], wc = curr.wheels[i];
@@ -207,14 +373,29 @@ function frame(now) {
     wheelMeshes[i].rotateX(lerp(wp.spin, wc.spin));
   }
 
-  // Chase camera: spring toward a point behind and above the car.
-  const behind = new THREE.Vector3(0, 3.2, -8.5).applyQuaternion(car.quaternion).add(car.position);
-  camPos.lerp(behind, 1 - Math.exp(-4 * (dtMs / 1000)));
-  camera.position.copy(camPos);
-  camTarget.lerp(car.position, 0.6);
-  camera.lookAt(camTarget.x, camTarget.y + 1.2, camTarget.z);
+  // Camera: chase (spring-damped) or hood.
+  if (cameraMode === "chase") {
+    const behind = new THREE.Vector3(0, 3.2, -8.5).applyQuaternion(car.quaternion).add(car.position);
+    camPos.lerp(behind, 1 - Math.exp(-4 * (dtMs / 1000)));
+    camera.position.copy(camPos);
+    camTarget.lerp(car.position, 0.6);
+    camera.lookAt(camTarget.x, camTarget.y + 1.2, camTarget.z);
+  } else {
+    const hood = new THREE.Vector3(0, 1.15, 0.8).applyQuaternion(car.quaternion).add(car.position);
+    const ahead = new THREE.Vector3(0, 0.9, 30).applyQuaternion(car.quaternion).add(car.position);
+    camera.position.copy(hood);
+    camera.lookAt(ahead);
+    camPos.copy(hood);
+  }
 
   renderer.render(scene, camera);
+
+  // ---- side channels: audio + FFB (read-only on sim state)
+  audio.update(curr, lastThrottle);
+  if (ffb) {
+    ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque(), dtMs / 1000);
+    $("mFfb").value = ffb.smoothed / ffb.maxNm;
+  }
 
   // ---- HUD
   const runningTicks = frozen ? sim.lapTimeTicks() || ticks.length : ticks.length;
@@ -223,7 +404,14 @@ function frame(now) {
   $("lapInfo").textContent = `best: ${bestMs ? fmtMs(bestMs) : "—"}   last: ${lastMs ? fmtMs(lastMs) : "—"}`;
   minimap.draw(car.position.toArray(), curr.checkpoints);
 
-  // live meters in config panel
+  // Live delta vs ghost: compare tick counts at equal lap progress.
+  if (ghost && !frozen && countdownMs <= 0 && curr.lapProgress > 0.01) {
+    while (deltaPtr < ghost.lapTicks - 1 && ghost.progress[deltaPtr] < curr.lapProgress) deltaPtr++;
+    const d = (ticks.length - deltaPtr) / 400;
+    $("delta").textContent = `${d >= 0 ? "+" : ""}${d.toFixed(2)}`;
+    $("delta").style.color = d >= 0 ? "#ff8f8f" : "#7fe3a1";
+  }
+
   if ($("config").style.display === "block") {
     const raw = input.sample(dtMs / 1000);
     $("mSteer").value = raw.steer;
@@ -233,7 +421,7 @@ function frame(now) {
   }
 }
 
-resetRun();
+await resetRun();
 requestAnimationFrame(frame);
 
 // Debug/test hook: lets automated checks pump physics when the tab is
@@ -242,7 +430,8 @@ requestAnimationFrame(frame);
 window.__sttr = {
   advance,
   renderOnce: () => frame(performance.now()),
-  info: () => ({ ticks: ticks.length, frozen, invalid, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress }),
+  skipCountdown: () => (countdownMs = 1),
+  info: () => ({ ticks: ticks.length, frozen, invalid, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, ffbNm: sim.ffbTorque() }),
   track: { center: track.center, tangent: track.tangent },
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),

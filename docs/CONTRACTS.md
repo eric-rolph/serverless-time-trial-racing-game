@@ -44,6 +44,9 @@ sim_state_size() -> u32
 sim_state_hash_lo() -> u32                // FNV-1a-64 over dynamic state, low half
 sim_state_hash_hi() -> u32                // high half (avoids u64 at JS boundary)
 sim_lap_time_ticks() -> u32               // valid when LAP_COMPLETE set
+sim_ffb_torque() -> f32                   // ABI 1.1: steering rack torque (Nm)
+                                          // for FFB — output-only, never affects
+                                          // simulation state or hashes
 ```
 
 ### 1.2 `SimStateV1` (packed, little-endian, fixed offsets)
@@ -135,6 +138,9 @@ Server responses (JSON text frames):
 ```json
 { "type": "ack", "stage": "received" | "verified" | "heuristics" | "replayed" }
 { "type": "result", "status": "accepted", "lapTimeMs": 83452, "rank": 4 }
+{ "type": "result", "status": "pending", "lapTimeMs": 83452 }
+   // VALIDATE_MODE=queue (free tier): signature+heuristics passed; replay
+   // validation happens in the Actions sweeper within ~30 min
 { "type": "result", "status": "rejected",
   "reason": "bad_signature" | "heuristics_failed" | "replay_mismatch" |
             "track_mismatch" | "log_malformed" | "too_large",

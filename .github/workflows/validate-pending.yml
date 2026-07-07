@@ -1,0 +1,22 @@
+# Free-tier validation sweeper (docs/MUST-HAVES.md #23). Only does work when
+# the Worker runs with VALIDATE_MODE=queue; otherwise the pending: prefix is
+# empty and this exits in seconds.
+
+name: Validate Pending Laps
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tools/validate_pending.mjs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

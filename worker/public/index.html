@@ -41,12 +41,14 @@
 <canvas id="gl"></canvas>
 
 <div id="hud" class="panel">
-  <div class="time" id="lapTime">0:00.000</div>
+  <div class="time"><span id="lapTime">0:00.000</span> <span id="delta" style="font-size:18px"></span></div>
   <div class="speed"><span id="speed">0</span> km/h</div>
   <div class="sub" id="lapInfo">best: — &nbsp; last: —</div>
+  <div class="sub" id="sectors"></div>
   <div class="sub" style="margin-top:6px">
     <kbd>←→</kbd>/<kbd>A D</kbd> steer &nbsp;<kbd>↑</kbd>/<kbd>W</kbd> throttle
-    &nbsp;<kbd>↓</kbd>/<kbd>S</kbd> brake &nbsp;<kbd>R</kbd> restart &nbsp;<kbd>I</kbd> wheel setup
+    &nbsp;<kbd>↓</kbd>/<kbd>S</kbd> brake &nbsp;<kbd>R</kbd> restart &nbsp;<kbd>C</kbd> camera
+    &nbsp;<kbd>M</kbd> mute &nbsp;<kbd>I</kbd> wheel setup
   </div>
   <div class="row" style="margin-top:8px; display:flex; gap:6px; align-items:center">
     <input type="text" id="name" placeholder="driver name" maxlength="24">
@@ -72,8 +74,19 @@
   <div class="row"><label>brake</label><meter id="mBrake" min="0" max="1" value="0"></meter>
     <button data-cal="brake">detect</button></div>
   <div class="row sub" id="calMsg">click detect, then move only that control</div>
+  <hr style="border-color:#2a3448">
+  <h3>FORCE FEEDBACK <span class="sub">(WebHID — experimental, Fanatec bases, Chrome/Edge)</span></h3>
+  <div class="row"><button id="ffbConnect">connect wheel FFB</button>
+    <span class="sub" id="ffbMsg">torque from the physics rack model</span></div>
+  <div class="row"><label>gain</label>
+    <input type="range" id="ffbGain" min="0" max="1.5" step="0.05" value="0.8" style="flex:1"></div>
+  <div class="row"><label>invert</label><input type="checkbox" id="ffbInvert">
+    <label style="width:auto">torque</label><meter id="mFfb" min="-1" max="1" value="0" style="flex:1"></meter></div>
   <div class="row"><button id="closeConfig">close</button></div>
 </div>
+
+<div id="countdown" style="display:none; position:fixed; top:38%; left:50%; transform:translate(-50%,-50%);
+     font-size:120px; font-weight:800; color:#ffd479; text-shadow:0 0 40px rgba(255,212,121,.5);"></div>
 
 <script type="module" src="js/app.js"></script>
 </body>

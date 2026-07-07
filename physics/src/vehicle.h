@@ -30,6 +30,9 @@ typedef struct Vehicle
 {
 	b3BodyId chassis;
 	WheelRuntime wheels[SIM_WHEEL_COUNT]; // 0=FL 1=FR 2=RL 3=RR
+	// Steering rack torque (Nm at the rim) for force feedback. Pure output —
+	// never feeds back into the simulation, so it has no replay/hash impact.
+	float rack_torque;
 	int valid;
 } Vehicle;
 

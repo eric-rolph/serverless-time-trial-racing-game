@@ -1,0 +1,49 @@
+# Racing simulator must-haves
+
+Status: ✅ shipped · 🚧 this iteration · ▢ backlog. Web-first: everything must
+work in the browser client unless marked native-only.
+
+## Input
+
+| # | feature | status |
+|---|---------|--------|
+| 1 | Keyboard (slewed steering, drivable) | ✅ |
+| 2 | Wheel + pedals via Gamepad API, per-channel calibration wizard | ✅ |
+| 3 | Controller zero-config (standard gamepad mapping: stick + analog triggers) | 🚧 |
+| 4 | Wheel torque FFB in the browser — WebHID, Fanatec protocol (experimental) | 🚧 |
+| 5 | FFB in native client (DirectInput constant force, ffb.toml) | ▢ (docs/FFB.md design done) |
+| 6 | Steering sensitivity / rotation-range setting | ▢ |
+
+## Driving & timing core
+
+| # | feature | status |
+|---|---------|--------|
+| 7 | Deterministic 400 Hz physics, replay-validated laps | ✅ |
+| 8 | Lap timer, checkpoint validation, corner-cut detection | ✅ |
+| 9 | Standing start with 3-2-1 countdown | 🚧 |
+| 10 | Ghost car of your personal best (local, per track) | 🚧 |
+| 11 | Live delta-to-best readout | 🚧 |
+| 12 | Sector times (from checkpoints) with best comparison | 🚧 |
+| 13 | Off-track auto-respawn | ✅ |
+| 14 | Setup/tuning options (tire pressure, wing, gearing) | ▢ (needs setup hash in LAPLOG to stay fair) |
+
+## Presentation
+
+| # | feature | status |
+|---|---------|--------|
+| 15 | 3D track + car rendering, chase camera, minimap | ✅ |
+| 16 | Camera toggle (chase / hood) | 🚧 |
+| 17 | Engine + tire audio (WebAudio synth) | 🚧 |
+| 18 | Aspect-native rendering (21:9/32:9) | ✅ (native + web) |
+| 19 | Proper car model / track-side objects | ▢ |
+| 20 | Replay viewer (any leaderboard lap as ghost — logs are public by design) | ▢ |
+
+## Competition & infrastructure
+
+| # | feature | status |
+|---|---------|--------|
+| 21 | Global leaderboard (KV), weekly track rotation | ✅ |
+| 22 | Edge anti-cheat: signature + telemetry heuristics + wasm replay | ✅ |
+| 23 | Cost middle-ground: `VALIDATE_MODE=queue` — free-plan Worker defers replay to a GitHub Actions sweeper (results in ≤30 min) | 🚧 |
+| 24 | Personal best persistence (local) | 🚧 (with ghost) |
+| 25 | Named seasons / multiple concurrent tracks | ▢ |

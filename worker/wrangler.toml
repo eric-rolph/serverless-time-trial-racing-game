@@ -18,6 +18,13 @@ globs = ["**/*.wasm"]
 type = "Data"
 globs = ["**/*.bin"]
 
+[vars]
+# "edge" = replay per-submission at the edge (Workers Paid CPU budget).
+# "queue" = free-plan mode: laps park as pending:* in KV; the GitHub Actions
+#           sweeper validates them within ~30 minutes. Flip + redeploy to
+#           change cost/latency trade-off; no code changes needed.
+VALIDATE_MODE = "edge"
+
 [assets]
 directory = "public"
 

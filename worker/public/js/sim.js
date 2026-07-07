@@ -5,18 +5,26 @@ export const STATUS = { RUNNING: 0x1, LAP_COMPLETE: 0x2, OFF_TRACK: 0x4, LAP_INV
 export const TICK_RATE = 400;
 export const DT_MS = 2.5; // dyadic (2^1 + 2^-1) — accumulator subtraction is exact
 
+let cachedModule = null;
+
 export class Sim {
   static async load() {
-    const resp = await fetch("/api/sim/current");
-    if (!resp.ok) throw new Error(`sim fetch failed: ${resp.status}`);
-    const bytes = await resp.arrayBuffer();
-    const module = await WebAssembly.compile(bytes);
+    if (!cachedModule) {
+      const resp = await fetch("/api/sim/current");
+      if (!resp.ok) throw new Error(`sim fetch failed: ${resp.status}`);
+      cachedModule = await WebAssembly.compile(await resp.arrayBuffer());
+    }
+    return Sim.instantiate();
+  }
+
+  /** Fresh instance from the cached module (used for the ghost car). */
+  static async instantiate() {
     const imports = {};
-    for (const im of WebAssembly.Module.imports(module)) {
+    for (const im of WebAssembly.Module.imports(cachedModule)) {
       if (im.kind !== "function") continue;
       (imports[im.module] ??= {})[im.name] = () => 0;
     }
-    const instance = await WebAssembly.instantiate(module, imports);
+    const instance = await WebAssembly.instantiate(cachedModule, imports);
     const sim = new Sim(instance.exports);
     if (sim.e.sim_abi_version() !== 1) throw new Error("sim ABI mismatch");
     return sim;
@@ -50,6 +58,8 @@ export class Sim {
         spin: dv.getFloat32(o + 12, true),
         steer: dv.getFloat32(o + 16, true),
         compression: dv.getFloat32(o + 20, true),
+        slipRatio: dv.getFloat32(o + 24, true),
+        slipAngle: dv.getFloat32(o + 28, true),
       });
     }
     return {
@@ -71,4 +81,7 @@ export class Sim {
   }
 
   lapTimeTicks() { return this.e.sim_lap_time_ticks(); }
+
+  /** Steering rack torque (Nm) — ABI 1.1 export; 0 on older binaries. */
+  ffbTorque() { return this.e.sim_ffb_torque ? this.e.sim_ffb_torque() : 0; }
 }

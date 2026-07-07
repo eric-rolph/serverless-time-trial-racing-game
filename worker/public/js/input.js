@@ -55,6 +55,19 @@ export class Input {
   /** Latest sample as floats: steer -1..1, throttle/brake 0..1. */
   sample(dtSec) {
     const gp = this.gamepad();
+    // Zero-config path for standard-mapped controllers (Xbox/PS pads): left
+    // stick X steers, analog triggers are pedals. Wheels report mapping "" and
+    // go through the calibration wizard instead.
+    if (gp && gp.mapping === "standard" && !this.cal?.steer) {
+      const dz = (v) => (Math.abs(v) < 0.08 ? 0 : v);
+      return {
+        steer: dz(gp.axes[0] ?? 0),
+        throttle: gp.buttons[7]?.value ?? 0,
+        brake: gp.buttons[6]?.value ?? 0,
+        handbrake: gp.buttons[0]?.pressed ?? false,
+        device: `${gp.id} (standard mapping)`,
+      };
+    }
     if (gp && this.cal?.steer) {
       const read = (ch, signed) => {
         const c = this.cal[ch];

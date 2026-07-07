@@ -77,6 +77,13 @@ typedef struct VehicleTuning
 
 	// Steering
 	float max_steer; // rad (±30°)
+
+	// Force-feedback signal (docs/FFB.md). Output-only; no simulation effect.
+	float ffb_trail0;		  // pneumatic trail at zero slip (m)
+	float ffb_trail_falloff;  // trail collapse rate per rad of slip angle
+	float ffb_caster_trail;	  // mechanical (caster) trail (m)
+	float ffb_scrub_radius;	  // kingpin scrub radius (m)
+	float ffb_steering_ratio; // rack:rim ratio
 } VehicleTuning;
 
 static const VehicleTuning kTuning = {
@@ -117,6 +124,12 @@ static const VehicleTuning kTuning = {
 	.handbrake_torque = 2500.0f,
 
 	.max_steer = 0.5235988f, // 30 degrees
+
+	.ffb_trail0 = 0.030f,
+	.ffb_trail_falloff = 8.3f, // trail gone by ~7° slip (past the Pacejka peak)
+	.ffb_caster_trail = 0.025f,
+	.ffb_scrub_radius = 0.008f,
+	.ffb_steering_ratio = 13.0f,
 };
 
 #define TWO_PI_F 6.2831855f
@@ -208,6 +221,7 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 	{
 		v->wheels[i] = ( WheelRuntime ){ 0 };
 	}
+	v->rack_torque = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +275,9 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 
 	// Steering: linear map, front axle only.
 	float steer_angle = steer * t->max_steer;
+
+	// FFB: front-axle rack torque accumulated over the wheel loop.
+	float rack = 0.0f;
 
 	b3QueryFilter rayFilter = b3DefaultQueryFilter();
 	rayFilter.categoryBits = SIM_CAT_CHASSIS;
@@ -399,6 +416,21 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 		b3Vec3 tire_force = b3Add( b3MulSV( fx, wheel_fwd ), b3MulSV( fy, wheel_side ) );
 		b3Body_ApplyForce( chassis, tire_force, ray.point, true );
 
+		// --- FFB rack torque (front axle only, output-only) ---
+		// Lateral force acts behind the steering axis by pneumatic + caster
+		// trail; the pneumatic component collapses as slip passes the Pacejka
+		// peak, which is the natural "light wheel" understeer cue.
+		if ( sIsFront( i ) )
+		{
+			float trail_scale = 1.0f - b3AbsFloat( slip_angle ) * t->ffb_trail_falloff;
+			if ( trail_scale < 0.0f )
+			{
+				trail_scale = 0.0f;
+			}
+			float trail = t->ffb_trail0 * trail_scale + t->ffb_caster_trail;
+			rack += fy * trail + fx * t->ffb_scrub_radius;
+		}
+
 		// --- Wheel spin dynamics (RWD, brakes on all four) ---
 		float drive = 0.0f;
 		if ( !sIsFront( i ) && !handbrake )
@@ -450,6 +482,8 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 			w->spin_angle += TWO_PI_F;
 		}
 	}
+
+	v->rack_torque = rack / t->ffb_steering_ratio;
 
 	// --- Aerodynamic drag at the center of mass ---
 	b3Vec3 vel = b3Body_GetLinearVelocity( chassis );

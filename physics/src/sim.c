@@ -617,6 +617,11 @@ uint32_t sim_lap_time_ticks( void )
 	return g_sim.lap_time_ticks;
 }
 
+float sim_ffb_torque( void )
+{
+	return g_sim.vehicle.rack_torque;
+}
+
 const SimStateV1* sim_state( void )
 {
 	return &g_sim.state;

@@ -27,6 +27,11 @@ import { verifySignature } from "./verify";
 
 export interface Env {
   LEADERBOARD: KVNamespace;
+  /** "edge" (default): replay at the edge, needs Workers Paid CPU budget.
+   *  "queue": free-plan mode — verify signature + heuristics here, park the
+   *  log in KV as pending:*, and let the GitHub Actions sweeper
+   *  (.github/workflows/validate-pending.yml) replay it within ~30 min. */
+  VALIDATE_MODE?: string;
 }
 
 const trackBytes = new Uint8Array(TRACK_BIN as ArrayBuffer);
@@ -190,6 +195,21 @@ async function processLog(
     });
   }
   ws.send(JSON.stringify({ type: "ack", stage: "heuristics" }));
+
+  // Free-tier mode: defer the CPU-heavy replay to the Actions sweeper.
+  if (env.VALIDATE_MODE === "queue") {
+    let b64 = "";
+    for (let i = 0; i < rawBytes.length; i += 0x8000) {
+      b64 += btoa(String.fromCharCode(...rawBytes.subarray(i, i + 0x8000)));
+    }
+    const key = `pending:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+    await env.LEADERBOARD.put(
+      key,
+      JSON.stringify({ name: header.name, pubkey: header.pubkey, sig: header.sig, logB64: b64, flags: verdict.flags, submittedAt: new Date().toISOString() }),
+      { expirationTtl: 7 * 24 * 3600 },
+    );
+    return done({ type: "result", status: "pending", lapTimeMs: ticksToMs(log.claimedLapTicks) });
+  }
 
   // 3+4. Headless replay through the same physics binary ------------------------
   const replay = replayLap(SIM_WASM, trackBytes, log, rawBytes);
