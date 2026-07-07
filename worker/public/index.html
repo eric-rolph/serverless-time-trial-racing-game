@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serverless Time Trial</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e14; color: #e6e6e6;
+               font-family: "Segoe UI", system-ui, sans-serif; }
+  #gl { position: fixed; inset: 0; display: block; }
+  .panel { position: fixed; background: rgba(10,14,22,.78); border: 1px solid #2a3448;
+           border-radius: 10px; padding: 10px 14px; backdrop-filter: blur(4px); }
+  #hud { top: 14px; left: 14px; min-width: 210px; }
+  #hud .time { font-size: 34px; font-variant-numeric: tabular-nums; font-weight: 600; }
+  #hud .speed { font-size: 20px; color: #8fd3ff; font-variant-numeric: tabular-nums; }
+  #hud .sub { font-size: 12px; color: #9aa7bd; }
+  #board { top: 14px; right: 14px; width: 250px; }
+  #board h3 { margin: 2px 0 8px; font-size: 14px; letter-spacing: .08em; color: #9aa7bd; }
+  #board ol { margin: 0; padding-left: 22px; font-size: 13px; }
+  #board li { margin: 2px 0; font-variant-numeric: tabular-nums; }
+  #board li b { color: #ffd479; }
+  #map { bottom: 14px; left: 14px; padding: 8px; }
+  #status { bottom: 14px; left: 50%; transform: translateX(-50%); font-size: 14px;
+            text-align: center; max-width: 620px; }
+  #status .ok { color: #7fe3a1; } #status .bad { color: #ff8f8f; } #status .info { color: #8fd3ff; }
+  #config { top: 14px; left: 50%; transform: translateX(-50%); display: none; width: 360px; }
+  #config h3 { margin: 2px 0 8px; font-size: 14px; }
+  #config .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; }
+  #config .row label { width: 70px; }
+  #config meter { flex: 1; }
+  button { background: #21304a; color: #dbe6ff; border: 1px solid #3b4d6e; border-radius: 6px;
+           padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #2b3f61; }
+  input[type=text] { background: #101827; color: #e6e6e6; border: 1px solid #2a3448;
+                     border-radius: 6px; padding: 4px 8px; width: 130px; }
+  kbd { background: #1a2333; border: 1px solid #33415e; border-radius: 4px; padding: 0 5px;
+        font-size: 11px; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="hud" class="panel">
+  <div class="time" id="lapTime">0:00.000</div>
+  <div class="speed"><span id="speed">0</span> km/h</div>
+  <div class="sub" id="lapInfo">best: — &nbsp; last: —</div>
+  <div class="sub" style="margin-top:6px">
+    <kbd>←→</kbd>/<kbd>A D</kbd> steer &nbsp;<kbd>↑</kbd>/<kbd>W</kbd> throttle
+    &nbsp;<kbd>↓</kbd>/<kbd>S</kbd> brake &nbsp;<kbd>R</kbd> restart &nbsp;<kbd>I</kbd> wheel setup
+  </div>
+  <div class="row" style="margin-top:8px; display:flex; gap:6px; align-items:center">
+    <input type="text" id="name" placeholder="driver name" maxlength="24">
+  </div>
+</div>
+
+<div id="board" class="panel">
+  <h3>GLOBAL LEADERBOARD</h3>
+  <ol id="entries"><li class="sub">loading…</li></ol>
+</div>
+
+<div id="map" class="panel"><canvas id="minimap" width="220" height="220"></canvas></div>
+
+<div id="status" class="panel"><span class="info" id="statusText">loading physics…</span></div>
+
+<div id="config" class="panel">
+  <h3>WHEEL / PEDAL SETUP <span class="sub">(Gamepad API — press a pedal or turn the wheel once so the browser exposes the device)</span></h3>
+  <div class="row"><label>device</label><span id="gpName" class="sub">none detected</span></div>
+  <div class="row"><label>steering</label><meter id="mSteer" min="-1" max="1" value="0"></meter>
+    <button data-cal="steer">detect</button></div>
+  <div class="row"><label>throttle</label><meter id="mThrottle" min="0" max="1" value="0"></meter>
+    <button data-cal="throttle">detect</button></div>
+  <div class="row"><label>brake</label><meter id="mBrake" min="0" max="1" value="0"></meter>
+    <button data-cal="brake">detect</button></div>
+  <div class="row sub" id="calMsg">click detect, then move only that control</div>
+  <div class="row"><button id="closeConfig">close</button></div>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

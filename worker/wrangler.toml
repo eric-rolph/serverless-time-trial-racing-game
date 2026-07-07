@@ -18,5 +18,8 @@ globs = ["**/*.wasm"]
 type = "Data"
 globs = ["**/*.bin"]
 
+[assets]
+directory = "public"
+
 [observability]
 enabled = true

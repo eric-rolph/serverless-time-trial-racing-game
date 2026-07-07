@@ -51,6 +51,8 @@ Iteration counter and verification log at the bottom.
 | 8 | Worker deployed to edge; Blob binary-frame normalization fix | sttr-referee.ericrolph.workers.dev |
 | 9 | LIVE E2E ACCEPTED: autopilot lap 62.035 s, edge replay hash match, KV rank 1 | + wasmtime replay = same hash (3-host determinism) |
 | 10 | **VERIFICATION PASS #2** | see below |
+| 11 | Web client shipped: browser game on Workers static assets (free), Gamepad API wheel support + calibration wizard, minimap, three.js renderer | in-browser autopilot lap ACCEPTED via full browser stack (noble-ed25519 + WS) |
+| 12 | FFB research + integration design | docs/FFB.md — rack-torque model, DirectInput plan, ffb.toml schema |
 
 ### Verification passes (every 5 iterations)
 

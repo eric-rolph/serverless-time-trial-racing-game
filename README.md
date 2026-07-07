@@ -36,8 +36,13 @@ and redeploys the referee worldwide. Fresh leaderboard every week.
 
 ## Live deployment
 
-- Referee: `https://sttr-referee.ericrolph.workers.dev` (`/api/leaderboard`,
-  `/api/track/current`, `/api/sim/current`, `/api/submit` via WebSocket)
+- **Play in the browser: <https://sttr-referee.ericrolph.workers.dev>** — same
+  wasm physics, same referee; wheel/pedals via the Gamepad API (press <kbd>I</kbd>
+  in-game for the calibration wizard). Keyboard works too but carries heuristic
+  flags. Torque force feedback is native-client-only (browsers can't do PID FFB
+  — see [docs/FFB.md](docs/FFB.md)).
+- Referee API: `/api/leaderboard`, `/api/track/current`, `/api/sim/current`,
+  `/api/submit` (WebSocket)
 - Always race with the **canonical** binaries the referee validates against:
   `curl -O https://sttr-referee.ericrolph.workers.dev/api/sim/current` — a
   self-built `sim.wasm` from a different compiler version will replay-mismatch.
