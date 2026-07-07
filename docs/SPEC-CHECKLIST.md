@@ -53,6 +53,7 @@ Iteration counter and verification log at the bottom.
 | 10 | **VERIFICATION PASS #2** | see below |
 | 11 | Web client shipped: browser game on Workers static assets (free), Gamepad API wheel support + calibration wizard, minimap, three.js renderer | in-browser autopilot lap ACCEPTED via full browser stack (noble-ed25519 + WS) |
 | 12 | FFB research + integration design | docs/FFB.md — rack-torque model, DirectInput plan, ffb.toml schema |
+| 13 | Must-have wave 1 (docs/MUST-HAVES.md): ghost+delta+sectors, countdown, controller zero-config, WebHID FFB, audio, cameras, `sim_ffb_torque` ABI 1.1, VALIDATE_MODE=queue + sweeper | native hashes unchanged (75691d62…, 6f375f28…); prod e2e re-accepted with new binary |
 
 ### Verification passes (every 5 iterations)
 
