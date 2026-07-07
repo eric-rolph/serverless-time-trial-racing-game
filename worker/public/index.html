@@ -65,15 +65,19 @@
 <div id="status" class="panel"><span class="info" id="statusText">loading physics…</span></div>
 
 <div id="config" class="panel">
-  <h3>WHEEL / PEDAL SETUP <span class="sub">(Gamepad API — press a pedal or turn the wheel once so the browser exposes the device)</span></h3>
-  <div class="row"><label>device</label><span id="gpName" class="sub">none detected</span></div>
+  <h3>WHEEL / PEDAL SETUP <span class="sub">(Gamepad API — wiggle EACH device once so the browser exposes it; wheel, pedals and handbrake can be separate USB devices)</span></h3>
+  <div class="row" style="align-items:flex-start"><label>devices</label>
+    <span id="gpName" class="sub" style="flex:1">none detected</span></div>
   <div class="row"><label>steering</label><meter id="mSteer" min="-1" max="1" value="0"></meter>
     <button data-cal="steer">detect</button></div>
   <div class="row"><label>throttle</label><meter id="mThrottle" min="0" max="1" value="0"></meter>
     <button data-cal="throttle">detect</button></div>
   <div class="row"><label>brake</label><meter id="mBrake" min="0" max="1" value="0"></meter>
     <button data-cal="brake">detect</button></div>
-  <div class="row sub" id="calMsg">click detect, then move only that control</div>
+  <div class="row"><label>handbrake</label><meter id="mHandbrake" min="0" max="1" value="0"></meter>
+    <button data-cal="handbrake">detect</button></div>
+  <div class="row sub" id="calMsg">click detect, then move only that control (any device)</div>
+  <div class="row"><button id="clearCal">clear all bindings</button></div>
   <hr style="border-color:#2a3448">
   <h3>FORCE FEEDBACK <span class="sub">(WebHID — experimental, Fanatec bases, Chrome/Edge)</span></h3>
   <div class="row"><button id="ffbConnect">connect wheel FFB</button>

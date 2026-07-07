@@ -1,15 +1,29 @@
-// Input: keyboard fallback + Gamepad API wheel/pedals with a per-channel
-// calibration wizard (rest value + extreme captured while the user moves only
-// that control — handles inverted pedals and combined axes automatically).
+// Input: keyboard fallback, zero-config standard controllers, and multi-device
+// wheel rigs via per-channel calibration. Sim rigs are several USB devices
+// (wheel base, pedals, handbrake...) — each channel binds to ITS OWN device:
+// detection scans the axes of EVERY connected gamepad and picks whichever
+// (device, axis) moved the most. Bindings persist by device id string, so a
+// steering wheel, Heusinkveld pedals, and a handbrake all coexist.
+//
+// Browser quirk: a device only appears in navigator.getGamepads() after you
+// interact with it once (press/turn it) — the setup panel says so.
 
-const CAL_KEY = "sttr-input-cal-v1";
+const CAL_KEY = "sttr-input-cal-v2"; // v1 was single-device; ignored on load
+
+export const CHANNELS = ["steer", "throttle", "brake", "handbrake"];
 
 export class Input {
   constructor() {
     this.keys = new Set();
     this.kSteer = 0; // slewed keyboard steering
-    this.cal = JSON.parse(localStorage.getItem(CAL_KEY) ?? "null"); // {steer:{axis,rest,ext},throttle:{...},brake:{...}}
-    this.calibrating = null; // {channel, baseline:[...], t0}
+    this.cal = null; // { steer: {id, axis, rest, ext}, throttle: {...}, ... }
+    try {
+      const stored = JSON.parse(localStorage.getItem(CAL_KEY) ?? "null");
+      if (stored && Object.values(stored).every((c) => typeof c?.id === "string")) this.cal = stored;
+    } catch {
+      /* corrupted -> recalibrate */
+    }
+    this.calibrating = null;
     this.onCalDone = null;
     addEventListener("keydown", (e) => {
       if (!e.repeat) this.keys.add(e.code);
@@ -17,14 +31,26 @@ export class Input {
     addEventListener("keyup", (e) => this.keys.delete(e.code));
   }
 
-  gamepad() {
-    return [...(navigator.getGamepads?.() ?? [])].find((g) => g && g.connected && g.axes.length >= 2) ?? null;
+  /** All connected gamepads (each USB device of a rig is its own entry). */
+  gamepads() {
+    return [...(navigator.getGamepads?.() ?? [])].filter((g) => g && g.connected);
   }
 
+  padById(id) {
+    return this.gamepads().find((g) => g.id === id) ?? null;
+  }
+
+  /** Begin per-channel detection across ALL devices. */
   startCalibration(channel, onDone) {
-    const gp = this.gamepad();
-    if (!gp) return false;
-    this.calibrating = { channel, baseline: [...gp.axes], best: -1, bestDev: 0, t0: performance.now() };
+    const pads = this.gamepads();
+    if (!pads.length) return false;
+    this.calibrating = {
+      channel,
+      baselines: new Map(pads.map((g) => [g.index, [...g.axes]])),
+      best: null,
+      bestDev: 0,
+      t0: performance.now(),
+    };
     this.onCalDone = onDone;
     return true;
   }
@@ -33,61 +59,76 @@ export class Input {
   tickCalibration() {
     const c = this.calibrating;
     if (!c) return;
-    const gp = this.gamepad();
-    if (!gp) return;
-    gp.axes.forEach((v, i) => {
-      const dev = Math.abs(v - c.baseline[i]);
-      if (dev > c.bestDev) { c.bestDev = dev; c.best = i; c.ext = v; }
-    });
+    for (const gp of this.gamepads()) {
+      let base = c.baselines.get(gp.index);
+      if (!base) {
+        c.baselines.set(gp.index, [...gp.axes]); // hot-plugged mid-calibration
+        continue;
+      }
+      gp.axes.forEach((v, i) => {
+        const dev = Math.abs(v - base[i]);
+        if (dev > c.bestDev) {
+          c.bestDev = dev;
+          c.best = { id: gp.id, axis: i, rest: base[i], ext: v };
+        }
+      });
+    }
     if (performance.now() - c.t0 > 2500) {
-      if (c.best >= 0 && c.bestDev > 0.25) {
+      if (c.best && c.bestDev > 0.25) {
         this.cal ??= {};
-        this.cal[c.channel] = { axis: c.best, rest: c.baseline[c.best], ext: c.ext };
+        this.cal[c.channel] = c.best;
         localStorage.setItem(CAL_KEY, JSON.stringify(this.cal));
-        this.onCalDone?.(`${c.channel} → axis ${c.best}`);
+        const short = c.best.id.split("(")[0].trim().slice(0, 28);
+        this.onCalDone?.(`${c.channel} → "${short}" axis ${c.best.axis}`);
       } else {
-        this.onCalDone?.(`${c.channel}: no movement detected, try again`);
+        this.onCalDone?.(
+          `${c.channel}: no movement seen on any device — wiggle it once first (browser hides idle devices), then retry`,
+        );
       }
       this.calibrating = null;
     }
   }
 
+  /** Read one calibrated channel from its own device. null = unbound/missing. */
+  readChannel(ch, signed) {
+    const c = this.cal?.[ch];
+    if (!c) return null;
+    const gp = this.padById(c.id);
+    if (!gp) return null;
+    const v = gp.axes[c.axis] ?? c.rest;
+    const span = c.ext - c.rest;
+    if (Math.abs(span) < 1e-3) return null;
+    const n = (v - c.rest) / span; // 1 = the direction moved during detect
+    // Signed channel (steering): the wizard says "turn LEFT", and left is -1
+    // in the sim convention — so the detect direction maps to -1. This makes
+    // polarity deterministic regardless of the device's native axis sign.
+    return signed ? Math.max(-1, Math.min(1, -n)) : Math.max(0, Math.min(1, n));
+  }
+
   /** Latest sample as floats: steer -1..1, throttle/brake 0..1. */
   sample(dtSec) {
-    const gp = this.gamepad();
-    // Zero-config path for standard-mapped controllers (Xbox/PS pads): left
-    // stick X steers, analog triggers are pedals. Wheels report mapping "" and
-    // go through the calibration wizard instead.
-    if (gp && gp.mapping === "standard" && !this.cal?.steer) {
-      const dz = (v) => (Math.abs(v) < 0.08 ? 0 : v);
+    // Calibrated multi-device rig takes precedence.
+    if (this.cal?.steer) {
+      const boundIds = new Set(CHANNELS.map((ch) => this.cal?.[ch]?.id).filter(Boolean));
+      const present = [...boundIds].filter((id) => this.padById(id)).length;
       return {
-        steer: dz(gp.axes[0] ?? 0),
-        throttle: gp.buttons[7]?.value ?? 0,
-        brake: gp.buttons[6]?.value ?? 0,
-        handbrake: gp.buttons[0]?.pressed ?? false,
-        device: `${gp.id} (standard mapping)`,
+        steer: this.readChannel("steer", true) ?? 0,
+        throttle: this.readChannel("throttle", false) ?? 0,
+        brake: this.readChannel("brake", false) ?? 0,
+        handbrake: (this.readChannel("handbrake", false) ?? 0) > 0.5 || this.keys.has("Space"),
+        device: `rig: ${present}/${boundIds.size} bound device(s) present`,
       };
     }
-    if (gp && this.cal?.steer) {
-      const read = (ch, signed) => {
-        const c = this.cal[ch];
-        if (!c) return 0;
-        const v = gp.axes[c.axis] ?? c.rest;
-        const span = c.ext - c.rest;
-        if (Math.abs(span) < 1e-3) return 0;
-        const n = (v - c.rest) / span;
-        return signed ? Math.max(-1, Math.min(1, n)) : Math.max(0, Math.min(1, n));
-      };
-      // Steering: calibration captured one extreme; assume symmetric range
-      // around rest (true for wheels reporting -1..1 with 0 center).
-      const s = this.cal.steer;
-      const steerRaw = ((gp.axes[s.axis] ?? s.rest) - s.rest) / Math.abs(s.ext - s.rest);
+    // Zero-config controllers: prefer a standard-mapped pad among ALL devices.
+    const std = this.gamepads().find((g) => g.mapping === "standard");
+    if (std) {
+      const dz = (v) => (Math.abs(v) < 0.08 ? 0 : v);
       return {
-        steer: Math.max(-1, Math.min(1, steerRaw * Math.sign(s.ext - s.rest))),
-        throttle: read("throttle", false),
-        brake: read("brake", false),
-        handbrake: gp.buttons?.[0]?.pressed ?? false,
-        device: gp.id,
+        steer: dz(std.axes[0] ?? 0),
+        throttle: std.buttons[7]?.value ?? 0,
+        brake: std.buttons[6]?.value ?? 0,
+        handbrake: std.buttons[0]?.pressed ?? false,
+        device: `${std.id.slice(0, 40)} (standard mapping)`,
       };
     }
     // Keyboard: slewed steering so it's actually drivable.
@@ -96,13 +137,19 @@ export class Input {
     const slew = 3.0 * dtSec;
     this.kSteer += Math.max(-slew, Math.min(slew, target - this.kSteer));
     if (target === 0) this.kSteer *= Math.max(0, 1 - 6 * dtSec);
+    const pads = this.gamepads();
     return {
       steer: this.kSteer,
       throttle: this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0,
       brake: this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0,
       handbrake: this.keys.has("Space"),
-      device: gp ? `${gp.id} (uncalibrated — press I)` : "keyboard",
+      device: pads.length ? `keyboard (${pads.length} device(s) seen — press I to bind)` : "keyboard",
     };
+  }
+
+  clearCalibration() {
+    this.cal = null;
+    localStorage.removeItem(CAL_KEY);
   }
 }
 

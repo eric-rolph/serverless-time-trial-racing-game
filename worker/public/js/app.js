@@ -219,13 +219,18 @@ addEventListener("pointerdown", () => audio.start());
 for (const btn of document.querySelectorAll("[data-cal]")) {
   btn.addEventListener("click", () => {
     const ch = btn.dataset.cal;
-    $("calMsg").textContent = `move ONLY the ${ch} control now…`;
+    $("calMsg").textContent =
+      ch === "steer" ? "turn the wheel fully LEFT now…" : `press/pull the ${ch} fully now…`;
     if (!input.startCalibration(ch, (msg) => ($("calMsg").textContent = msg))) {
-      $("calMsg").textContent = "no gamepad — turn the wheel / press a pedal first, then retry";
+      $("calMsg").textContent = "no devices visible — wiggle each one once (browser hides idle devices), then retry";
     }
   });
 }
 $("closeConfig").addEventListener("click", () => ($("config").style.display = "none"));
+$("clearCal").addEventListener("click", () => {
+  input.clearCalibration();
+  $("calMsg").textContent = "bindings cleared — detect each channel again";
+});
 
 // FFB UI (WebHID, experimental)
 if (!FanatecFFB.supported()) $("ffbConnect").disabled = true;
@@ -465,7 +470,11 @@ function frame(now) {
     $("mSteer").value = raw.steer;
     $("mThrottle").value = raw.throttle;
     $("mBrake").value = raw.brake;
-    $("gpName").textContent = raw.device;
+    $("mHandbrake").value = raw.handbrake ? 1 : 0;
+    const pads = input.gamepads();
+    $("gpName").textContent = pads.length
+      ? pads.map((p) => p.id.split("(")[0].trim().slice(0, 34)).join("  ·  ") + `  —  ${raw.device}`
+      : "none detected — wiggle each device once";
   }
 }
 
@@ -483,4 +492,5 @@ window.__sttr = {
   track: { center: track.center, tangent: track.tangent },
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),
+  input,
 };
