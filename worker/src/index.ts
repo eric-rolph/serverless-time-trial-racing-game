@@ -3,7 +3,11 @@
 
 // Bundled artifacts — wrangler rules: CompiledWasm for .wasm, Data for .bin.
 // CI copies the freshly built sim.wasm + weekly track here before deploy.
+// sim_wasm.bin is the same bytes as sim.wasm, imported as Data so we can SERVE
+// the canonical binary to clients — a self-built sim.wasm from a different
+// compiler version would hash-mismatch on replay.
 import SIM_WASM from "../assets/sim.wasm";
+import SIM_WASM_BYTES from "../assets/sim_wasm.bin";
 import TRACK_BIN from "../assets/track.bin";
 
 import { analyzeSteer } from "./heuristics";
@@ -46,7 +50,16 @@ export default {
           service: "sttr-referee",
           rev: 4,
           track: trackHashHex,
-          endpoints: ["/api/submit (ws)", "/api/leaderboard", "/api/track/current"],
+          endpoints: ["/api/submit (ws)", "/api/leaderboard", "/api/track/current", "/api/sim/current"],
+        });
+
+      case "/api/sim/current":
+        return new Response(SIM_WASM_BYTES, {
+          headers: {
+            "content-type": "application/wasm",
+            "x-sim-hash": hex64(fnv1a64(new Uint8Array(SIM_WASM_BYTES as ArrayBuffer))),
+            "access-control-allow-origin": "*",
+          },
         });
 
       case "/api/track/current":

@@ -47,7 +47,7 @@ jobs:
 
       - uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 4.0.10
+          version: 6.0.2
 
       - name: Build sim.wasm (Box3D C17 -> Emscripten, strict IEEE fp)
         run: bash physics/build_wasm.sh
@@ -59,6 +59,7 @@ jobs:
         run: |
           mkdir -p worker/assets
           cp physics/out/sim.wasm worker/assets/sim.wasm
+          cp physics/out/sim.wasm worker/assets/sim_wasm.bin
           cp assets/tracks/week-${{ steps.seed.outputs.seed }}/track.bin worker/assets/track.bin
 
       - uses: actions/setup-node@v4
