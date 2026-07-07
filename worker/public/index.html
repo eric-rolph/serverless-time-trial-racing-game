@@ -77,6 +77,9 @@
   <div class="row"><label>handbrake</label><meter id="mHandbrake" min="0" max="1" value="0"></meter>
     <button data-cal="handbrake">detect</button></div>
   <div class="row sub" id="calMsg">click detect, then move only that control (any device)</div>
+  <div class="row"><button id="addHid">add device via raw HID (WebHID)</button>
+    <span class="sub">for devices the browser lists but never reads (Fanatec bases/pedals) — pick them here instead</span></div>
+  <div class="row sub" id="hidDiag"></div>
   <div class="row"><button id="clearCal">clear all bindings</button></div>
   <hr style="border-color:#2a3448">
   <h3>FORCE FEEDBACK <span class="sub">(WebHID — experimental, Fanatec bases, Chrome/Edge)</span></h3>

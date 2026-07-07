@@ -7,6 +7,7 @@ import { Input, quantize } from "./input.js";
 import { buildLapLog, submitLap, fetchLeaderboard, fetchReplay, fmtMs } from "./lap.js";
 import { EngineAudio } from "./audio.js";
 import { FanatecFFB } from "./ffb.js";
+import { addHidDevices, autoReconnectHid, hidDiagnostics, hidVirtualPads, registerHidDevice } from "./hid-input.js";
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (text, cls = "info") => { $("statusText").textContent = text; $("statusText").className = cls; };
@@ -156,6 +157,11 @@ async function raceReplay(entry) {
 
 // ---------------------------------------------------------------- game state
 const input = new Input();
+input.setVirtualPads(hidVirtualPads);
+// Reopen previously-granted WebHID input devices (permission persists).
+autoReconnectHid().then((n) => {
+  if (n) $("calMsg").textContent = `${n} WebHID device(s) reconnected — bindings ready`;
+});
 const minimap = new Minimap($("minimap"), track);
 const audio = new EngineAudio();
 const fellOffY = Math.min(...track.center.map((c) => c[1])) - 25;
@@ -231,6 +237,16 @@ $("clearCal").addEventListener("click", () => {
   input.clearCalibration();
   $("calMsg").textContent = "bindings cleared — detect each channel again";
 });
+$("addHid").addEventListener("click", async () => {
+  try {
+    const n = await addHidDevices();
+    $("calMsg").textContent = n
+      ? `${n} device(s) added via raw HID — now detect each channel`
+      : "no device selected";
+  } catch (err) {
+    $("calMsg").textContent = `WebHID: ${err.message}`;
+  }
+});
 
 // FFB UI (WebHID, experimental)
 if (!FanatecFFB.supported()) $("ffbConnect").disabled = true;
@@ -239,15 +255,13 @@ $("ffbConnect").addEventListener("click", async () => {
     if (ffb) {
       await ffb.stop();
       ffb = null;
-      input.setVirtualPad(null);
       $("ffbConnect").textContent = "connect wheel FFB";
       $("ffbMsg").textContent = "disconnected";
       return;
     }
     ffb = await FanatecFFB.connect();
-    // Chrome hides WebHID-opened devices from the Gamepad API — expose this
-    // device's decoded HID axes to the binder as a virtual pad instead.
-    input.setVirtualPad(() => ffb?.virtualPad() ?? null);
+    // Same open connection also feeds the input binder (raw HID axes).
+    await registerHidDevice(ffb.device);
     $("ffbConnect").textContent = "disconnect FFB";
     $("ffbMsg").textContent = `connected: ${ffb.device.productName || "Fanatec base"} — now re-detect steering above (move the wheel)`;
   } catch (err) {
@@ -452,11 +466,6 @@ function frame(now) {
   if (ffb) {
     ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque(), dtMs / 1000);
     $("mFfb").value = ffb.smoothed / ffb.maxNm;
-    if ($("config").style.display === "block") {
-      $("ffbMsg").textContent =
-        `${ffb.device.productName || "wheel"}: ${ffb.axes.length} HID axes, ` +
-        `${ffb.reportsSeen} reports received${ffb.reportsSeen === 0 ? " — move the wheel to check data flow" : ""}`;
-    }
   }
 
   // ---- HUD
@@ -484,6 +493,8 @@ function frame(now) {
     $("gpName").textContent = pads.length
       ? pads.map((p) => p.id.split("(")[0].trim().slice(0, 34)).join("  ·  ") + `  —  ${raw.device}`
       : "none detected — wiggle each device once";
+    const diag = hidDiagnostics();
+    if (diag) $("hidDiag").textContent = diag + " — move a control; its report count should climb";
   }
 }
 
@@ -503,4 +514,5 @@ window.__sttr = {
   setInputOverride: (fn) => (inputOverride = fn),
   input,
   FanatecFFB,
+  registerHidDevice,
 };

@@ -15,54 +15,6 @@
 const FANATEC_VID = 0x0eb7;
 const SLOT = 1;
 
-/** Walk the parsed HID report descriptor and locate every axis-like input
- *  field (Generic Desktop page, usages X..Dial, >= 8 bits). Returns
- *  Map<reportId, [{bit, size, min, max}]> with absolute bit offsets. */
-function buildAxisMap(device) {
-  const maps = new Map();
-  for (const col of device.collections ?? []) {
-    for (const rep of col.inputReports ?? []) {
-      let bit = 0;
-      const fields = [];
-      for (const item of rep.items ?? []) {
-        const size = item.reportSize ?? 0;
-        const count = item.reportCount ?? 0;
-        const usages = item.usages ?? [];
-        for (let k = 0; k < count; k++) {
-          const usage = usages[k] ?? (item.isRange ? (item.usageMinimum ?? 0) + k : undefined);
-          if (usage !== undefined && size >= 8) {
-            const page = usage >>> 16;
-            const id = usage & 0xffff;
-            if (page === 0x01 && id >= 0x30 && id <= 0x39) {
-              fields.push({
-                bit,
-                size,
-                min: item.logicalMinimum ?? 0,
-                max: item.logicalMaximum ?? 2 ** size - 1,
-              });
-            }
-          }
-          bit += size;
-        }
-      }
-      if (fields.length) maps.set(rep.reportId ?? 0, fields);
-    }
-  }
-  return maps;
-}
-
-/** Little-endian bit-field extraction from a HID report payload. */
-function readBits(dv, bitOffset, size, signed) {
-  const start = bitOffset >> 3;
-  const shift = bitOffset & 7;
-  const nBytes = Math.min(Math.ceil((size + shift) / 8), Math.max(0, dv.byteLength - start));
-  let acc = 0;
-  for (let b = 0; b < nBytes; b++) acc += dv.getUint8(start + b) * 2 ** (8 * b);
-  let value = Math.floor(acc / 2 ** shift) % 2 ** size;
-  if (signed && value >= 2 ** (size - 1)) value -= 2 ** size;
-  return value;
-}
-
 export class FanatecFFB {
   static supported() {
     return "hid" in navigator;
@@ -90,39 +42,9 @@ export class FanatecFFB {
     this.maxNm = 8.0; // CSL DD peak
     this.invert = false;
     this.smoothed = 0;
-
-    // Chrome removes a device from the Gamepad API once a page opens it via
-    // WebHID — so we decode steering/pedal axes from the HID input reports
-    // ourselves and expose them as a virtual gamepad. The decoder is generic:
-    // built from the report descriptor metadata (Generic Desktop usages
-    // 0x30-0x39), no device-specific layout assumptions.
-    this.axes = [];
-    this.reportsSeen = 0;
-    this._axisMap = buildAxisMap(device);
-    device.addEventListener("inputreport", (e) => this._decodeInput(e));
-  }
-
-  _decodeInput(e) {
-    const fields = this._axisMap.get(e.reportId);
-    if (!fields) return;
-    this.reportsSeen++;
-    this.axes = fields.map((f) => {
-      const raw = readBits(e.data, f.bit, f.size, f.min < 0);
-      const span = f.max - f.min;
-      return span > 0 ? ((raw - f.min) / span) * 2 - 1 : 0;
-    });
-  }
-
-  /** Gamepad-shaped view of this device's HID axes (for the input binder). */
-  virtualPad() {
-    return {
-      id: `WebHID ${this.device.productName || "Fanatec"}`,
-      index: 100,
-      axes: this.axes,
-      buttons: [],
-      mapping: "",
-      connected: this.device.opened,
-    };
+    // Input-axis decoding for WebHID devices lives in hid-input.js — app.js
+    // registers this device there on connect, so torque and steering input
+    // share one open HID connection.
   }
 
   async send(bytes) {

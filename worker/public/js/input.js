@@ -31,18 +31,17 @@ export class Input {
     addEventListener("keyup", (e) => this.keys.delete(e.code));
   }
 
-  /** Register a function returning a gamepad-shaped object (or null) — used
-   *  for WebHID-backed devices that Chrome hides from the Gamepad API once a
-   *  page opens them (the FFB wheel). */
-  setVirtualPad(fn) {
-    this.virtualPad = fn;
+  /** Register a function returning gamepad-shaped objects — WebHID-backed
+   *  devices that Chrome's Gamepad API hides (once WebHID-opened) or simply
+   *  never delivers data for (known with some Fanatec bases/pedals). */
+  setVirtualPads(fn) {
+    this.virtualPadsFn = fn;
   }
 
   /** All connected input devices: native gamepads + WebHID virtual pads. */
   gamepads() {
     const pads = [...(navigator.getGamepads?.() ?? [])].filter((g) => g && g.connected);
-    const virtual = this.virtualPad?.();
-    if (virtual?.connected) pads.push(virtual);
+    for (const v of this.virtualPadsFn?.() ?? []) if (v?.connected) pads.push(v);
     return pads;
   }
 
