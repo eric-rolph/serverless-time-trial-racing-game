@@ -61,6 +61,34 @@ export function buildAmbience(track, hash = null) {
   ground.position.set(cx, groundY, cz);
   group.add(ground);
 
+  // Skirts: the terrain strip ends at the shoulders' outer edges, which float
+  // above the ground plane wherever the track climbs — connect each outer
+  // edge down to the plane with a wall strip so road and land read as one
+  // world. Terrain vertex layout (trackgen): v(i,row) = i*4+row, rows 0/3 are
+  // the outer shoulder edges.
+  {
+    const skirtMat = new THREE.MeshLambertMaterial({ color: 0x2d3b31, side: THREE.DoubleSide });
+    for (const row of [0, 3]) {
+      const pos = new Float32Array(n * 2 * 3);
+      for (let i = 0; i < n; i++) {
+        const base = (i * 4 + row) * 3;
+        const x = track.verts[base], y = track.verts[base + 1], z = track.verts[base + 2];
+        pos.set([x, y + 0.02, z], i * 6);
+        pos.set([x, groundY, z], i * 6 + 3);
+      }
+      const idx = [];
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        idx.push(2 * i, 2 * i + 1, 2 * j, 2 * j, 2 * i + 1, 2 * j + 1);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      g.setIndex(idx);
+      g.computeVertexNormals();
+      group.add(new THREE.Mesh(g, skirtMat));
+    }
+  }
+
   // ------------------------------------------------------------- trees
   // A candidate 12–25 m off one segment can still sit ON another segment of
   // the loop (hairpins, straights folding back) — reject anything within
