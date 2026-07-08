@@ -117,6 +117,9 @@ pub struct Sim {
     f_state_hash_lo: TypedFunc<(), u32>,
     f_state_hash_hi: TypedFunc<(), u32>,
     f_lap_time_ticks: TypedFunc<(), u32>,
+    /// OPTIONAL export (docs/FFB.md): steering rack torque in Nm. Absent on
+    /// kernels built before the FFB work — then `ffb_torque()` returns 0.0.
+    f_ffb_torque: Option<TypedFunc<(), f32>>,
 }
 
 impl Sim {
@@ -164,6 +167,11 @@ impl Sim {
             };
         }
 
+        // Optional FFB export — old binaries simply don't have it.
+        let f_ffb_torque = instance
+            .get_typed_func::<(), f32>(&mut store, "sim_ffb_torque")
+            .ok();
+
         let sim = Sim {
             f_abi_version: func!("sim_abi_version"),
             f_alloc: func!("sim_alloc"),
@@ -176,6 +184,7 @@ impl Sim {
             f_state_hash_lo: func!("sim_state_hash_lo"),
             f_state_hash_hi: func!("sim_state_hash_hi"),
             f_lap_time_ticks: func!("sim_lap_time_ticks"),
+            f_ffb_torque,
             memory,
             store,
         };
@@ -255,6 +264,16 @@ impl Sim {
             .read(&self.store, ptr, &mut buf)
             .context("reading SimStateV1 from wasm memory")?;
         Ok(SimState::from_bytes(&buf))
+    }
+
+    /// Steering rack torque in Nm for force feedback (docs/FFB.md). Returns
+    /// 0.0 when the loaded kernel predates the `sim_ffb_torque` export or the
+    /// call traps — FFB is best-effort and must never take the sim down.
+    pub fn ffb_torque(&mut self) -> f32 {
+        match &self.f_ffb_torque {
+            Some(f) => f.call(&mut self.store, ()).unwrap_or(0.0),
+            None => 0.0,
+        }
     }
 
     fn read_state_hash(&mut self) -> Result<u64> {

@@ -80,7 +80,8 @@ impl Identity {
     }
 }
 
-fn config_dir() -> Result<PathBuf> {
+/// App config directory (shared: signing key here, ffb.toml in ffb.rs).
+pub(crate) fn config_dir() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "sttr-client")
         .context("could not determine OS config directory")?;
     Ok(dirs.config_dir().to_path_buf())

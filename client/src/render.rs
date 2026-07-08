@@ -17,6 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::ffb::{Ffb, FfbConfig};
 use crate::game_loop::{interpolate, GameLoop};
 use crate::input::{Control, InputSource, KeyboardInput, SelectedInput};
 use crate::laplog::LapLog;
@@ -531,6 +532,7 @@ pub struct RaceContext {
     pub name: String,
     pub submit_to: Option<String>,
     pub out_path: PathBuf,
+    pub ffb: FfbConfig,
 }
 
 // Mesh slots
@@ -545,6 +547,7 @@ struct RaceApp {
     cam: FollowCam,
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
+    ffb: Option<Ffb>,
     fatal: Option<anyhow::Error>,
     last_render: Option<Instant>,
     last_title: Instant,
@@ -602,6 +605,13 @@ impl RaceApp {
             .map(|l| now.duration_since(l).as_secs_f32())
             .unwrap_or(1.0 / 60.0);
         self.last_render = Some(now);
+
+        // 2.5 force feedback: kernel rack torque -> wheel. No-op without a
+        // device; read-only on sim state (docs/FFB.md determinism note).
+        if let Some(ffb) = &mut self.ffb {
+            let torque = self.ctx.sim.ffb_torque();
+            ffb.frame(torque, rdt);
+        }
 
         let car_pos = Vec3::from(pose.pos);
         let car_quat =
@@ -724,6 +734,9 @@ impl ApplicationHandler for RaceApp {
             Ok(g) => self.gfx = Some(g),
             Err(e) => return self.fail(event_loop, e),
         }
+        // FFB needs the window's HWND for exclusive DirectInput acquisition.
+        // Never fatal: without a device the race just runs silent.
+        self.ffb = Some(Ffb::new(self.ctx.ffb.clone(), &window));
         self.window = Some(window);
     }
 
@@ -769,6 +782,7 @@ pub fn run_race(mut ctx: RaceContext) -> Result<()> {
         cam: FollowCam::new(),
         window: None,
         gfx: None,
+        ffb: None,
         fatal: None,
         last_render: None,
         last_title: Instant::now(),

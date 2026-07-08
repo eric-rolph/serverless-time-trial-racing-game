@@ -36,6 +36,17 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
+# force feedback config (ffb.toml)
+toml = "0.9"
+
+# force feedback output — DirectInput8 (docs/FFB.md); Windows-only
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
 [profile.dev]
 # wgpu/wasmtime are unusable at opt-level 0 for a 400 Hz sim; keep deps optimized
 opt-level = 1

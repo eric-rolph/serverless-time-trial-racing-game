@@ -11,12 +11,12 @@ work in the browser client unless marked native-only.
 | 2 | Wheel + pedals via Gamepad API, per-channel calibration wizard | ✅ |
 | 3 | Controller zero-config (standard gamepad mapping: stick + analog triggers) | ✅ |
 | 4 | Wheel torque FFB in the browser — WebHID, Fanatec protocol (experimental) | ✅ shipped, awaiting hardware test |
-| 5 | FFB in native client (DirectInput constant force, ffb.toml) | ▢ (docs/FFB.md design done) |
+| 5 | FFB in native client (DirectInput constant force, ffb.toml) | 🚧 in flight |
 | 6 | Steering sensitivity / rotation-range setting + invert | ✅ |
 | 6b | Physically-based tire model: discretized brush patch, emergent pneumatic trail (SAT/FFB), 2-node thermal + track conduction + lockup flash-heat, combined-slip budget (docs/TIRE-MODEL.md) | ✅ |
 | 6c | Analytic C1 road surface for tires — decoupled from the low-poly visual/collision mesh: CR-interpolated frames, crown, smooth kerb profile, banking-continuous camber; 1600 Hz tire substepping (docs/ROAD-SURFACE.md) | ✅ |
 | 6d | Tire temps on HUD (sim_tire_temp, ABI 1.2) | ✅ |
-| 6e | Physics wave 3: unsprung mass (quarter-car), kinematic camber/toe curves + camber thrust, inertia tensor from mass layout | ▢ next |
+| 6e | Physics wave 3: unsprung mass (quarter-car), kinematic camber/toe curves + camber thrust, inertia tensor from mass layout (docs/SUSPENSION.md) | 🚧 in flight |
 
 ## Driving & timing core
 

@@ -6,6 +6,7 @@
 //!   replay  headless local verification of a lap.laplog through sim.wasm
 //!   devices list input devices gilrs can see
 
+mod ffb;
 mod game_loop;
 mod input;
 mod laplog;
@@ -85,6 +86,9 @@ struct RaceArgs {
     /// Where to write the recorded lap.
     #[arg(long, default_value = "lap.laplog")]
     out: PathBuf,
+    /// Disable force feedback output (overrides ffb.toml).
+    #[arg(long)]
+    no_ffb: bool,
 }
 
 #[derive(Args)]
@@ -220,6 +224,12 @@ fn cmd_race(args: RaceArgs) -> Result<()> {
 
     let input = select_input(&args)?;
 
+    // FFB config from the OS config dir (written on first run); --no-ffb wins.
+    let mut ffb_config = ffb::FfbConfig::load_or_create_default();
+    if args.no_ffb {
+        ffb_config.enabled = false;
+    }
+
     render::run_race(render::RaceContext {
         sim,
         track,
@@ -227,6 +237,7 @@ fn cmd_race(args: RaceArgs) -> Result<()> {
         name: args.name,
         submit_to: args.submit_to,
         out_path: args.out,
+        ffb: ffb_config,
     })
 }
 
