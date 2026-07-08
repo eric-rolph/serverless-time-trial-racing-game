@@ -38,6 +38,33 @@ export function fnv1a64(bytes) {
 
 const v3 = (a) => new THREE.Vector3(a[0], a[1], a[2]);
 
+// Curvature constants shared by the kerb paint (below) and trackside ambience
+// (js/ambience.js). Mirrors the generator's rule (trackgen/generate_track.py:
+// KERB_KAPPA, smoothing window).
+export const KERB_KAPPA = 0.022;
+export const KERB_SMOOTH = 15;
+
+/** Smoothed signed curvature per centerline sample (sign = turn direction).
+ *  Same math the kerb painter uses; exported so ambience placement (tire
+ *  barriers, braking boards) agrees with where the kerbs are. */
+export function smoothedCurvature(track, smooth = KERB_SMOOTH) {
+  const n = track.S;
+  const raw = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = track.tangent[i];
+    const t2 = track.tangent[(i + 1) % n];
+    raw[i] = (t[0] * t2[2] - t[2] * t2[0]) / 2.5;
+  }
+  const kappa = new Float32Array(n);
+  const half = (smooth / 2) | 0;
+  for (let i = 0; i < n; i++) {
+    let sum = 0;
+    for (let k = -half; k <= half; k++) sum += raw[(i + k + n) % n];
+    kappa[i] = sum / smooth;
+  }
+  return kappa;
+}
+
 export function buildTrackMeshes(track) {
   const group = new THREE.Group();
 
@@ -85,24 +112,12 @@ export function buildTrackMeshes(track) {
     group.add(new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xdfe6f0 })));
   }
 
-  // Kerb visuals: red/white striped strips through tight corners. Mirrors the
-  // generator's rule (trackgen/generate_track.py: KERB_KAPPA, smoothing window)
-  // — the physical rumble geometry is in the terrain mesh; this is the paint.
-  const KERB_KAPPA = 0.022;
-  const KERB_SMOOTH = 15;
+  // Kerb visuals: red/white striped strips through tight corners — the
+  // physical rumble geometry is in the terrain mesh; this is the paint.
+  // (Curvature math + constants live in smoothedCurvature above, shared with
+  // js/ambience.js so barriers/boards land on the same corners.)
   const KERB_WIDTH = 1.1;
-  const raw = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const t = track.tangent[i];
-    const t2 = track.tangent[(i + 1) % n];
-    raw[i] = (t[0] * t2[2] - t[2] * t2[0]) / 2.5;
-  }
-  const kappa = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    let sum = 0;
-    for (let k = -((KERB_SMOOTH / 2) | 0); k <= (KERB_SMOOTH / 2) | 0; k++) sum += raw[(i + k + n) % n];
-    kappa[i] = sum / KERB_SMOOTH;
-  }
+  const kappa = smoothedCurvature(track);
   const kerbPos = [];
   const kerbCol = [];
   const red = [0.85, 0.2, 0.16], white = [0.92, 0.92, 0.9];

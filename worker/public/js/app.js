@@ -6,6 +6,9 @@ import { parseTrack, buildTrackMeshes, Minimap, fnv1a64 } from "./track.js";
 import { Input, quantize } from "./input.js";
 import { buildLapLog, submitLap, fetchLeaderboard, fetchReplay, fmtMs } from "./lap.js";
 import { EngineAudio } from "./audio.js";
+import { buildCar, buildWheel } from "./car.js";
+import { buildAmbience } from "./ambience.js";
+import { Lighting } from "./lighting.js";
 import { FanatecFFB } from "./ffb.js";
 import { addHidDevices, autoReconnectHid, hidDiagnostics, hidDump, hidVirtualPads, registerHidDevice } from "./hid-input.js";
 
@@ -18,7 +21,8 @@ const [sim, trackResp] = await Promise.all([Sim.load(), fetch("/api/track/curren
 const trackBuf = await trackResp.arrayBuffer();
 const track = parseTrack(trackBuf);
 sim.loadTrack(new Uint8Array(trackBuf));
-const trackHashHex = fnv1a64(track.bytes).toString(16).padStart(16, "0");
+const trackHash = fnv1a64(track.bytes);
+const trackHashHex = trackHash.toString(16).padStart(16, "0");
 
 $("name").value = localStorage.getItem("sttr-name") ?? "";
 $("name").addEventListener("change", () => localStorage.setItem("sttr-name", $("name").value));
@@ -31,39 +35,25 @@ scene.background = new THREE.Color(0x0e1420);
 scene.fog = new THREE.Fog(0x0e1420, 150, 480);
 const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 800);
 
-scene.add(new THREE.HemisphereLight(0xbdd4ff, 0x2a2f38, 1.25));
-const sun = new THREE.DirectionalLight(0xfff2d8, 1.7);
-sun.position.set(120, 180, 60);
-scene.add(sun);
 scene.add(buildTrackMeshes(track));
+// Trackside dressing — trees, tire barriers, gantry, brake boards — all
+// seeded from the track hash so placement is deterministic per track.
+const ambience = buildAmbience(track, trackHash);
+scene.add(ambience);
 
-function buildCar(color, opacity = 1) {
-  const group = new THREE.Group();
-  const mat = (c) =>
-    new THREE.MeshLambertMaterial({ color: c, transparent: opacity < 1, opacity, depthWrite: opacity === 1 });
-  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.9, 4.4), mat(color));
-  chassis.position.y = 0.25;
-  group.add(chassis);
-  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.5, 1.8), mat(0x1a2333));
-  cabin.position.set(0, 0.85, -0.3);
-  group.add(cabin);
-  return group;
-}
 const car = buildCar(0xd9483b);
 scene.add(car);
-const ghostCar = buildCar(0xbfd9ff, 0.35);
+const ghostCar = buildCar(0xbfd9ff, 0.35, true); // translucent, with static wheels
 ghostCar.visible = false;
 scene.add(ghostCar);
 
+// Time-of-day lighting (cosmetic; local clock; L cycles overrides). Owns the
+// hemisphere + sun lights and the car's night headlights.
+const lighting = new Lighting(scene, car, ambience.userData.glowMaterials);
+
 const wheelMeshes = [];
 for (let i = 0; i < 4; i++) {
-  const w = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.33, 0.33, 0.28, 18),
-    new THREE.MeshLambertMaterial({ color: 0x22262e }),
-  );
-  w.rotation.z = Math.PI / 2;
-  const holder = new THREE.Group();
-  holder.add(w);
+  const holder = buildWheel(); // racing slick + rim, posed from physics below
   scene.add(holder);
   wheelMeshes.push(holder);
 }
@@ -217,6 +207,7 @@ addEventListener("keydown", (e) => {
   if (e.code === "KeyR") resetRun();
   if (e.code === "KeyC") cameraMode = cameraMode === "chase" ? "hood" : "chase";
   if (e.code === "KeyM") setStatus(audio.toggleMute() ? "muted" : "sound on");
+  if (e.code === "KeyL") setStatus(`lighting: ${lighting.cycle()}`);
   if (e.code === "KeyI") $("config").style.display = $("config").style.display === "block" ? "none" : "block";
 });
 addEventListener("pointerdown", () => audio.start());
@@ -498,10 +489,11 @@ function frame(now) {
     camPos.copy(hood);
   }
 
+  lighting.update(); // time-of-day blend follows the local clock
   renderer.render(scene, camera);
 
   // ---- side channels: audio + FFB (read-only on sim state)
-  audio.update(curr, lastThrottle);
+  audio.update(curr, lastThrottle, sim);
   if (ffb) {
     ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque(), dtMs / 1000);
     $("mFfb").value = ffb.smoothed / ffb.maxNm;

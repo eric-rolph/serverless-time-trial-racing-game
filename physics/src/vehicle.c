@@ -46,6 +46,11 @@ typedef struct VehicleTuning
 
 	// Aerodynamics: F = -drag_coef * v * |v|, applied at center of mass
 	float drag_coef; // 0.5 * rho * Cd * A
+	// Downforce: F = -cl * v^2 along body up, applied per axle. This is what
+	// makes it a RACE car — grip that grows with speed (skidpad-diagnosed:
+	// without it the ceiling is ~0.9 g, street-car territory).
+	float aero_cl_front; // N/(m/s)^2 at the front axle
+	float aero_cl_rear;	 // N/(m/s)^2 at the rear axle (rear-biased: stability)
 
 	// Suspension (per wheel)
 	float hardpoint_y;	  // chassis-local Y of the suspension hardpoints
@@ -116,6 +121,8 @@ static const VehicleTuning kTuning = {
 	.inertia_roll = 550.0f,
 
 	.drag_coef = 0.42f,
+	.aero_cl_front = 1.1f,
+	.aero_cl_rear = 1.4f,
 
 	.hardpoint_y = -0.25f,
 	.track_half = 0.80f,
@@ -138,8 +145,11 @@ static const VehicleTuning kTuning = {
 
 	.thermal_t_amb = 25.0f,
 	.thermal_t_opt = 85.0f,
-	.thermal_k_t = 4.1666668e-5f, // 0.15 / 60^2: 25 C and 145 C both give 0.85
-	.thermal_c_surf = 1500.0f,
+	// Skidpad-retuned (sustained cornering drove the loaded front to 157 C and
+	// a 20% grip cliff within ~90 s): gentler falloff, higher floor, 2x thermal
+	// mass so the equilibrium arrives over minutes, not one lap.
+	.thermal_k_t = 2.5e-5f, // 0.09 / 60^2: 25 C and 145 C both give 0.91
+	.thermal_c_surf = 3000.0f,
 	.thermal_h_conv = 0.008f,
 	.thermal_h_int = 0.006f,
 	.thermal_h_int2 = 0.002f,
@@ -303,7 +313,7 @@ void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, 
 	// Thermal grip factor (docs/TIRE-MODEL.md §2)
 	float dT = t_surf - t->thermal_t_opt;
 	float mu_t = 1.0f - t->thermal_k_t * dT * dT;
-	mu_t = b3ClampFloat( mu_t, 0.80f, 1.00f );
+	mu_t = b3ClampFloat( mu_t, 0.88f, 1.00f );
 	float mu_s = t->brush_mu_s * mu_t;
 	float mu_k = t->brush_mu_k_ratio * mu_s;
 
@@ -692,6 +702,15 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 	{
 		b3Vec3 drag = b3MulSV( -t->drag_coef * chassis_speed, chassis_vel );
 		b3Body_ApplyForceToCenter( chassis, drag, true );
+	}
+
+	// --- Aerodynamic downforce, per axle along -body-up ---
+	{
+		float v2 = chassis_speed * chassis_speed;
+		b3Pos front_ax = b3Body_GetWorldPoint( chassis, ( b3Vec3 ){ 0.0f, t->hardpoint_y, t->wheelbase_half } );
+		b3Pos rear_ax = b3Body_GetWorldPoint( chassis, ( b3Vec3 ){ 0.0f, t->hardpoint_y, -t->wheelbase_half } );
+		b3Body_ApplyForce( chassis, b3MulSV( -t->aero_cl_front * v2, up ), front_ax, true );
+		b3Body_ApplyForce( chassis, b3MulSV( -t->aero_cl_rear * v2, up ), rear_ax, true );
 	}
 }
 

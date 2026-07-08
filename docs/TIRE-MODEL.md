@@ -95,6 +95,25 @@ spikes → patch load → force → rack. No canned effects anywhere.
 4. Wasm smoke + `tools/autopilot_lap.mjs` completes a lap on
    `assets/tracks/dev/track.bin` (use `--target-speed 18`; cold tires).
 
+## 4b. Skidpad retuning (2026-07-08, after real-rig feedback)
+
+Player report: "skids out too quickly above 75 km/h." Verified on a synthetic
+60 m constant-radius skidpad (scratchpad harness, pure-pursuit radius hold,
+0.125 m/s² speed ramp): breakaway at 83 km/h (0.88 g), terminal understeer,
+**outside-front tire at 157 °C** — sustained cornering drove the loaded front
+past the thermal cliff (μ floor 0.80) in ~90 s. Two root causes, two fixes:
+
+1. **Thermal balance**: `C_s 1500 → 3000 J/K` (equilibrium arrives over
+   minutes, not one lap), `k_T → 2.5e-5` with floor `0.88` (cold ≈ 0.91,
+   worst-case hot ≈ 0.88 — a warning, not a cliff).
+2. **Aerodynamic downforce** (it's a race car): `F = cl·v²` per axle,
+   `cl_front = 1.1`, `cl_rear = 1.4 N/(m/s)²` (rear-biased for stability).
+   ≈ +10 % grip at 23 m/s, +17 % at 30 m/s.
+
+After: breakaway 89.9 km/h (1.04 g) cold or warm, outside-front peaks 125 °C,
+still front-limited at the absolute limit (stable). Autopilot lap on the
+archetype track: 65.4 s → 57.6 s at its original target pace.
+
 ## 5. Notes
 
 - `sPacejka` and its tunables are removed with the ADR-007 force path;

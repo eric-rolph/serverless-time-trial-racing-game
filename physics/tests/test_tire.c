@@ -140,7 +140,7 @@ int main( void )
 		SweepResult cold = sweep( 0.0f, T_COLD );
 		float ratio = cold.peak_fy / warm.peak_fy;
 		printf( "cold (25 C) peak = %.1f N, %.3f of warm peak\n", (double)cold.peak_fy, (double)ratio );
-		CHECK( ratio > 0.83f && ratio < 0.87f, "cold tire grips ~0.85 of warm (thermal floor)" );
+		CHECK( ratio > 0.89f && ratio < 0.93f, "cold tire grips ~0.91 of warm (thermal floor, skidpad-retuned)" );
 	}
 
 	if ( g_failures != 0 )
