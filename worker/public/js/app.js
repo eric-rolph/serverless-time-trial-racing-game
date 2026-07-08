@@ -495,7 +495,8 @@ function frame(now) {
   // ---- side channels: audio + FFB (read-only on sim state)
   audio.update(curr, lastThrottle, sim);
   if (ffb) {
-    ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque(), dtMs / 1000);
+    const ffbFade = Math.min(1, Math.max(0, (curr.speed - 1.5) / 3)); // standstill fade
+    ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque() * ffbFade, dtMs / 1000);
     $("mFfb").value = ffb.smoothed / ffb.maxNm;
   }
 

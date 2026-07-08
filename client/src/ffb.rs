@@ -60,7 +60,7 @@ impl Default for FfbConfig {
     fn default() -> FfbConfig {
         FfbConfig {
             enabled: true,
-            max_torque_nm: 8.0,
+            max_torque_nm: 18.0, // rack Nm at full output; 8.0 clipped past ~1 deg slip
             gain: 0.85,
             min_force: 0.02,
             damping: 0.10,

@@ -39,7 +39,10 @@ export class FanatecFFB {
     this.lastSent = 0;
     this.lastValue = null;
     this.gain = 0.8;
-    this.maxNm = 8.0; // CSL DD peak
+    this.maxNm = 18.0; // rack torque (Nm) mapping to full wheel output — the
+    // brush model peaks near ~16-18 Nm of rack torque; mapping 8 Nm clipped
+    // everything past 1 deg of slip into a wall (soft center, then max force).
+    // Absolute strength is the wheel base's own setting; this is SHAPE.
     this.invert = false;
     this.smoothed = 0;
     // Input-axis decoding for WebHID devices lives in hid-input.js — app.js
