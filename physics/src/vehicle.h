@@ -1,5 +1,6 @@
-// vehicle.h — internal vehicle model interface (ADR-007).
-// Raycast-suspension + Pacejka MF-lite on a single Box3D rigid body.
+// vehicle.h — internal vehicle model interface.
+// Raycast-suspension + discretized brush-model tires (docs/TIRE-MODEL.md)
+// on a single Box3D rigid body.
 
 #ifndef SIM_VEHICLE_H
 #define SIM_VEHICLE_H
@@ -24,6 +25,11 @@ typedef struct WheelRuntime
 	b3Vec3 contact_point;	// world
 	b3Vec3 wheel_center;	// world
 	float load;				// Fz (N) this tick, 0 if airborne
+	// Tire thermal state (docs/TIRE-MODEL.md §2). Internal only — never
+	// exported into SimStateV1 and never hashed directly (it feeds grip,
+	// which feeds the hashed dynamics). Reset to ambient (25 C) with the car.
+	float t_surf; // tread surface temperature (deg C)
+	float t_core; // carcass core temperature (deg C)
 } WheelRuntime;
 
 typedef struct Vehicle
@@ -51,5 +57,16 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 
 // Write per-wheel state into the packed SimStateV1 block.
 void vehicle_export( const Vehicle* v, SimStateV1* state );
+
+// Brush contact-patch evaluation (docs/TIRE-MODEL.md §1) — the per-tire force
+// model used inside vehicle_update, exposed for tests/test_tire.c sweeps.
+// Internal linkage only: NOT in the wasm EXPORTED_FUNCTIONS list, so the
+// CONTRACTS §1.1 export surface is unchanged.
+//   sigma_x = slip ratio, sigma_y = tan(slip angle), fz = load (N),
+//   t_surf = tread surface temperature (deg C).
+// Outputs: fx (N, wheel forward), fy (N, wheel side/left), trail (m, emergent
+// pneumatic trail: lateral-force centroid distance behind the patch center).
+void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, float* out_fx, float* out_fy,
+						  float* out_trail );
 
 #endif // SIM_VEHICLE_H

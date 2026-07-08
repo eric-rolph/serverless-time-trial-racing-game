@@ -241,6 +241,18 @@ $("clearCal").addEventListener("click", () => {
   input.clearCalibration();
   $("calMsg").textContent = "bindings cleared — detect each channel again";
 });
+// Steering feel: invert + sensitivity (higher = less physical rotation for
+// full lock, for high-rotation-range DD bases).
+$("steerInvert").checked = input.steerSettings.invert;
+$("steerSens").value = input.steerSettings.sensitivity;
+$("steerSensVal").textContent = `${input.steerSettings.sensitivity.toFixed(1)}×`;
+$("steerInvert").addEventListener("change", () => input.setSteerSettings({ invert: $("steerInvert").checked }));
+$("steerSens").addEventListener("input", () => {
+  const v = Number($("steerSens").value);
+  input.setSteerSettings({ sensitivity: v });
+  $("steerSensVal").textContent = `${v.toFixed(1)}×`;
+});
+
 $("sendDiag").addEventListener("click", async () => {
   try {
     const payload = {

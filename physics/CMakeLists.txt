@@ -43,7 +43,16 @@ target_link_libraries(test_vehicle PRIVATE sim)
 set_target_properties(test_vehicle PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
 add_test(NAME vehicle COMMAND test_vehicle)
 
+# test_tire sweeps the internal brush-patch function directly (vehicle.h
+# lives in src/, deliberately not part of the public include/ surface).
+add_executable(test_tire tests/test_tire.c)
+target_link_libraries(test_tire PRIVATE sim)
+target_include_directories(test_tire PRIVATE src)
+set_target_properties(test_tire PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
+add_test(NAME tire COMMAND test_tire)
+
 if (UNIX)
     target_link_libraries(test_determinism PRIVATE m)
     target_link_libraries(test_vehicle PRIVATE m)
+    target_link_libraries(test_tire PRIVATE m)
 endif()

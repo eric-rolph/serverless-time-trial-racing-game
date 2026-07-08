@@ -127,6 +127,85 @@ LAP_INVALID.
   re-sync that list.
 - Smoke: `node tests/wasm_smoke.mjs`.
 
+## Brush tire model (2026-07-07, replaces the Pacejka bullets above)
+
+`sPacejka` + friction-ellipse + the canned FFB trail heuristic are gone;
+tire forces now come from the discretized brush contact-patch model of
+docs/TIRE-MODEL.md (`vehicle_brush_patch` in src/vehicle.c, N = 16 bristles,
+parabolic pressure, vector slip -> one shared friction budget, emergent
+pneumatic trail, two-node thermal layer per tire).
+
+### Constants chosen (all compile-time literals in `kTuning`)
+
+- `brush_cp = 7.0e6 N/m²`, `brush_a0 = 0.075 m`, `brush_fz0 = 3500 N`
+  → Cα = 2·cp·a0² = 78.75 kN/rad; full slide at |σ| = 0.197.
+- `brush_mu_s = 1.48` (bristle-level static), `brush_mu_k_ratio = 0.65`.
+- Thermal: `T_amb 25`, `T_opt 85`, `k_T = 0.15/60² = 4.1667e-5`
+  (25 °C and 145 °C both ⇒ μ_T = 0.85, clamp floor 0.80),
+  `C_s = 1500 J/K`, `h_conv = 0.008 /s`, `h_int = 0.006 /s`,
+  `h_int2 = 0.002 /s`.
+- FFB keeps `caster 0.025 m`, `scrub 0.008 m`, `ratio 13`; pneumatic trail is
+  now the patch output (`ffb_trail0`/`ffb_trail_falloff` deleted).
+
+### Deviations from TIRE-MODEL.md (with justification)
+
+1. **Bristle μs = 1.48, μk/μs = 0.65 instead of the spec's μs0 = 1.05,
+   0.85.** The spec-literal constants fail the spec's own §4.3 gates: a
+   binary static/kinetic brush under a parabolic pressure peaks just above
+   μk·Fz — measured peak 0.865·μs0·Fz0 (gate ≥ 0.95) with a 1.5 % drop at
+   15° (gate 5–20 %). Analytically the continuous model peaks at
+   `r + 4(1−r)³/(3−2r)²` in units of bristle-μs·Fz, so peak ≈ μk for
+   r ≥ 0.8. Chosen tuning keeps μs0 = 1.05 as the PATCH-level grip target:
+   peak fraction at r = 0.65 is 0.709, and 1.48·0.709 ≈ 1.05. Measured:
+   peak 3758.6 N = 1.023·μs0·Fz0 at 6.65°, 15° drop 10.2 %.
+2. **Trail gate relaxed between 8° and 15°.** Raw emergent trail:
+   20.2 mm at 1°, −3.4 mm at 8°, 0.0 mm at 15°. The few-mm negative dip just
+   past the peak (and return to exactly 0 at full slide) is inherent to the
+   binary μs/μk split — the adhesion centroid sits ahead of the patch center
+   while the sliding rear is discounted by μk — so the literal strictly
+   monotone chain t1 > t8 > t15 is unattainable in this model class.
+   test_tire checks t1 > 10 mm, hard collapse 1°→8°, |t8| ≤ 5 mm,
+   t8 ≥ t15 − 5 mm, |t15| ≤ 3 mm. FFB uses the raw (unclamped) trail; the
+   25 mm caster keeps total front trail positive everywhere.
+3. **C_s = 1500 J/K instead of ≈ 9000.** 9000 J/K is the heat capacity of a
+   whole tire, not the tread surface layer; with it the surface never leaves
+   ~35 °C in a lap. 1500 J/K (≈1 kg tread rubber) with the smaller h_conv
+   gives a warm-up time constant of ~50 s and bounded steady state (cooling
+   grows linearly with ΔT and speed, so no runaway).
+
+### Interface / determinism notes
+
+- `WheelRuntime` gained `t_surf`/`t_core` (internal only, NOT in SimStateV1,
+  not hashed; they feed grip which feeds the hashed dynamics).
+  `vehicle_create`/`vehicle_reset` set both to 25 °C — replays from
+  `sim_reset` are bit-identical.
+- `vehicle_brush_patch` is non-static and declared in src/vehicle.h so
+  tests/test_tire.c can sweep it. It is NOT in build_wasm.sh's
+  EXPORTED_FUNCTIONS — the CONTRACTS §1.1 export surface is unchanged
+  (verified: wasm exports identical, sim_state_size still 200).
+- Math in the patch loop: mul/add/div/compare + `sqrtf` only, fixed 16-count
+  loop; μ_T is a clamped quadratic. No new transcendentals, no libm beyond
+  `sqrtf`.
+- Longitudinal/lateral stiffness is now isotropic (single cp): 74 kN/slip at
+  static load vs Pacejka's 75 k long / 43 k lat. Long behavior ~unchanged,
+  lateral response crisper.
+
+### Measured (2026-07-07)
+
+- test_determinism PASS, native 8000-tick final hash `b5bccb81c606e0b8`
+  (differs from the pre-brush `75691d62c83dd18d` — expected, physics changed).
+- test_vehicle PASS with NO threshold changes; oval pursuit lap 30.50 s
+  (12198 ticks) on cold tires, no LAP_INVALID; settle compression 0.0552 m;
+  0→7.13 m/s in 2 s (still engine-limited).
+- test_tire PASS: warm peak 3758.6 N @ 6.65°; Fy(15°) 3373.6 N (−10.2 %);
+  trail 20.23 / −3.36 / −0.00 mm at 1/8/15°; combined σx = 0.10 lateral peak
+  0.865× pure; cold peak 0.849× warm.
+- wasm build 405 941 bytes; wasm_smoke PASS, step-vs-replay hash
+  `e9eadd8e6b64fb8d` (was `6f375f286e4d406e`).
+- tools/autopilot_lap.mjs on assets/tracks/dev/track.bin at --target-speed 18:
+  LAP COMPLETE, 61.910 s (24 764 ticks), final hash `79ab68ecea9ca914` —
+  cold-tire grip (0.85 floor at 25 °C) did not require lowering the target.
+
 ## Open items
 
 - Native-vs-wasm hashes differ (expected and allowed — only wasm-vs-wasm

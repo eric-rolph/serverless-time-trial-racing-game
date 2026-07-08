@@ -1,9 +1,14 @@
-// vehicle.c — raycast-suspension vehicle with Pacejka MF-lite tires (ADR-007).
+// vehicle.c — raycast-suspension vehicle with discretized brush-model tires
+// (docs/TIRE-MODEL.md, replacing the Pacejka MF of ADR-007).
 //
 // Chassis: one dynamic Box3D rigid body (box hull ~1.9 x 1.1 x 4.4 m, 1350 kg,
 // explicit inertia). Wheels are NOT rigid bodies: each is a fixed hardpoint
 // raycast down the chassis-local -Y axis, a spring/damper along chassis up,
-// and Pacejka Magic Formula tire forces applied at the contact patch.
+// and brush contact-patch tire forces applied at the contact point. The patch
+// is N=16 bristle elements under a parabolic pressure distribution; grip,
+// combined-slip budget sharing and the pneumatic-trail collapse all emerge
+// from the per-element adhesion/sliding split. A two-node thermal layer
+// (T_surf/T_core per tire) scales friction with surface temperature.
 //
 // Coordinate convention (recorded in physics/NOTES.md):
 //   chassis local: +X right, +Y up, +Z forward. Yaw about +Y; yaw = 0 faces +Z.
@@ -22,14 +27,6 @@
 // ---------------------------------------------------------------------------
 // Tunables — every vehicle parameter lives in this one struct.
 // ---------------------------------------------------------------------------
-
-typedef struct PacejkaAxis
-{
-	float B; // stiffness factor
-	float C; // shape factor
-	float mu; // peak friction coefficient: D = mu * Fz
-	float E; // curvature factor
-} PacejkaAxis;
 
 typedef struct VehicleTuning
 {
@@ -57,12 +54,28 @@ typedef struct VehicleTuning
 	float damper_bump;	  // N s/m (compressing)
 	float damper_rebound; // N s/m (extending)
 
-	// Tires
-	PacejkaAxis longitudinal;
-	PacejkaAxis lateral;
+	// Tires — discretized brush contact patch (docs/TIRE-MODEL.md §1).
+	// brush_mu_s is the BRISTLE-level static friction coefficient; the
+	// patch-level peak grip that the car actually sees is lower because the
+	// rear of the patch always slides at mu_k. Tuned so the emergent peak is
+	// ~1.02 * (mu_s0 = 1.05) * Fz — see NOTES.md "Brush tire model".
+	float brush_cp;			// bristle stiffness per unit length^2 (N/m^2)
+	float brush_a0;			// patch half-length at reference load (m)
+	float brush_fz0;		// reference load Fz0 (N)
+	float brush_mu_s;		// bristle static friction at T_opt
+	float brush_mu_k_ratio; // kinetic/static friction ratio
 	float max_load;		  // Fz clamp (N) to bound force spikes
 	float slip_v_min;	  // low-speed epsilon for slip computation (m/s)
 	float wheel_inertia;  // kg m^2 per wheel
+
+	// Tire thermal layer, two nodes per tire (docs/TIRE-MODEL.md §2)
+	float thermal_t_amb;  // ambient temperature (deg C)
+	float thermal_t_opt;  // optimal surface temperature (deg C)
+	float thermal_k_t;	  // grip falloff: mu_T = 1 - k_t * (T_surf - T_opt)^2
+	float thermal_c_surf; // surface-layer heat capacity (J/K)
+	float thermal_h_conv; // convective cooling rate (1/s, scaled by speed)
+	float thermal_h_int;  // surface->core exchange as seen by the surface (1/s)
+	float thermal_h_int2; // surface->core exchange as seen by the core (1/s)
 
 	// Drivetrain (RWD, fixed single ratio)
 	float gear_ratio;		// engine:wheel
@@ -78,9 +91,8 @@ typedef struct VehicleTuning
 	// Steering
 	float max_steer; // rad (±30°)
 
-	// Force-feedback signal (docs/FFB.md). Output-only; no simulation effect.
-	float ffb_trail0;		  // pneumatic trail at zero slip (m)
-	float ffb_trail_falloff;  // trail collapse rate per rad of slip angle
+	// Force-feedback signal (docs/TIRE-MODEL.md §3). Output-only; the
+	// pneumatic trail is emergent from the brush patch, not a tunable.
 	float ffb_caster_trail;	  // mechanical (caster) trail (m)
 	float ffb_scrub_radius;	  // kingpin scrub radius (m)
 	float ffb_steering_ratio; // rack:rim ratio
@@ -108,11 +120,22 @@ static const VehicleTuning kTuning = {
 	.damper_bump = 4500.0f,
 	.damper_rebound = 5200.0f,
 
-	.longitudinal = { .B = 12.0f, .C = 1.65f, .mu = 1.15f, .E = 0.97f },
-	.lateral = { .B = 10.0f, .C = 1.30f, .mu = 1.00f, .E = 0.97f },
+	.brush_cp = 7.0e6f,
+	.brush_a0 = 0.075f,
+	.brush_fz0 = 3500.0f,
+	.brush_mu_s = 1.48f,
+	.brush_mu_k_ratio = 0.65f,
 	.max_load = 9000.0f,
 	.slip_v_min = 0.8f,
 	.wheel_inertia = 1.2f,
+
+	.thermal_t_amb = 25.0f,
+	.thermal_t_opt = 85.0f,
+	.thermal_k_t = 4.1666668e-5f, // 0.15 / 60^2: 25 C and 145 C both give 0.85
+	.thermal_c_surf = 1500.0f,
+	.thermal_h_conv = 0.008f,
+	.thermal_h_int = 0.006f,
+	.thermal_h_int2 = 0.002f,
 
 	.gear_ratio = 8.2f,
 	.driveline_eff = 0.90f,
@@ -125,8 +148,6 @@ static const VehicleTuning kTuning = {
 
 	.max_steer = 0.5235988f, // 30 degrees
 
-	.ffb_trail0 = 0.030f,
-	.ffb_trail_falloff = 8.3f, // trail gone by ~7° slip (past the Pacejka peak)
 	.ffb_caster_trail = 0.025f,
 	.ffb_scrub_radius = 0.008f,
 	.ffb_steering_ratio = 13.0f,
@@ -198,6 +219,8 @@ void vehicle_create( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 	{
 		v->wheels[i] = ( WheelRuntime ){ 0 };
+		v->wheels[i].t_surf = t->thermal_t_amb;
+		v->wheels[i].t_core = t->thermal_t_amb;
 	}
 	v->valid = 1;
 }
@@ -220,23 +243,92 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 	{
 		v->wheels[i] = ( WheelRuntime ){ 0 };
+		// Tires back to ambient: a reset run must replay identically.
+		v->wheels[i].t_surf = kTuning.thermal_t_amb;
+		v->wheels[i].t_core = kTuning.thermal_t_amb;
 	}
 	v->rack_torque = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
-// Tire model
+// Tire model — discretized brush contact patch (docs/TIRE-MODEL.md §1)
 // ---------------------------------------------------------------------------
 
-// Pacejka Magic Formula: F = D sin(C atan(B s − E (B s − atan(B s))))
-static float sPacejka( const PacejkaAxis* a, float slip, float fz )
+// Fixed bristle count: determinism requires a compile-time loop bound.
+#define SIM_BRUSH_N 16
+
+// Evaluate the brush patch for one tire. Inputs: slip vector sigma =
+// (slip_ratio, tan(slip_angle)), vertical load fz (N), surface temperature
+// t_surf (deg C). Outputs: fx along wheel forward, fy along wheel side (left),
+// and the emergent pneumatic trail (m, distance of the lateral-force centroid
+// BEHIND the patch center; positive at small slip, collapses to ~0 past the
+// grip peak — the spec's t_p = -Mz/Fy under a forward-positive moment axis).
+//
+// Per element (position x from the leading edge, parabolic pressure q):
+//   adhesion: f = cp * |sigma| * x       while cp*|sigma|*x <= mu_s(T)*q(x)
+//   sliding:  f = mu_k(T) * q(x)         from the breakaway point rearward
+// Both act along sigma-hat, so longitudinal and lateral demand share one
+// friction budget with no ellipse hack. Non-static so test_tire can sweep it
+// directly; NOT in the wasm export list (CONTRACTS §1.1 surface unchanged).
+void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, float* out_fx, float* out_fy,
+						  float* out_trail )
 {
-	float D = a->mu * fz;
-	float Bs = a->B * slip;
-	float inner = Bs - a->E * ( Bs - b3Atan2( Bs, 1.0f ) );
-	float phi = a->C * b3Atan2( inner, 1.0f );
-	b3CosSin cs = b3ComputeCosSin( phi );
-	return D * cs.sine;
+	const VehicleTuning* t = &kTuning;
+
+	float a = t->brush_a0 * sqrtf( fz > 0.0f ? fz / t->brush_fz0 : 0.0f );
+	float sig = sqrtf( sigma_x * sigma_x + sigma_y * sigma_y );
+	if ( sig < 1.0e-6f || fz <= 0.0f )
+	{
+		*out_fx = 0.0f;
+		*out_fy = 0.0f;
+		*out_trail = a * ( 1.0f / 3.0f ); // adhesion-only limit as |sigma| -> 0
+		return;
+	}
+	float inv_sig = 1.0f / sig;
+	float sx_hat = sigma_x * inv_sig;
+	float sy_hat = sigma_y * inv_sig;
+
+	// Thermal grip factor (docs/TIRE-MODEL.md §2)
+	float dT = t_surf - t->thermal_t_opt;
+	float mu_t = 1.0f - t->thermal_k_t * dT * dT;
+	mu_t = b3ClampFloat( mu_t, 0.80f, 1.00f );
+	float mu_s = t->brush_mu_s * mu_t;
+	float mu_k = t->brush_mu_k_ratio * mu_s;
+
+	float w = ( 2.0f * a ) / (float)SIM_BRUSH_N; // element width
+	float q_scale = ( 3.0f * fz ) / ( 4.0f * a ); // parabolic pressure, N/m
+
+	float f_sum = 0.0f; // total force magnitude along sigma-hat
+	float m_sum = 0.0f; // first moment of that force about the patch center
+	for ( int j = 0; j < SIM_BRUSH_N; ++j )
+	{
+		float x = ( (float)j + 0.5f ) * w; // element center, from leading edge
+		float xi = x / a - 1.0f;		   // [-1, 1] across the patch
+		float q = q_scale * ( 1.0f - xi * xi );
+		float f_adh = t->brush_cp * sig * x;
+		float f = ( f_adh <= mu_s * q ) ? f_adh : mu_k * q;
+		float fe = f * w;
+		f_sum += fe;
+		m_sum += fe * ( x - a );
+	}
+
+	*out_fx = f_sum * sx_hat;
+	*out_fy = f_sum * sy_hat;
+	*out_trail = ( f_sum > 1.0e-3f ) ? ( m_sum / f_sum ) : a * ( 1.0f / 3.0f );
+}
+
+// Advance the two-node thermal state of one tire by SIM_DT
+// (docs/TIRE-MODEL.md §2). power = friction power into the surface (W),
+// speed = vehicle speed (m/s) for convective cooling. Plain float Euler
+// integration — deterministic by construction, never hashed directly.
+static void sTireThermal( WheelRuntime* w, float power, float speed )
+{
+	const VehicleTuning* t = &kTuning;
+	float d_surf = power / t->thermal_c_surf - t->thermal_h_conv * ( 1.0f + 0.05f * speed ) * ( w->t_surf - t->thermal_t_amb ) -
+				   t->thermal_h_int * ( w->t_surf - w->t_core );
+	float d_core = t->thermal_h_int2 * ( w->t_surf - w->t_core );
+	w->t_surf += d_surf * SIM_DT;
+	w->t_core += d_core * SIM_DT;
 }
 
 static float sEngineTorque( float rpm )
@@ -273,6 +365,10 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 
 	int handbrake = ( flags & SIM_FLAG_HANDBRAKE ) != 0;
 
+	// Vehicle speed for tire convective cooling (and reused for drag below).
+	b3Vec3 chassis_vel = b3Body_GetLinearVelocity( chassis );
+	float chassis_speed = b3Length( chassis_vel );
+
 	// Steering: linear map, front axle only.
 	float steer_angle = steer * t->max_steer;
 
@@ -308,6 +404,9 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 			w->slip_ratio = 0.0f;
 			w->slip_angle = 0.0f;
 			w->wheel_center = b3MulAdd( origin, -t->rest_length, up );
+
+			// Airborne tire still cools (no friction power).
+			sTireThermal( w, 0.0f, chassis_speed );
 
 			// Free-spinning wheel: engine/brake still act on it.
 			float drive = 0.0f;
@@ -362,6 +461,7 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 		{
 			w->slip_ratio = 0.0f;
 			w->slip_angle = 0.0f;
+			sTireThermal( w, 0.0f, chassis_speed );
 			continue;
 		}
 
@@ -397,38 +497,33 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 		w->slip_ratio = slip_ratio;
 		w->slip_angle = slip_angle;
 
-		// --- Pacejka forces + friction-ellipse combining ---
-		float fx = sPacejka( &t->longitudinal, slip_ratio, fz );
-		float fy = sPacejka( &t->lateral, slip_angle, fz );
-
-		float dx = t->longitudinal.mu * fz;
-		float dy = t->lateral.mu * fz;
-		float ex = fx / dx;
-		float ey = fy / dy;
-		float rho2 = ex * ex + ey * ey;
-		if ( rho2 > 1.0f )
-		{
-			float inv = 1.0f / sqrtf( rho2 );
-			fx *= inv;
-			fy *= inv;
-		}
+		// --- Brush contact-patch forces (docs/TIRE-MODEL.md §1) ---
+		// Slip vector: sigma_x = slip ratio, sigma_y = tan(slip angle) =
+		// -v_lat/denom (exactly what slip_angle's atan2 argument already is).
+		// Combined slip shares one friction budget inside the patch model.
+		float sigma_y = -v_lat / denom;
+		float fx, fy, trail;
+		vehicle_brush_patch( slip_ratio, sigma_y, fz, w->t_surf, &fx, &fy, &trail );
 
 		b3Vec3 tire_force = b3Add( b3MulSV( fx, wheel_fwd ), b3MulSV( fy, wheel_side ) );
 		b3Body_ApplyForce( chassis, tire_force, ray.point, true );
 
 		// --- FFB rack torque (front axle only, output-only) ---
-		// Lateral force acts behind the steering axis by pneumatic + caster
-		// trail; the pneumatic component collapses as slip passes the Pacejka
-		// peak, which is the natural "light wheel" understeer cue.
+		// Lateral force acts behind the steering axis by the EMERGENT
+		// pneumatic trail plus mechanical caster (docs/TIRE-MODEL.md §3).
+		// The trail collapse past the grip peak — the "light wheel"
+		// understeer cue — comes out of the patch moment, not a heuristic.
 		if ( sIsFront( i ) )
 		{
-			float trail_scale = 1.0f - b3AbsFloat( slip_angle ) * t->ffb_trail_falloff;
-			if ( trail_scale < 0.0f )
-			{
-				trail_scale = 0.0f;
-			}
-			float trail = t->ffb_trail0 * trail_scale + t->ffb_caster_trail;
-			rack += fy * trail + fx * t->ffb_scrub_radius;
+			rack += fy * ( trail + t->ffb_caster_trail ) + fx * t->ffb_scrub_radius;
+		}
+
+		// --- Tire thermal state (docs/TIRE-MODEL.md §2) ---
+		// Friction power from the slip velocity at the patch.
+		{
+			float v_slip_x = w->omega * t->wheel_radius - v_long;
+			float p_fric = b3AbsFloat( fx * v_slip_x ) + b3AbsFloat( fy * v_lat );
+			sTireThermal( w, p_fric, chassis_speed );
 		}
 
 		// --- Wheel spin dynamics (RWD, brakes on all four) ---
@@ -486,11 +581,11 @@ void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, f
 	v->rack_torque = rack / t->ffb_steering_ratio;
 
 	// --- Aerodynamic drag at the center of mass ---
-	b3Vec3 vel = b3Body_GetLinearVelocity( chassis );
-	float speed = b3Length( vel );
-	if ( speed > 0.01f )
+	// (chassis_vel/chassis_speed sampled before force accumulation; velocity
+	// only changes at the subsequent b3World_Step, so this is the same value.)
+	if ( chassis_speed > 0.01f )
 	{
-		b3Vec3 drag = b3MulSV( -t->drag_coef * speed, vel );
+		b3Vec3 drag = b3MulSV( -t->drag_coef * chassis_speed, chassis_vel );
 		b3Body_ApplyForceToCenter( chassis, drag, true );
 	}
 }

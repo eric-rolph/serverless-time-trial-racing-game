@@ -76,6 +76,11 @@
     <button data-cal="brake">detect</button></div>
   <div class="row"><label>handbrake</label><meter id="mHandbrake" min="0" max="1" value="0"></meter>
     <button data-cal="handbrake">detect</button></div>
+  <div class="row"><label>steer feel</label>
+    <input type="checkbox" id="steerInvert"><span class="sub" style="width:52px">invert</span>
+    <span class="sub">rotation</span>
+    <input type="range" id="steerSens" min="0.3" max="3" step="0.05" value="1" style="flex:1">
+    <span class="sub" id="steerSensVal" style="width:34px">1.0×</span></div>
   <div class="row sub" id="calMsg">click detect, then move only that control (any device)</div>
   <div class="row"><button id="addHid">add device via raw HID (WebHID)</button>
     <span class="sub">for devices the browser lists but never reads (Fanatec bases/pedals) — pick them here instead</span></div>

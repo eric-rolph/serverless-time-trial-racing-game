@@ -106,6 +106,21 @@ def generate(seed: int) -> dict:
             [radii * np.cos(angles), np.zeros(n_ctrl), radii * np.sin(angles)], axis=1
         )
 
+        # --- Corner archetypes (track-design craft, seed-driven) ------------
+        # A memorable lap needs signature corners, not just noise: one hairpin
+        # (big braking event) and one chicane (direction-change rhythm),
+        # placed roughly opposite each other.
+        hp = int(rng.integers(0, n_ctrl))
+        ctrl[hp, [0, 2]] *= 0.45  # pull hard toward center → hairpin
+        ch = (hp + n_ctrl // 2) % n_ctrl
+        chord = ctrl[(ch + 1) % n_ctrl] - ctrl[(ch - 1) % n_ctrl]
+        chord = chord / (np.linalg.norm(chord) + 1e-9)
+        perp = np.array([-chord[2], 0.0, chord[0]])
+        amp = rng.uniform(9.0, 14.0)
+        p1 = ctrl[ch] - chord * 12.0 + perp * amp
+        p2 = ctrl[ch] + chord * 12.0 - perp * amp
+        ctrl = np.vstack([ctrl[:ch], [p1, p2], ctrl[ch + 1 :]])
+
         pos = resample_by_arclength(catmull_rom_closed(ctrl), SAMPLE_SPACING_M)
         n = len(pos)
         u = np.arange(n) / n
@@ -116,12 +131,6 @@ def generate(seed: int) -> dict:
         if grade > MAX_GRADE:
             elev *= MAX_GRADE / grade
         pos[:, 1] = elev
-
-        width = 11.0 + loop_harmonics(rng, u, freqs=(2, 7), amps=(3.0, 1.5))
-        width = np.maximum(width, MIN_WIDTH_M)
-
-        if self_intersects(pos, width):
-            continue
 
         # Frames: tangent from central differences, up = world-up perpendicularized.
         tangent = np.roll(pos, -1, axis=0) - np.roll(pos, 1, axis=0)
@@ -137,6 +146,25 @@ def generate(seed: int) -> dict:
         kappa = (tangent[:, 0] * t_next[:, 2] - tangent[:, 2] * t_next[:, 0]) / SAMPLE_SPACING_M
         kernel = np.ones(CURVATURE_SMOOTH_WINDOW) / CURVATURE_SMOOTH_WINDOW
         kappa = np.convolve(np.tile(kappa, 3), kernel, mode="same")[n : 2 * n]
+
+        # Track-design: rhythm needs at least one genuine straight (~110 m+
+        # of near-zero curvature) — regenerate layouts that are all corners.
+        quiet = np.abs(kappa) < 0.006
+        best_run, run = 0, 0
+        for flag in np.concatenate([quiet, quiet]):  # circular runs
+            run = run + 1 if flag else 0
+            best_run = max(best_run, run)
+        if min(best_run, n) * SAMPLE_SPACING_M < 110.0:
+            continue
+
+        # Width choreography: corners breathe wider (entry/line choice),
+        # straights stay lean; harmonics keep it organic.
+        width = 10.0 + loop_harmonics(rng, u, freqs=(2, 7), amps=(2.0, 1.0))
+        width = width + 4.0 * np.minimum(1.0, np.abs(kappa) / 0.03)
+        width = np.maximum(width, MIN_WIDTH_M)
+
+        if self_intersects(pos, width):
+            continue
 
         # Banking: rotate `up` about the tangent so the surface leans into the
         # corner (inside edge drops). kappa > 0 = left turn; the normal must

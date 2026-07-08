@@ -25,3 +25,6 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+
+# Windows reserved-name trap (node writes 'nul' for --out /dev/null)
+nul

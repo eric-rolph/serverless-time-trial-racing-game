@@ -9,6 +9,7 @@
 // interact with it once (press/turn it) — the setup panel says so.
 
 const CAL_KEY = "sttr-input-cal-v2"; // v1 was single-device; ignored on load
+const STEER_KEY = "sttr-steer-settings"; // {invert, sensitivity}
 
 export const CHANNELS = ["steer", "throttle", "brake", "handbrake"];
 
@@ -25,6 +26,10 @@ export class Input {
     }
     this.calibrating = null;
     this.onCalDone = null;
+    // Steering feel: invert (rigs/axes vary) and sensitivity — the ratio of
+    // wheel-axis travel to full car lock. sensitivity 2 = half the physical
+    // rotation reaches full lock (for high-rotation-range DD bases).
+    this.steerSettings = { invert: false, sensitivity: 1.0, ...JSON.parse(localStorage.getItem(STEER_KEY) ?? "{}") };
     addEventListener("keydown", (e) => {
       if (!e.repeat) this.keys.add(e.code);
     });
@@ -164,8 +169,11 @@ export class Input {
       // only pedals are bound).
       const kbSteer = (this.keys.has("ArrowLeft") || this.keys.has("KeyA") ? -1 : 0) +
                       (this.keys.has("ArrowRight") || this.keys.has("KeyD") ? 1 : 0);
+      const s = this.steerSettings;
+      const shape = (v) => Math.max(-1, Math.min(1, v * s.sensitivity * (s.invert ? -1 : 1)));
+      const rawSteer = this.readChannel("steer", true);
       return {
-        steer: this.readChannel("steer", true) ?? kbSteer,
+        steer: rawSteer !== null ? shape(rawSteer) : kbSteer,
         throttle: this.readChannel("throttle", false) ?? (this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0),
         brake: this.readChannel("brake", false) ?? (this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0),
         handbrake: (this.readChannel("handbrake", false) ?? 0) > 0.5 || this.keys.has("Space"),
@@ -198,6 +206,11 @@ export class Input {
       handbrake: this.keys.has("Space"),
       device: pads.length ? `keyboard (${pads.length} device(s) seen — press I to bind)` : "keyboard",
     };
+  }
+
+  setSteerSettings(patch) {
+    this.steerSettings = { ...this.steerSettings, ...patch };
+    localStorage.setItem(STEER_KEY, JSON.stringify(this.steerSettings));
   }
 
   clearCalibration() {

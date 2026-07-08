@@ -12,7 +12,8 @@ work in the browser client unless marked native-only.
 | 3 | Controller zero-config (standard gamepad mapping: stick + analog triggers) | ✅ |
 | 4 | Wheel torque FFB in the browser — WebHID, Fanatec protocol (experimental) | ✅ shipped, awaiting hardware test |
 | 5 | FFB in native client (DirectInput constant force, ffb.toml) | ▢ (docs/FFB.md design done) |
-| 6 | Steering sensitivity / rotation-range setting | ▢ |
+| 6 | Steering sensitivity / rotation-range setting + invert | ✅ |
+| 6b | Physically-based tire model: discretized brush patch, emergent pneumatic trail (SAT/FFB), 2-node thermal, combined-slip budget (docs/TIRE-MODEL.md) | ✅ |
 
 ## Driving & timing core
 
