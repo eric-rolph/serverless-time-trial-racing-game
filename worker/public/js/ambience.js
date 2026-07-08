@@ -44,6 +44,23 @@ export function buildAmbience(track, hash = null) {
     return Math.sign(t2.sub(f.t).dot(f.side)) || 1;
   };
 
+  // ------------------------------------------------------------- ground
+  // The world beyond the 8 m shoulders is void — give it a ground plane at
+  // shoulder-base level so trees stand on something and the horizon reads as
+  // land, not outer space. Trees sit ON this plane.
+  let minY = Infinity, cx = 0, cz = 0, maxR = 0;
+  for (const c of track.center) {
+    minY = Math.min(minY, c[1]);
+    cx += c[0] / n; cz += c[2] / n;
+  }
+  for (const c of track.center) maxR = Math.max(maxR, Math.hypot(c[0] - cx, c[2] - cz));
+  const groundY = minY - 1.35; // just under the shoulder drop (-1.2)
+  const groundGeo = new THREE.CircleGeometry(maxR + 120, 40);
+  groundGeo.rotateX(-Math.PI / 2);
+  const ground = new THREE.Mesh(groundGeo, new THREE.MeshLambertMaterial({ color: 0x25301f }));
+  ground.position.set(cx, groundY, cz);
+  group.add(ground);
+
   // ------------------------------------------------------------- trees
   // A candidate 12–25 m off one segment can still sit ON another segment of
   // the loop (hairpins, straights folding back) — reject anything within
@@ -66,7 +83,7 @@ export function buildAmbience(track, hash = null) {
       const p = f.c.clone()
         .addScaledVector(f.side, s * lat)
         .addScaledVector(f.t, (rand() - 0.5) * 4);
-      p.y = f.c.y - 0.25; // sink the base a little to hide terrain slope
+      p.y = groundY; // stand on the ground plane (world beyond shoulders is flat)
       if (!clearOfTrack(p)) continue;
       trees.push({ p, scale: [0.8, 1.0, 1.35][(rand() * 3) | 0], rot: rand() * Math.PI * 2 });
     }

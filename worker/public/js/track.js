@@ -65,6 +65,39 @@ export function smoothedCurvature(track, smooth = KERB_SMOOTH) {
   return kappa;
 }
 
+/** Procedural asphalt: mid-gray noise + sparse aggregate specks and darker
+ *  patches. Tiled along the ribbon's arc length (one repeat / 6 m). */
+function asphaltTexture() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 256;
+  const g = c.getContext("2d");
+  const img = g.createImageData(256, 256);
+  let s = 0x1234abcd;
+  const rnd = () => ((s = (s * 1664525 + 1013904223) >>> 0), s / 0xffffffff);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const base = 88 + (rnd() - 0.5) * 22; // fine grain
+    img.data[i] = base;
+    img.data[i + 1] = base + 4;
+    img.data[i + 2] = base + 10;
+    img.data[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  for (let k = 0; k < 260; k++) { // lighter aggregate specks
+    g.fillStyle = `rgba(190,196,205,${0.10 + rnd() * 0.15})`;
+    g.fillRect((rnd() * 256) | 0, (rnd() * 256) | 0, 1 + ((rnd() * 2) | 0), 1);
+  }
+  for (let k = 0; k < 7; k++) { // occasional repair patches
+    g.fillStyle = `rgba(30,34,42,${0.12 + rnd() * 0.10})`;
+    g.beginPath();
+    g.ellipse(rnd() * 256, rnd() * 256, 12 + rnd() * 30, 6 + rnd() * 14, rnd() * 3, 0, 7);
+    g.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 export function buildTrackMeshes(track) {
   const group = new THREE.Group();
 
@@ -76,8 +109,11 @@ export function buildTrackMeshes(track) {
   group.add(new THREE.Mesh(terrainGeo, new THREE.MeshLambertMaterial({ color: 0x2d3b31 })));
 
   // Ribbon (drivable surface) lifted a hair above the terrain to avoid z-fight.
+  // Textured: procedural asphalt (noise + aggregate) tiled along arc length.
   const n = track.S;
   const pos = new Float32Array(n * 2 * 3);
+  const uvs = new Float32Array(n * 2 * 2);
+  let arc = 0;
   for (let i = 0; i < n; i++) {
     const c = v3(track.center[i]), u = v3(track.up[i]), t = v3(track.tangent[i]);
     const side = new THREE.Vector3().crossVectors(u, t).normalize();
@@ -86,6 +122,10 @@ export function buildTrackMeshes(track) {
     const r = c.clone().addScaledVector(side, half).addScaledVector(u, 0.05);
     pos.set([l.x, l.y, l.z], i * 6);
     pos.set([r.x, r.y, r.z], i * 6 + 3);
+    const uAlong = arc / 6; // one texture repeat per 6 m of road
+    uvs.set([uAlong, 0], i * 4);
+    uvs.set([uAlong, 1], i * 4 + 2);
+    arc += 2.5;
   }
   const idx = [];
   for (let i = 0; i < n; i++) {
@@ -94,9 +134,10 @@ export function buildTrackMeshes(track) {
   }
   const ribbonGeo = new THREE.BufferGeometry();
   ribbonGeo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  ribbonGeo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
   ribbonGeo.setIndex(idx);
   ribbonGeo.computeVertexNormals();
-  group.add(new THREE.Mesh(ribbonGeo, new THREE.MeshLambertMaterial({ color: 0x5a626e })));
+  group.add(new THREE.Mesh(ribbonGeo, new THREE.MeshLambertMaterial({ map: asphaltTexture() })));
 
   // White edge lines — the single biggest readability win at speed.
   for (const offset of [0, 3]) {
@@ -146,6 +187,42 @@ export function buildTrackMeshes(track) {
     kg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(kerbPos), 3));
     kg.setAttribute("color", new THREE.BufferAttribute(new Float32Array(kerbCol), 3));
     group.add(new THREE.Mesh(kg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })));
+  }
+
+  // Rubbered-in racing line: a translucent dark band that pulls toward each
+  // corner's inside (apex) proportionally to curvature — the worn groove
+  // every used circuit carries. Purely visual.
+  {
+    const LINE_W = 2.3;
+    const offs = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const u = v3(track.up[i]), t = v3(track.tangent[i]);
+      const side = new THREE.Vector3().crossVectors(u, t).normalize();
+      const t2 = v3(track.tangent[(i + 1) % n]);
+      const inside = Math.sign(t2.sub(t).dot(side)) || 1;
+      const pull = Math.min(1, Math.abs(kappa[i]) / 0.02);
+      offs[i] = inside * pull * (track.width[i] * 0.5 - 2.0);
+    }
+    // smooth the lateral offsets so the line sweeps, not zigzags
+    const sm = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (let k = -8; k <= 8; k++) sum += offs[(i + k + n) % n];
+      sm[i] = sum / 17;
+    }
+    const lp = new Float32Array(n * 2 * 3);
+    for (let i = 0; i < n; i++) {
+      const c = v3(track.center[i]), u = v3(track.up[i]), t = v3(track.tangent[i]);
+      const side = new THREE.Vector3().crossVectors(u, t).normalize();
+      const a = c.clone().addScaledVector(side, sm[i] - LINE_W / 2).addScaledVector(u, 0.065);
+      const b = c.clone().addScaledVector(side, sm[i] + LINE_W / 2).addScaledVector(u, 0.065);
+      lp.set([a.x, a.y, a.z], i * 6);
+      lp.set([b.x, b.y, b.z], i * 6 + 3);
+    }
+    const lg = new THREE.BufferGeometry();
+    lg.setAttribute("position", new THREE.BufferAttribute(lp, 3));
+    lg.setIndex(idx);
+    group.add(new THREE.Mesh(lg, new THREE.MeshBasicMaterial({ color: 0x14181f, transparent: true, opacity: 0.30, depthWrite: false })));
   }
 
   // Start line + checkpoint gates: thin bright quads across the track.

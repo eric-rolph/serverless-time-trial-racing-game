@@ -121,12 +121,55 @@ def generate(seed: int) -> dict:
         p2 = ctrl[ch] + chord * 12.0 - perp * amp
         ctrl = np.vstack([ctrl[:ch], [p1, p2], ctrl[ch + 1 :]])
 
+        # Esses: a rapid alternating flick (Suzuka S-curves family), placed a
+        # quarter-lap from the hairpin so the three signature sections spread.
+        m = len(ctrl)
+        es = (hp + m // 4) % m
+        if min(abs(es - ch), m - abs(es - ch)) < 2:
+            es = (hp + 3 * m // 4) % m
+        chord2 = ctrl[(es + 1) % m] - ctrl[(es - 1) % m]
+        chord2 = chord2 / (np.linalg.norm(chord2) + 1e-9)
+        perp2 = np.array([-chord2[2], 0.0, chord2[0]])
+        amp2 = rng.uniform(7.0, 10.0)
+        e1 = ctrl[es] - chord2 * 15.0 + perp2 * amp2
+        e2 = ctrl[es] - perp2 * amp2
+        e3 = ctrl[es] + chord2 * 15.0 + perp2 * amp2
+        ctrl = np.vstack([ctrl[:es], [e1, e2, e3], ctrl[es + 1 :]])
+
         pos = resample_by_arclength(catmull_rom_closed(ctrl), SAMPLE_SPACING_M)
         n = len(pos)
         u = np.arange(n) / n
+        kernel = np.ones(CURVATURE_SMOOTH_WINDOW) / CURVATURE_SMOOTH_WINDOW
 
-        # Elevation: loop-continuous harmonics, grade-clamped.
+        # Flat-plan curvature pre-pass: find the longest straight and the
+        # tightest corner while the geometry is still 2D.
+        tflat = np.roll(pos, -1, axis=0) - np.roll(pos, 1, axis=0)
+        tflat /= np.linalg.norm(tflat, axis=1, keepdims=True)
+        t2f = np.roll(tflat, -1, axis=0)
+        kflat = (tflat[:, 0] * t2f[:, 2] - tflat[:, 2] * t2f[:, 0]) / SAMPLE_SPACING_M
+        kflat = np.convolve(np.tile(kflat, 3), kernel, mode="same")[n : 2 * n]
+
+        # Start/finish belongs on the main straight, like every real circuit —
+        # roll the sample indexing so index 0 sits a few car lengths into it.
+        quiet0 = np.abs(kflat) < 0.006
+        best_len, best_start, run = 0, 0, 0
+        for i2, f in enumerate(np.concatenate([quiet0, quiet0])):
+            run = run + 1 if f else 0
+            if run > best_len:
+                best_len, best_start = run, i2 - run + 1
+        roll_to = (best_start + 6) % n
+        pos = np.roll(pos, -roll_to, axis=0)
+        kflat = np.roll(kflat, -roll_to)
+        i_hp = int(np.argmax(np.abs(kflat)))
+
+        # Elevation: loop-continuous harmonics + a crest ~35 m before the
+        # tightest corner (the blind-crest-into-braking drama of real courses),
+        # grade-clamped.
         elev = loop_harmonics(rng, u, freqs=(1, 3, 5), amps=(4.0, 2.5, 1.2))
+        crest_c = (i_hp - 14) % n
+        d = np.abs(np.arange(n) - crest_c)
+        d = np.minimum(d, n - d).astype(float)
+        elev += 2.0 * np.exp(-(d * d) / (2.0 * 8.0 * 8.0))
         grade = np.max(np.abs(np.diff(elev, append=elev[:1]))) / SAMPLE_SPACING_M
         if grade > MAX_GRADE:
             elev *= MAX_GRADE / grade
