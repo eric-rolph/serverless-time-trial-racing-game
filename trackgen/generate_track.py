@@ -39,22 +39,28 @@ KERB_TOOTH_M = 0.02  # raised tooth height; alternating samples → rumble
 
 
 def catmull_rom_closed(points: np.ndarray, samples_per_seg: int = 200) -> np.ndarray:
-    """Uniform Catmull-Rom through a closed control polygon."""
+    """CENTRIPETAL Catmull-Rom through a closed control polygon (alpha = 0.5).
+
+    Uniform CR overshoots and cusps through unevenly spaced points — which is
+    exactly what the corner archetypes create. Centripetal parameterization is
+    provably cusp- and self-intersection-free within segments (Barry-Goldman).
+    """
     n = len(points)
-    ts = np.linspace(0.0, 1.0, samples_per_seg, endpoint=False)
     out = []
     for i in range(n):
         p0, p1, p2, p3 = (points[(i + k - 1) % n] for k in range(4))
-        t = ts[:, None]
-        out.append(
-            0.5
-            * (
-                2 * p1
-                + (-p0 + p2) * t
-                + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t**2
-                + (-p0 + 3 * p1 - 3 * p2 + p3) * t**3
-            )
-        )
+        eps = 1e-6
+        t0 = 0.0
+        t1 = t0 + max(np.linalg.norm(p1 - p0), eps) ** 0.5
+        t2 = t1 + max(np.linalg.norm(p2 - p1), eps) ** 0.5
+        t3 = t2 + max(np.linalg.norm(p3 - p2), eps) ** 0.5
+        tt = np.linspace(t1, t2, samples_per_seg, endpoint=False)[:, None]
+        a1 = (t1 - tt) / (t1 - t0) * p0 + (tt - t0) / (t1 - t0) * p1
+        a2 = (t2 - tt) / (t2 - t1) * p1 + (tt - t1) / (t2 - t1) * p2
+        a3 = (t3 - tt) / (t3 - t2) * p2 + (tt - t2) / (t3 - t2) * p3
+        b1 = (t2 - tt) / (t2 - t0) * a1 + (tt - t0) / (t2 - t0) * a2
+        b2 = (t3 - tt) / (t3 - t1) * a2 + (tt - t1) / (t3 - t1) * a3
+        out.append((t2 - tt) / (t2 - t1) * b1 + (tt - t1) / (t2 - t1) * b2)
     return np.vstack(out)
 
 
@@ -93,7 +99,7 @@ def self_intersects(pos: np.ndarray, width: np.ndarray) -> bool:
 
 
 def generate(seed: int) -> dict:
-    for attempt in range(50):
+    for attempt in range(120):
         rng = np.random.default_rng((seed + attempt * 0x9E3779B9) & 0xFFFFFFFFFFFFFFFF)
 
         n_ctrl = int(rng.integers(10, 15))
@@ -111,14 +117,16 @@ def generate(seed: int) -> dict:
         # (big braking event) and one chicane (direction-change rhythm),
         # placed roughly opposite each other.
         hp = int(rng.integers(0, n_ctrl))
-        ctrl[hp, [0, 2]] *= 0.45  # pull hard toward center → hairpin
+        ctrl[hp, [0, 2]] *= 0.55  # pull hard toward center → hairpin
+        ctrl[(hp - 1) % n_ctrl, [0, 2]] *= 0.85  # ease neighbors so the
+        ctrl[(hp + 1) % n_ctrl, [0, 2]] *= 0.85  # spline turns, not kinks
         ch = (hp + n_ctrl // 2) % n_ctrl
         chord = ctrl[(ch + 1) % n_ctrl] - ctrl[(ch - 1) % n_ctrl]
         chord = chord / (np.linalg.norm(chord) + 1e-9)
         perp = np.array([-chord[2], 0.0, chord[0]])
-        amp = rng.uniform(9.0, 14.0)
-        p1 = ctrl[ch] - chord * 12.0 + perp * amp
-        p2 = ctrl[ch] + chord * 12.0 - perp * amp
+        amp = rng.uniform(6.0, 9.0)
+        p1 = ctrl[ch] - chord * 15.0 + perp * amp
+        p2 = ctrl[ch] + chord * 15.0 - perp * amp
         ctrl = np.vstack([ctrl[:ch], [p1, p2], ctrl[ch + 1 :]])
 
         # Esses: a rapid alternating flick (Suzuka S-curves family), placed a
@@ -130,16 +138,26 @@ def generate(seed: int) -> dict:
         chord2 = ctrl[(es + 1) % m] - ctrl[(es - 1) % m]
         chord2 = chord2 / (np.linalg.norm(chord2) + 1e-9)
         perp2 = np.array([-chord2[2], 0.0, chord2[0]])
-        amp2 = rng.uniform(7.0, 10.0)
-        e1 = ctrl[es] - chord2 * 15.0 + perp2 * amp2
-        e2 = ctrl[es] - perp2 * amp2
-        e3 = ctrl[es] + chord2 * 15.0 + perp2 * amp2
+        amp2 = rng.uniform(4.5, 6.5)
+        e1 = ctrl[es] - chord2 * 18.0 + perp2 * amp2
+        e2 = ctrl[es] - perp2 * (0.5 * amp2)
+        e3 = ctrl[es] + chord2 * 18.0 + perp2 * amp2
         ctrl = np.vstack([ctrl[:es], [e1, e2, e3], ctrl[es + 1 :]])
 
         pos = resample_by_arclength(catmull_rom_closed(ctrl), SAMPLE_SPACING_M)
         n = len(pos)
         u = np.arange(n) / n
         kernel = np.ones(CURVATURE_SMOOTH_WINDOW) / CURVATURE_SMOOTH_WINDOW
+
+        # Geometric lint: Catmull-Rom through aggressive archetype points can
+        # cusp. Accept a layout only if no adjacent-sample direction change
+        # exceeds 7.5 deg (~R 19 m at 2.5 m spacing) — kinked layouts
+        # regenerate instead of shipping bumps that launch the car.
+        seg_v = np.roll(pos, -1, axis=0) - pos
+        seg_v /= np.linalg.norm(seg_v, axis=1, keepdims=True)
+        turn = np.degrees(np.arccos(np.clip((seg_v * np.roll(seg_v, 1, axis=0)).sum(1), -1.0, 1.0)))
+        if turn.max() > 9.0:
+            continue
 
         # Flat-plan curvature pre-pass: find the longest straight and the
         # tightest corner while the geometry is still 2D.
@@ -169,7 +187,7 @@ def generate(seed: int) -> dict:
         crest_c = (i_hp - 14) % n
         d = np.abs(np.arange(n) - crest_c)
         d = np.minimum(d, n - d).astype(float)
-        elev += 2.0 * np.exp(-(d * d) / (2.0 * 8.0 * 8.0))
+        elev += 1.5 * np.exp(-(d * d) / (2.0 * 8.0 * 8.0))
         grade = np.max(np.abs(np.diff(elev, append=elev[:1]))) / SAMPLE_SPACING_M
         if grade > MAX_GRADE:
             elev *= MAX_GRADE / grade

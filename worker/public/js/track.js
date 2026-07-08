@@ -75,7 +75,7 @@ function asphaltTexture() {
   let s = 0x1234abcd;
   const rnd = () => ((s = (s * 1664525 + 1013904223) >>> 0), s / 0xffffffff);
   for (let i = 0; i < img.data.length; i += 4) {
-    const base = 88 + (rnd() - 0.5) * 22; // fine grain
+    const base = 128 + (rnd() - 0.5) * 24; // fine grain
     img.data[i] = base;
     img.data[i + 1] = base + 4;
     img.data[i + 2] = base + 10;
@@ -137,7 +137,7 @@ export function buildTrackMeshes(track) {
   ribbonGeo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
   ribbonGeo.setIndex(idx);
   ribbonGeo.computeVertexNormals();
-  group.add(new THREE.Mesh(ribbonGeo, new THREE.MeshLambertMaterial({ map: asphaltTexture() })));
+  group.add(new THREE.Mesh(ribbonGeo, new THREE.MeshLambertMaterial({ map: asphaltTexture(), side: THREE.DoubleSide })));
 
   // White edge lines — the single biggest readability win at speed.
   for (const offset of [0, 3]) {
@@ -222,7 +222,7 @@ export function buildTrackMeshes(track) {
     const lg = new THREE.BufferGeometry();
     lg.setAttribute("position", new THREE.BufferAttribute(lp, 3));
     lg.setIndex(idx);
-    group.add(new THREE.Mesh(lg, new THREE.MeshBasicMaterial({ color: 0x14181f, transparent: true, opacity: 0.30, depthWrite: false })));
+    group.add(new THREE.Mesh(lg, new THREE.MeshBasicMaterial({ color: 0x14181f, transparent: true, opacity: 0.20, depthWrite: false, side: THREE.DoubleSide })));
   }
 
   // Start line + checkpoint gates: thin bright quads across the track.

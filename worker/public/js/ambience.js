@@ -57,7 +57,7 @@ export function buildAmbience(track, hash = null) {
   const groundY = minY - 1.35; // just under the shoulder drop (-1.2)
   const groundGeo = new THREE.CircleGeometry(maxR + 120, 40);
   groundGeo.rotateX(-Math.PI / 2);
-  const ground = new THREE.Mesh(groundGeo, new THREE.MeshLambertMaterial({ color: 0x25301f }));
+  const ground = new THREE.Mesh(groundGeo, new THREE.MeshLambertMaterial({ color: 0x2d3b31 }));
   ground.position.set(cx, groundY, cz);
   group.add(ground);
 

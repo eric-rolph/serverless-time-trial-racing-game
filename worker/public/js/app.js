@@ -558,6 +558,7 @@ window.__sttr = {
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),
   input,
+  scene,
   FanatecFFB,
   registerHidDevice,
 };
