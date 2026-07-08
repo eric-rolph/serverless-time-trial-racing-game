@@ -76,9 +76,10 @@ int main( void )
 	CHECK( s->pos[1] > 0.2f && s->pos[1] < 1.5f, "car rests above terrain (no fall-through)" );
 	CHECK( s->speed < 0.6f, "car nearly at rest after settling" );
 
-	// Static load per wheel ~ mg/4 = 1350*9.81/4 = 3311 N; k = 60000 N/m
-	// → expected compression ≈ 0.055 m. Allow generous tolerance for
-	// damping transients and front/rear balance.
+	// The suspension springs carry the SPRUNG weight only (docs/SUSPENSION.md
+	// §1): 1262*9.81 N over four corners of k = 60000 N/m, front/rear split
+	// by the computed CoM (z = -0.134) → ~0.046 m front, ~0.057 m rear.
+	// Allow generous tolerance for damping transients.
 	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 	{
 		float c = s->wheels[i].susp_compression;
@@ -121,9 +122,13 @@ int main( void )
 	float turn = fz_before * fx_after - fx_before * fz_after;
 	printf( "turn cross-product after 1 s of steering: %.3f\n", (double)turn );
 	CHECK( fabsf( turn ) > 0.05f, "steering yaws the chassis" );
-	CHECK( fabsf( s->wheels[0].steer_angle - 20000.0f / 32767.0f * 0.5235988f ) < 1e-3f,
-		   "front wheel steer angle matches linear map" );
-	CHECK( s->wheels[2].steer_angle == 0.0f, "rear wheels do not steer" );
+	// Steer angle now includes kinematic toe (docs/SUSPENSION.md §2): front
+	// runs 0.05 deg toe-out (~0.9 mrad per side), the rear 0.15 deg toe-in
+	// plus bump toe — so the front check tolerates the toe offset and the
+	// rear check bounds the angle instead of expecting exactly zero.
+	CHECK( fabsf( s->wheels[0].steer_angle - 20000.0f / 32767.0f * 0.5235988f ) < 2e-3f,
+		   "front wheel steer angle matches linear map (+/- toe)" );
+	CHECK( fabsf( s->wheels[2].steer_angle ) < 0.01f, "rear wheels carry only toe (no steering input)" );
 
 	// --- 5. Handbrake locks rears ---
 	sim_reset();

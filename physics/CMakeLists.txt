@@ -60,9 +60,19 @@ target_include_directories(test_road PRIVATE src)
 set_target_properties(test_road PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
 add_test(NAME road COMMAND test_road)
 
+# test_suspension drives vehicle_suspension_step / vehicle_wheel_kinematics /
+# vehicle_camber_thrust_sigma directly (docs/SUSPENSION.md §5.2) plus a full
+# sim settle on the flat oval.
+add_executable(test_suspension tests/test_suspension.c tests/make_test_track.c)
+target_link_libraries(test_suspension PRIVATE sim)
+target_include_directories(test_suspension PRIVATE src)
+set_target_properties(test_suspension PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
+add_test(NAME suspension COMMAND test_suspension)
+
 if (UNIX)
     target_link_libraries(test_determinism PRIVATE m)
     target_link_libraries(test_vehicle PRIVATE m)
     target_link_libraries(test_tire PRIVATE m)
     target_link_libraries(test_road PRIVATE m)
+    target_link_libraries(test_suspension PRIVATE m)
 endif()

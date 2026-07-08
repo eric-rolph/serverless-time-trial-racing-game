@@ -2,17 +2,23 @@
 // (docs/TIRE-MODEL.md, replacing the Pacejka MF of ADR-007) contacting the
 // analytic C1 road surface of docs/ROAD-SURFACE.md.
 //
-// Chassis: one dynamic Box3D rigid body (box hull ~1.9 x 1.1 x 4.4 m, 1350 kg,
-// explicit inertia). Wheels are NOT rigid bodies: each is a fixed hardpoint
-// whose contact comes from road_query() on the analytic surface (mesh raycast
-// only as the off-domain fallback), a spring/damper along chassis up, and
-// brush contact-patch tire forces applied at the contact point. The patch
-// is N=16 bristle elements under a parabolic pressure distribution; grip,
-// combined-slip budget sharing and the pneumatic-trail collapse all emerge
-// from the per-element adhesion/sliding split. A two-node thermal layer
-// (T_surf/T_core per tire, plus track conduction) scales friction with
-// surface temperature. The per-wheel pipeline (slip -> brush -> thermal ->
-// spin) runs 4 fixed sub-steps per 400 Hz tick (ROAD-SURFACE §3).
+// Chassis: one dynamic Box3D rigid body (box hull ~1.9 x 1.1 x 4.4 m; sprung
+// mass 1262 kg with CoM + inertia tensor computed from the docs/SUSPENSION.md
+// §4 mass layout). Wheels are NOT Box3D bodies: each is a 22 kg unsprung
+// quarter-car corner with 1-DOF strut travel below the hardpoint
+// (docs/SUSPENSION.md §1) — a 200 kN/m tire vertical spring against the
+// analytic road (road_query(); mesh raycast only as the off-domain fallback)
+// works against the suspension spring/damper to the chassis. Fz for the
+// brush contact patch IS the tire spring force, so kerb/bump load spikes
+// come from tire stiffness + unsprung dynamics. Kinematic camber/toe follow
+// spring travel and camber feeds the patch as equivalent lateral slip
+// (docs/SUSPENSION.md §2-3). The patch is N=16 bristle elements under a
+// parabolic pressure distribution; grip, combined-slip budget sharing and
+// the pneumatic-trail collapse all emerge from the per-element
+// adhesion/sliding split. A two-node thermal layer (T_surf/T_core per tire,
+// plus track conduction) scales friction with surface temperature. The
+// per-wheel pipeline (strut -> slip -> brush -> thermal -> spin) runs 4
+// fixed sub-steps per 400 Hz tick (ROAD-SURFACE §3).
 //
 // Coordinate convention (recorded in physics/NOTES.md):
 //   chassis local: +X right, +Y up, +Z forward. Yaw about +Y; yaw = 0 faces +Z.
@@ -34,15 +40,12 @@
 
 typedef struct VehicleTuning
 {
-	// Chassis
+	// Chassis. Mass properties (CoM + inertia tensor) are COMPUTED from the
+	// docs/SUSPENSION.md §4 mass layout in vehicle_mass_data(), not hand-set.
 	float half_extent_x; // half width (m)
 	float half_extent_y; // half height (m)
 	float half_extent_z; // half length (m)
-	float mass;			 // kg
-	float com_drop;		 // center of mass lowered by this much (m)
-	float inertia_pitch; // about local X (kg m^2)
-	float inertia_yaw;	 // about local Y
-	float inertia_roll;	 // about local Z
+	float mass;			 // TOTAL vehicle mass (kg); sprung = mass - 4*unsprung_mass
 
 	// Aerodynamics: F = -drag_coef * v * |v|, applied at center of mass
 	float drag_coef; // 0.5 * rho * Cd * A
@@ -62,6 +65,25 @@ typedef struct VehicleTuning
 	float spring_k;		  // N/m
 	float damper_bump;	  // N s/m (compressing)
 	float damper_rebound; // N s/m (extending)
+
+	// Quarter-car unsprung corner (docs/SUSPENSION.md §1)
+	float unsprung_mass; // kg per corner (wheel + brake + upright)
+	float tire_k;		 // tire vertical spring rate (N/m)
+	float tire_c;		 // tire vertical damping (N s/m)
+
+	// Kinematic camber/toe (docs/SUSPENSION.md §2). Conventional signs:
+	// camber negative = top of the wheel toward the centerline; toe positive =
+	// toe-IN (leading edge inward). Bump curves are linear in spring travel
+	// about the per-axle static settle compression below.
+	float camber_static_front;	// rad
+	float camber_static_rear;	// rad
+	float camber_bump_gain;		// rad per m of compression (both axles)
+	float toe_in_front;			// rad per side (+ = in; front runs toe-OUT)
+	float toe_in_rear;			// rad per side
+	float toe_bump_gain_rear;	// rad per m of compression (rear only)
+	float settle_comp_front;	// static settle spring compression, front (m)
+	float settle_comp_rear;		// static settle spring compression, rear (m)
+	float camber_thrust;		// sigma_y += camber_thrust * sin(gamma) (§3)
 
 	// Tires — discretized brush contact patch (docs/TIRE-MODEL.md §1).
 	// brush_mu_s is the BRISTLE-level static friction coefficient; the
@@ -115,10 +137,6 @@ static const VehicleTuning kTuning = {
 	.half_extent_y = 0.55f,
 	.half_extent_z = 2.2f,
 	.mass = 1350.0f,
-	.com_drop = 0.15f,
-	.inertia_pitch = 2400.0f,
-	.inertia_yaw = 2600.0f,
-	.inertia_roll = 550.0f,
 
 	.drag_coef = 0.42f,
 	.aero_cl_front = 1.1f,
@@ -133,6 +151,26 @@ static const VehicleTuning kTuning = {
 	.spring_k = 60000.0f,
 	.damper_bump = 4500.0f,
 	.damper_rebound = 5200.0f,
+
+	.unsprung_mass = 22.0f,
+	.tire_k = 200000.0f, // docs/SUSPENSION.md §1
+	.tire_c = 300.0f,
+
+	// docs/SUSPENSION.md §2: camber -1.5 deg F / -1.0 deg R; camber gain
+	// -1.0 deg per 25 mm compression; toe +0.05 deg OUT front / +0.15 deg IN
+	// rear; bump toe +0.10 deg per 25 mm on the rear only.
+	.camber_static_front = -0.02617994f, // -1.5 deg
+	.camber_static_rear = -0.01745329f,	 // -1.0 deg
+	.camber_bump_gain = -0.69813170f,	 // -1.0 deg / 0.025 m
+	.toe_in_front = -8.7266462e-4f,		 // 0.05 deg toe-out
+	.toe_in_rear = 2.6179939e-3f,		 // 0.15 deg toe-in
+	.toe_bump_gain_rear = 0.069813170f,	 // +0.10 deg / 0.025 m
+	// Static settle spring compression per axle: sprung weight 1262*9.81 N on
+	// the CoM at z = -0.13393 between hardpoints z = +/-1.3 gives per-wheel
+	// front 2776.2 N -> 0.04627 m and rear 3414.0 N -> 0.05690 m at 60 kN/m.
+	.settle_comp_front = 0.046270f,
+	.settle_comp_rear = 0.056898f,
+	.camber_thrust = 0.6f, // docs/SUSPENSION.md §3
 
 	.brush_cp = 7.0e6f,
 	.brush_a0 = 0.075f,
@@ -192,6 +230,91 @@ static int sIsFront( int i )
 }
 
 // ---------------------------------------------------------------------------
+// Mass layout -> composite CoM + inertia tensor (docs/SUSPENSION.md §4)
+// ---------------------------------------------------------------------------
+
+// Point masses of the layout table (the tub/body is the uniform box below;
+// the 4 unsprung corners are appended from the hardpoint positions).
+typedef struct MassPoint
+{
+	float m;
+	b3Vec3 p;
+} MassPoint;
+
+#define SIM_BOX_MASS 900.0f // tub/body: uniform 1.9 x 1.1 x 4.4 box at origin
+
+static const MassPoint kMassPoints[] = {
+	{ 220.0f, { 0.0f, -0.10f, -0.90f } }, // engine + gearbox
+	{ 80.0f, { 0.0f, 0.00f, 0.20f } },	  // driver
+	{ 40.0f, { 0.0f, -0.20f, -0.30f } },  // fuel
+	{ 22.0f, { 0.0f, -0.30f, 0.60f } },	  // ballast (remainder to 1350 total)
+};
+#define SIM_MASS_POINT_COUNT 4
+
+// Composite CoM + principal (diagonal) inertia: box formula for the tub,
+// parallel-axis for every point mass. The small Iyz product (~10 kg m^2,
+// <1% of pitch) is dropped — principal axes assumed body-aligned. Fixed
+// float math, fixed iteration order: bit-identical native/wasm.
+b3MassData vehicle_mass_data( void )
+{
+	const VehicleTuning* t = &kTuning;
+
+	// Gather all point masses: table + 4 unsprung corners at the hardpoints.
+	MassPoint pts[SIM_MASS_POINT_COUNT + SIM_WHEEL_COUNT];
+	for ( int i = 0; i < SIM_MASS_POINT_COUNT; ++i )
+	{
+		pts[i] = kMassPoints[i];
+	}
+	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
+	{
+		pts[SIM_MASS_POINT_COUNT + i].m = t->unsprung_mass;
+		pts[SIM_MASS_POINT_COUNT + i].p = sVehicleHardpoint( i );
+	}
+
+	// Composite CoM (box sits at the origin, contributes no moment).
+	float total = SIM_BOX_MASS;
+	b3Vec3 moment = b3Vec3_zero;
+	for ( int i = 0; i < SIM_MASS_POINT_COUNT + SIM_WHEEL_COUNT; ++i )
+	{
+		total += pts[i].m;
+		moment = b3MulAdd( moment, pts[i].m, pts[i].p );
+	}
+	b3Vec3 com = b3MulSV( 1.0f / total, moment );
+
+	// Uniform box about its own center, then parallel-axis to the CoM.
+	float w = 2.0f * t->half_extent_x;
+	float h = 2.0f * t->half_extent_y;
+	float d = 2.0f * t->half_extent_z;
+	float ixx = ( SIM_BOX_MASS / 12.0f ) * ( h * h + d * d ) + SIM_BOX_MASS * ( com.y * com.y + com.z * com.z );
+	float iyy = ( SIM_BOX_MASS / 12.0f ) * ( w * w + d * d ) + SIM_BOX_MASS * ( com.x * com.x + com.z * com.z );
+	float izz = ( SIM_BOX_MASS / 12.0f ) * ( w * w + h * h ) + SIM_BOX_MASS * ( com.x * com.x + com.y * com.y );
+
+	for ( int i = 0; i < SIM_MASS_POINT_COUNT + SIM_WHEEL_COUNT; ++i )
+	{
+		float dx = pts[i].p.x - com.x;
+		float dy = pts[i].p.y - com.y;
+		float dz = pts[i].p.z - com.z;
+		ixx += pts[i].m * ( dy * dy + dz * dz );
+		iyy += pts[i].m * ( dx * dx + dz * dz );
+		izz += pts[i].m * ( dx * dx + dy * dy );
+	}
+
+	// Translational mass is the SPRUNG mass (docs/SUSPENSION.md §1): the four
+	// unsprung corners carry their own weight to the ground through the tire
+	// springs. Rotationally the wheels move with the chassis (only their
+	// strut DOF is separate), so the tensor keeps the full layout.
+	b3MassData md;
+	md.mass = total - 4.0f * t->unsprung_mass;
+	md.center = com;
+	md.inertia = ( b3Matrix3 ){
+		.cx = { ixx, 0.0f, 0.0f },
+		.cy = { 0.0f, iyy, 0.0f },
+		.cz = { 0.0f, 0.0f, izz },
+	};
+	return md;
+}
+
+// ---------------------------------------------------------------------------
 // Creation / reset
 // ---------------------------------------------------------------------------
 
@@ -226,21 +349,14 @@ void vehicle_create( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 	b3BoxHull box = b3MakeBoxHull( t->half_extent_x, t->half_extent_y, t->half_extent_z );
 	b3CreateHullShape( v->chassis, &shapeDef, &box.base );
 
-	// Explicit, realistic mass properties (a uniform box hull of these
-	// dimensions would be far too top-heavy in roll).
-	b3MassData md;
-	md.mass = t->mass;
-	md.center = ( b3Vec3 ){ 0.0f, -t->com_drop, 0.0f };
-	md.inertia = ( b3Matrix3 ){
-		.cx = { t->inertia_pitch, 0.0f, 0.0f },
-		.cy = { 0.0f, t->inertia_yaw, 0.0f },
-		.cz = { 0.0f, 0.0f, t->inertia_roll },
-	};
-	b3Body_SetMassData( v->chassis, md );
+	// Mass properties computed from the docs/SUSPENSION.md §4 mass layout
+	// (sprung translational mass, full-layout CoM + principal tensor).
+	b3Body_SetMassData( v->chassis, vehicle_mass_data() );
 
 	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 	{
 		v->wheels[i] = ( WheelRuntime ){ 0 };
+		v->wheels[i].travel = t->rest_length; // full droop: the car hangs
 		v->wheels[i].t_surf = t->thermal_t_amb;
 		v->wheels[i].t_core = t->thermal_t_amb;
 	}
@@ -265,6 +381,7 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 	{
 		v->wheels[i] = ( WheelRuntime ){ 0 };
+		v->wheels[i].travel = kTuning.rest_length; // full droop, as created
 		// Tires back to ambient: a reset run must replay identically.
 		v->wheels[i].t_surf = kTuning.thermal_t_amb;
 		v->wheels[i].t_core = kTuning.thermal_t_amb;
@@ -358,6 +475,98 @@ void vehicle_tire_thermal( WheelRuntime* w, float power, float speed, int in_con
 	float d_core = t->thermal_h_int2 * ( w->t_surf - w->t_core );
 	w->t_surf += d_surf * dt;
 	w->t_core += d_core * dt;
+}
+
+// ---------------------------------------------------------------------------
+// Quarter-car unsprung corner (docs/SUSPENSION.md §1)
+// ---------------------------------------------------------------------------
+
+// One 1600 Hz sub-step of the 1-DOF strut travel. travel is measured DOWN
+// along the strut (-chassis up) from the hardpoint to the wheel center, so:
+//   spring compression c = rest_length - travel,  c_dot = -travel_vel
+//   tire penetration   p = travel + wheel_radius - hit_dist
+// Forces on the unsprung mass along strut-down: +suspension (a compressed
+// spring pushes the wheel away from the chassis), +gravity, -tire. Chassis
+// pose is frozen within the tick, so hit_dist / hit_dist_dot are per-tick
+// constants supplied by the caller. Semi-implicit Euler (velocity first):
+// omega*dt ~ 0.07 at 1600 Hz, comfortably stable. mul/add/div/compare only.
+void vehicle_suspension_step( WheelRuntime* w, float hit_dist, float hit_dist_dot, float g_along, float dt,
+							  float* out_tire_force, float* out_susp_force )
+{
+	const VehicleTuning* t = &kTuning;
+
+	// Suspension spring/damper between chassis and unsprung mass. Travel
+	// clamps keep c in [0, max_travel]; the damper may pull (rebound), so the
+	// strut force is clamped symmetrically, not at zero.
+	float c = t->rest_length - w->travel;
+	float c_dot = -w->travel_vel;
+	float damper = c_dot >= 0.0f ? t->damper_bump : t->damper_rebound;
+	float f_susp = t->spring_k * c + damper * c_dot;
+	f_susp = b3ClampFloat( f_susp, -t->max_load, t->max_load );
+
+	// Tire vertical spring against the road (Fz for the brush model). Pushes
+	// only (clamped >= 0); force-free the instant the tread leaves the road.
+	float pen = w->travel + t->wheel_radius - hit_dist;
+	float f_tire = 0.0f;
+	if ( pen > 0.0f )
+	{
+		f_tire = t->tire_k * pen + t->tire_c * ( w->travel_vel - hit_dist_dot );
+		f_tire = b3ClampFloat( f_tire, 0.0f, t->max_load );
+	}
+
+	// m_u * dv = F_susp + m_u*g_along - F_tire  (strut-down positive; this is
+	// the spec's m_u*dv = F_t - F_susp - m_u*g with v measured strut-up)
+	float accel = ( f_susp - f_tire ) / t->unsprung_mass + g_along;
+	w->travel_vel += accel * dt;
+	w->travel += w->travel_vel * dt;
+
+	// Travel clamps: kill velocity INTO the stop only.
+	float travel_min = t->rest_length - t->max_travel;
+	if ( w->travel > t->rest_length )
+	{
+		w->travel = t->rest_length;
+		if ( w->travel_vel > 0.0f )
+		{
+			w->travel_vel = 0.0f;
+		}
+	}
+	else if ( w->travel < travel_min )
+	{
+		w->travel = travel_min;
+		if ( w->travel_vel < 0.0f )
+		{
+			w->travel_vel = 0.0f;
+		}
+	}
+
+	*out_tire_force = f_tire;
+	*out_susp_force = f_susp;
+}
+
+// ---------------------------------------------------------------------------
+// Kinematic camber/toe + camber thrust (docs/SUSPENSION.md §2, §3)
+// ---------------------------------------------------------------------------
+
+void vehicle_wheel_kinematics( int wheel, float compression, float* out_camber, float* out_steer_add )
+{
+	const VehicleTuning* t = &kTuning;
+	int front = wheel < 2;
+	float bump = compression - ( front ? t->settle_comp_front : t->settle_comp_rear );
+
+	float camber = ( front ? t->camber_static_front : t->camber_static_rear ) + t->camber_bump_gain * bump;
+	float toe_in = front ? t->toe_in_front : ( t->toe_in_rear + t->toe_bump_gain_rear * bump );
+
+	// Toe-in points the leading edge at the centerline: the LEFT wheel (x<0,
+	// indices 0/2) steers right (-), the RIGHT wheel steers left (+).
+	float mirror = ( wheel == 0 || wheel == 2 ) ? 1.0f : -1.0f; // +1 on left wheels
+	*out_camber = camber;
+	*out_steer_add = -mirror * toe_in;
+}
+
+float vehicle_camber_thrust_sigma( float gamma )
+{
+	b3CosSin cs = b3ComputeCosSin( gamma );
+	return kTuning.camber_thrust * cs.sine;
 }
 
 static float sEngineTorque( float rpm )
@@ -479,11 +688,19 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 	const float ray_len = t->rest_length + t->wheel_radius;
 	const float sub_dt = SIM_DT / (float)SIM_TIRE_SUBSTEPS;
 
+	// Gravity component along strut-down (-up): the same for all four corners.
+	const float g_along = 9.81f * up.y;
+
 	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 	{
 		WheelRuntime* w = &v->wheels[i];
 		int front = sIsFront( i );
-		w->steer_angle = front ? steer_angle : 0.0f;
+
+		// Kinematic camber/toe from the CURRENT spring compression
+		// (docs/SUSPENSION.md §2). Travel clamps keep it in [0, max_travel].
+		float camber_conv, toe_add;
+		vehicle_wheel_kinematics( i, t->rest_length - w->travel, &camber_conv, &toe_add );
+		w->steer_angle = ( front ? steer_angle : 0.0f ) + toe_add;
 
 		b3Vec3 hp_local = sVehicleHardpoint( i );
 		b3Pos origin = b3Body_GetWorldPoint( chassis, hp_local );
@@ -546,61 +763,51 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 			}
 		}
 
-		float prev_compression = w->compression;
-
 		if ( !have_contact )
 		{
-			w->in_contact = 0;
-			w->compression = 0.0f;
-			w->prev_compression = prev_compression;
-			w->load = 0.0f;
-			w->slip_ratio = 0.0f;
-			w->slip_angle = 0.0f;
-			w->wheel_center = b3MulAdd( origin, -t->rest_length, up );
-
-			// Airborne: tire still cools (no friction power, no track
+			// Airborne: no tire spring, but the strut still works the 22 kg
+			// unsprung mass toward full droop (and its reaction still pulls
+			// on the chassis), the tire cools (no friction power, no track
 			// conduction) and the free wheel still sees engine/brake torque.
+			float fsusp_sum = 0.0f;
 			for ( int k = 0; k < SIM_TIRE_SUBSTEPS; ++k )
 			{
+				float f_tire, f_susp;
+				vehicle_suspension_step( w, ray_len + 1.0f, 0.0f, g_along, sub_dt, &f_tire, &f_susp );
+				fsusp_sum += f_susp;
 				vehicle_tire_thermal( w, 0.0f, chassis_speed, 0, sub_dt );
 				sWheelSpinStep( w, front, handbrake, throttle, brake, 0.0f, sub_dt );
 			}
 			sWrapSpin( w );
-			continue;
-		}
 
-		// Compression: distance the spring is shorter than rest length.
-		float compression = ray_len - hit_dist; // 0 (full droop) .. ray_len
-		compression = b3ClampFloat( compression, 0.0f, t->max_travel );
+			const float inv_n_air = 1.0f / (float)SIM_TIRE_SUBSTEPS;
+			b3Body_ApplyForce( chassis, b3MulSV( fsusp_sum * inv_n_air, up ), origin, true );
 
-		w->in_contact = 1;
-		w->compression = compression;
-		w->contact_point = contact_point;
-		w->wheel_center = b3MulAdd( origin, -( hit_dist - t->wheel_radius ), up );
-
-		// --- Spring + damper along chassis up (strut axis) ---
-		float comp_vel = ( compression - prev_compression ) / SIM_DT;
-		float damper_c = comp_vel >= 0.0f ? t->damper_bump : t->damper_rebound;
-		float fz = t->spring_k * compression + damper_c * comp_vel;
-		fz = b3ClampFloat( fz, 0.0f, t->max_load );
-		w->load = fz;
-		w->prev_compression = prev_compression;
-
-		b3Vec3 susp_force = b3MulSV( fz, up );
-		b3Body_ApplyForce( chassis, susp_force, contact_point, true );
-
-		if ( fz <= 0.0f )
-		{
+			w->in_contact = 0;
+			w->compression = t->rest_length - w->travel;
+			w->load = 0.0f;
 			w->slip_ratio = 0.0f;
 			w->slip_angle = 0.0f;
-			for ( int k = 0; k < SIM_TIRE_SUBSTEPS; ++k )
-			{
-				vehicle_tire_thermal( w, 0.0f, chassis_speed, 1, sub_dt );
-				sWheelSpinStep( w, front, handbrake, throttle, brake, 0.0f, sub_dt );
-			}
-			sWrapSpin( w );
+			w->wheel_center = b3MulAdd( origin, -w->travel, up );
 			continue;
 		}
+
+		// Rate of change of the contact distance along the strut: the road is
+		// static, so d = dot(origin - point, n)/dot(up, n) changes with the
+		// hardpoint velocity only (per-tick constant; the ~0.03 deg/tick drift
+		// of `up` itself is second order). Feeds the tire-spring damper.
+		float hit_dist_dot = 0.0f;
+		{
+			float facing = b3Dot( up, contact_normal );
+			if ( facing > 0.2f )
+			{
+				b3Vec3 v_hp = b3Body_GetWorldPointVelocity( chassis, origin );
+				hit_dist_dot = b3Dot( v_hp, contact_normal ) / facing;
+			}
+		}
+
+		w->in_contact = 1;
+		w->contact_point = contact_point;
 
 		// --- Contact patch basis, projected onto the contact plane ---
 		// Wheel forward = chassis forward rotated by steer angle about chassis
@@ -627,6 +834,16 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 		}
 		b3Vec3 wheel_side = b3Cross( contact_normal, wheel_fwd ); // points left
 
+		// --- Camber vs the ROAD normal (docs/SUSPENSION.md §3): chassis lean
+		// about the wheel-forward axis (roll and banking both arrive through
+		// the contact-basis projection) plus the kinematic camber, mirrored
+		// so "negative camber" leans both wheel tops toward the centerline.
+		// gamma > 0 = wheel top leaning LEFT (+side) => thrust to the left.
+		float mirror = ( i == 0 || i == 2 ) ? 1.0f : -1.0f; // +1 on left wheels
+		float lean = b3Atan2( b3Dot( up, wheel_side ), b3Dot( up, contact_normal ) );
+		float gamma = lean + mirror * camber_conv;
+		float sigma_camber = vehicle_camber_thrust_sigma( gamma );
+
 		// --- Slip inputs from contact-patch velocity (constant across the
 		// tick: the chassis integrates at tick level, only omega sub-steps) ---
 		b3Vec3 vel = b3Body_GetWorldPointVelocity( chassis, contact_point );
@@ -640,21 +857,31 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 		}
 
 		// Slip vector: sigma_x = slip ratio, sigma_y = tan(slip angle) =
-		// -v_lat/denom (exactly what slip_angle's atan2 argument already is).
-		// Combined slip shares one friction budget inside the patch model.
-		float sigma_y = -v_lat / denom;
+		// -v_lat/denom plus the camber-thrust equivalent slip — it flows
+		// through the same bristle adhesion/sliding split, so camber thrust
+		// saturates with everything else. The EXPORTED slip_angle stays the
+		// kinematic one (SimStateV1 field meaning unchanged).
+		float sigma_y = -v_lat / denom + sigma_camber;
 		w->slip_angle = b3Atan2( -v_lat, denom );
 
-		// --- Sub-stepped per-wheel pipeline (docs/ROAD-SURFACE.md §3):
-		// slip -> brush patch -> thermal -> wheel spin at SIM_DT/4. Chassis
-		// force is the sub-step MEAN applied once per tick at the patch
-		// (Box3D integrates F·SIM_DT, so the mean preserves the summed
-		// sub-step impulses exactly). ---
+		// --- Sub-stepped per-wheel pipeline (docs/ROAD-SURFACE.md §3 +
+		// SUSPENSION.md §1): unsprung strut travel -> slip -> brush patch ->
+		// thermal -> wheel spin at SIM_DT/4. Fz for the brush model is the
+		// TIRE spring force from the quarter-car, per sub-step. Chassis
+		// forces are the sub-step MEAN applied once per tick (Box3D
+		// integrates F·SIM_DT, so the mean preserves the summed impulses):
+		// strut reaction at the hardpoint, tire in-plane force at the patch.
 		float fx_sum = 0.0f;
 		float fy_sum = 0.0f;
 		float rack_sum = 0.0f;
+		float fsusp_sum = 0.0f;
+		float fz = 0.0f;
 		for ( int k = 0; k < SIM_TIRE_SUBSTEPS; ++k )
 		{
+			float f_susp;
+			vehicle_suspension_step( w, hit_dist, hit_dist_dot, g_along, sub_dt, &fz, &f_susp );
+			fsusp_sum += f_susp;
+
 			float slip_ratio = ( w->omega * t->wheel_radius - v_long ) / denom;
 			slip_ratio = b3ClampFloat( slip_ratio, -4.0f, 4.0f );
 			w->slip_ratio = slip_ratio; // last sub-step's value is exported
@@ -673,17 +900,26 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 			}
 
 			// Thermal: friction power from the slip velocity at the patch,
-			// with track conduction while in contact (ROAD-SURFACE §2).
+			// with track conduction while the tread presses the road
+			// (ROAD-SURFACE §2).
 			float v_slip_x = w->omega * t->wheel_radius - v_long;
 			float p_fric = b3AbsFloat( fx * v_slip_x ) + b3AbsFloat( fy * v_lat );
-			vehicle_tire_thermal( w, p_fric, chassis_speed, 1, sub_dt );
+			vehicle_tire_thermal( w, p_fric, chassis_speed, fz > 0.0f, sub_dt );
 
 			// Wheel spin (RWD drive, brakes on all four, tire reaction).
 			sWheelSpinStep( w, front, handbrake, throttle, brake, -fx * t->wheel_radius, sub_dt );
 		}
 		sWrapSpin( w );
 
+		w->load = fz; // last sub-step's tire spring force
+		w->compression = t->rest_length - w->travel;
+		w->wheel_center = b3MulAdd( origin, -w->travel, up );
+
 		const float inv_n = 1.0f / (float)SIM_TIRE_SUBSTEPS;
+		// Strut reaction on the chassis at the hardpoint, along the strut.
+		b3Body_ApplyForce( chassis, b3MulSV( fsusp_sum * inv_n, up ), origin, true );
+		// Tire in-plane force at the patch (the unsprung mass has no in-plane
+		// DOF, so the patch force transfers rigidly to the chassis).
 		b3Vec3 tire_force = b3Add( b3MulSV( fx_sum * inv_n, wheel_fwd ), b3MulSV( fy_sum * inv_n, wheel_side ) );
 		b3Body_ApplyForce( chassis, tire_force, contact_point, true );
 

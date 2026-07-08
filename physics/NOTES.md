@@ -340,6 +340,145 @@ the per-wheel pipeline, and the additive `sim_tire_temp` export (ABI 1.2).
   --target-speed 15: LAP COMPLETE, 65.375 s (26 150 ticks), final hash
   `690a50d23d211840` — inside the ≤ 65.4 s gate.
 
+## Suspension wave 3 (2026-07-08, docs/SUSPENSION.md)
+
+Per-corner 22 kg unsprung mass with 1-DOF strut travel + 200 kN/m tire
+vertical spring; kinematic camber/toe with bump curves; camber thrust as
+equivalent lateral slip through the brush patch; chassis CoM + inertia tensor
+computed from the §4 mass layout. All in src/vehicle.c; SimStateV1 layout and
+the wasm export surface unchanged.
+
+### Quarter-car unsprung corner (§1)
+
+- `WheelRuntime` gained `travel` (wheel center below the hardpoint along the
+  strut, m) and `travel_vel`; `prev_compression` is gone (the damper now reads
+  `-travel_vel` directly instead of a finite difference). `compression`
+  remains the SUSPENSION SPRING travel `rest_length - travel`, which is what
+  `susp_compression` exports; wheel pos exports the unsprung center
+  `hardpoint - travel·up`. Create/reset initialize `travel = rest_length`
+  (full droop — the car hangs), deterministic for replays.
+- `vehicle_suspension_step()` (non-static, test-driven like
+  vehicle_brush_patch): one 1600 Hz sub-step, semi-implicit Euler
+  (velocity first — the standard stable form of "explicit" at ω·dt ≈ 0.07).
+  EOM along strut-down: `m_u·dv = F_susp + m_u·g_along − F_tire` with
+  `g_along = 9.81·up.y` (spec's equation with the axis flipped). Travel
+  clamps kill velocity into the stop only.
+- Tire spring `F_t = k_t·pen + c_t·(travel_vel − hit_dist_dot)` clamped
+  [0, max_load]; **Fz fed to the brush model is this force**, per sub-step.
+  `hit_dist_dot = dot(v_hardpoint, n)/dot(up, n)` — road static, so the
+  contact distance changes with hardpoint velocity only (per-tick constant).
+- Strut force `F_susp = k_s·c − damper·travel_vel` clamped ±max_load — it may
+  go NEGATIVE (rebound damper pulling the chassis down into a dip); the old
+  path clamped at 0 because the same number fed the tire. Its chassis
+  reaction applies at the HARDPOINT along up (same torque as the old
+  contact-point application — the offset is parallel to the force — but
+  matches the spec text). Applied airborne too (droop extension damping).
+- Load path at settle: springs carry the sprung weight only. Chassis body
+  mass = 1262 kg (spec §1); tire loads sum back to 1350·g because each corner
+  adds its own `m_u·g` through the tire spring. Known simplification: tire
+  IN-PLANE forces accelerate the 1262 kg body (the unsprung corners have no
+  in-plane DOF), so the car is ~6.5 % lighter in translation than 1350 kg —
+  quarter-car-in-a-game standard, accepted by the spec's mass split.
+- The airborne path integrates the same quarter-car with F_t = 0 (wheel runs
+  to the droop stop, strut reaction still applies); thermal/spin sub-steps
+  unchanged.
+
+### Kinematic camber/toe (§2)
+
+- `vehicle_wheel_kinematics()` (non-static, test-driven): static camber
+  −1.5°F/−1.0°R, toe 0.05° OUT front / 0.15° IN rear per side; bump curves
+  linear in spring travel about per-axle static settle: camber −1.0°/25 mm
+  both axles, toe +0.10°/25 mm rear only. Toe adds to `steer_angle`
+  (mirrored: toe-in steers left wheels right); camber feeds §3 only (no
+  geometric wheel-pose change, per spec).
+- Settle references are kTuning literals derived from the computed layout:
+  sprung 1262·9.81 N on CoM z = −0.13393 between hardpoints ±1.3 m →
+  2776.2 N/wheel front (0.046270 m), 3414.0 N/wheel rear (0.056898 m).
+  Measured sim settle matches to 4 decimals (test_suspension gate a).
+
+### Camber thrust (§3)
+
+- `sigma_y += 0.6·sin(gamma)` via `vehicle_camber_thrust_sigma()`;
+  γ = lean-left-positive camber vs the ROAD normal:
+  `gamma = atan2(dot(up, wheel_side), dot(up, contact_normal)) + mirror·camber`
+  — chassis roll and banking arrive through the contact-basis projection,
+  static/bump camber through the mirrored kinematic value. Sign verified:
+  negative camber on the outside wheel thrusts INTO the corner; body roll
+  (lean-out) reduces grip, which the static negative camber counteracts.
+- Computed once per tick (travel moves ≪ 1 mm per tick); flows through the
+  brush patch so it saturates with the shared friction budget — past the
+  grip peak the shift SUBTRACTS force (measured, gate d).
+- Side effect worth knowing: with Cα ≈ 79 kN/slip, static −1.5° camber makes
+  ~1.1 kN of standing lateral preload per front tire (left/right cancel —
+  net force, yaw and roll torque all zero; no thermal power at v_lat ≈ 0).
+  That is an aggressive but spec-mandated k = 0.6 (physical camber stiffness
+  is ~10× smaller); the emergent behavior gates all pass with it.
+
+### Mass layout → CoM + inertia (§4)
+
+- `vehicle_mass_data()` (non-static, test-driven) computes from the spec
+  table: box 900 kg 1.9×1.1×4.4 at origin + engine 220 @ (0,−0.10,−0.90) +
+  driver 80 @ (0,0,0.20) + fuel 40 @ (0,−0.20,−0.30) + 4×22 at the
+  hardpoints + ballast 22 @ (0,−0.30,0.60) = 1350 kg total.
+  Applied via `b3Body_SetMassData` (b3MassData: mass/center/inertia-about-CoM,
+  physics/box3d/include/box3d/box3d.h:647).
+- **Computed: CoM (0, −0.0434, −0.1339); pitch 1868.9, yaw 2096.5, roll
+  426.6 kg·m²** vs the old hand-set 2400/2600/550 about (0, −0.15, 0). Yaw
+  is 19 % under the old value, as the spec predicted.
+- **Deviation — CoM height**: the spec asks for a CoM within ~2 cm of the old
+  −0.15 m, "adjust ballast Y if needed". Unattainable: the 900 kg uniform box
+  at the origin pins the composite CoM near −0.04; matching −0.15 would need
+  the 22 kg ballast at y ≈ −6.8 m. Ballast kept at the table position (even
+  y = −0.55, the floor, moves the CoM only 4 mm). The ~10.7 cm higher CoM
+  adds ~13 % lateral load transfer; measured lap impact nil (see below) —
+  camber thrust on the loaded wheels and the lighter translational mass
+  compensate.
+- Off-diagonal Iyz ≈ 10.4 kg·m² (0.6 % of pitch) dropped — principal axes
+  assumed body-aligned, spec says "principal inertia".
+- Body mass = sprung 1262 kg, center/tensor = full 1350 kg layout: the wheels
+  yaw/pitch/roll WITH the chassis (only their strut DOF is separate), so
+  rotational inertia keeps them; vertical statics need the sprung split.
+  Using the full-layout CoM (vs sprung-only) shifts axle loads 0.7 % — noise.
+
+### Validation / threshold changes (all justified)
+
+- test_vehicle: front steer-angle tolerance 1e-3 → 2e-3 rad (steer_angle now
+  includes 0.05° ≈ 0.87 mrad toe-out); rear "steer == 0" → "|steer| < 0.01"
+  (rear wheels carry 0.15° toe-in + bump toe). Settle compressions moved from
+  0.0552 m to 0.0463 F / 0.0569 R (sprung weight only + rearward CoM) — still
+  inside the existing 0.025..0.10 gate, no change needed. Oval pursuit lap
+  30.57 s (12 227 ticks, was 30.50 s), no LAP_INVALID.
+- NEW test_suspension (wired in CMakeLists): (a) settle: spring compression
+  ≈ sprung_corner/k_s and tire compression ≈ corner_weight/k_tire per axle,
+  all within 1 % of prediction (gate ±10 %); (b) unsprung 3 cm road step —
+  **deviation from the literal "oscillates 12–18 Hz" wording**: with the
+  spec-mandated dampers the wheel mode is critically damped
+  (ζ = (4500+300)/(2·√(260 kN/m · 22 kg)) ≈ 1.00), so NO oscillation is
+  possible in any correct implementation; the gate instead checks
+  f_n = √((k_t+k_s)/m_u)/2π = **17.30 Hz** ∈ [12,18] and that the measured
+  step-response peak-velocity time matches 1/ω_n within 15 %. Measured:
+  peak 0.932 m/s at 8.77 ms → t_pk·ω_n = 0.953 (the 1600 Hz discretization
+  stiffens the discrete mode ~4 % — its exact eigenvalues give t_pk = 8.75 ms
+  — and the estimator adds ~1 %); response decays to <0.01 % of the 23.1 mm
+  offset within 300 ms. (c) camber −1.5°/−1.0° at settle, −1.0°/25 mm gain,
+  rear bump toe verified with mirroring. (d) γ = −3° vs 0° warm sweep at Fz0:
+  thrust −1969.5 N at zero slip, positive-Fy peak shifted +0.032 in σy,
+  Fy at σy = −0.06: −3016 → −3662 N (grip added on the leaned side),
+  at +0.06: 3016 → 1841 N (given back opposite).
+- Determinism: 2×8000-tick native hash `f349e9180a8ffd61` (was
+  `a305f4cd3421cef5` — expected, physics changed), stable across process
+  runs. New math in the kernel: b3Atan2 for the lean angle, b3ComputeCosSin
+  for sin(γ), mul/add/div/compare in the strut step — no new libm.
+- wasm 410 890 bytes; smoke PASS, step-vs-replay hash `63252f4009ee327e`
+  (was `b8729a7de50d1b0c`); export list verified byte-identical (CONTRACTS
+  §1.1 + sim_ffb_torque + sim_tire_temp), imports still only
+  emscripten_notify_memory_growth + fd_write.
+- tools/autopilot_lap.mjs on assets/tracks/dev-next/track.bin at
+  --target-speed 18: **LAP COMPLETE 57.555 s** (23 022 ticks, hash
+  `bda8f627263a0012`) vs the 57.6 s pre-wave baseline — net wash: the higher
+  CoM costs load transfer, camber thrust + kinematic toe add mid-corner
+  grip and the 1262 kg translational mass helps corner-exit accel.
+
 ## Open items
 
 - Native-vs-wasm hashes differ (expected and allowed — only wasm-vs-wasm
