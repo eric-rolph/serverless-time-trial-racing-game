@@ -6,6 +6,7 @@
 #define SIM_VEHICLE_H
 
 #include "box3d/box3d.h"
+#include "road.h"
 #include "sim/sim.h"
 
 // Collision filter categories
@@ -30,6 +31,11 @@ typedef struct WheelRuntime
 	// which feeds the hashed dynamics). Reset to ambient (25 C) with the car.
 	float t_surf; // tread surface temperature (deg C)
 	float t_core; // carcass core temperature (deg C)
+	// Incremental analytic-road hint (docs/ROAD-SURFACE.md §1): last segment
+	// index for the ±6 window search. Bootstrapped by a full deterministic
+	// scan on the first query after create/reset (road_hint_valid == 0).
+	uint32_t road_hint;
+	int road_hint_valid;
 } WheelRuntime;
 
 typedef struct Vehicle
@@ -53,7 +59,10 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw );
 
 // Per-tick force computation, before b3World_Step. Inputs are unquantized
 // floats: steer [-1,1], throttle [0,1], brake [0,1], flags bitfield.
-void vehicle_update( b3WorldId world, Vehicle* v, float steer, float throttle, float brake, uint32_t flags );
+// `road` is the analytic surface the wheels contact (docs/ROAD-SURFACE.md);
+// wheels fall back to the mesh raycast when outside its domain.
+void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer, float throttle, float brake,
+					 uint32_t flags );
 
 // Write per-wheel state into the packed SimStateV1 block.
 void vehicle_export( const Vehicle* v, SimStateV1* state );
@@ -68,5 +77,12 @@ void vehicle_export( const Vehicle* v, SimStateV1* state );
 // pneumatic trail: lateral-force centroid distance behind the patch center).
 void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, float* out_fx, float* out_fy,
 						  float* out_trail );
+
+// Two-node tire thermal step (docs/TIRE-MODEL.md §2 + ROAD-SURFACE.md §2):
+// friction power into the surface, speed-scaled convection, surface↔core
+// exchange, plus track conduction while in contact. Advances w->t_surf and
+// w->t_core by dt. Exposed (like vehicle_brush_patch) for tests/test_road.c's
+// lockup flash-heat gate; NOT a wasm export.
+void vehicle_tire_thermal( WheelRuntime* w, float power, float speed, int in_contact, float dt );
 
 #endif // SIM_VEHICLE_H

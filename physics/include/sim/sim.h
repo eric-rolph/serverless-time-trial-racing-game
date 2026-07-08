@@ -141,6 +141,11 @@ uint32_t sim_lap_time_ticks( void );
 // reads never affect simulation or hashes. Added in ABI 1.1; hosts may ignore.
 float sim_ffb_torque( void );
 
+// Tire tread surface temperature (deg C) for wheel 0-3 (FL FR RL RR); out of
+// range (or no loaded world) returns 0. Output-only — reads never affect
+// simulation or hashes. Added in ABI 1.2 (additive); hosts may ignore.
+float sim_tire_temp( uint32_t wheel );
+
 // Native-test helper (not a wasm export): direct state access.
 const SimStateV1* sim_state( void );
 

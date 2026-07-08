@@ -514,6 +514,19 @@ function frame(now) {
   $("lapInfo").textContent = `best: ${bestMs ? fmtMs(bestMs) : "—"}   last: ${lastMs ? fmtMs(lastMs) : "—"}`;
   minimap.draw(car.position.toArray(), curr.checkpoints);
 
+  // Tire surface temps (brush-model thermal layer): blue cold → green in the
+  // window → red overheated. Order FL FR RL RR.
+  if (sim.tireTemp(0) !== null) {
+    const label = ["FL", "FR", "RL", "RR"];
+    $("tireTemps").innerHTML = label
+      .map((n, i) => {
+        const t = sim.tireTemp(i);
+        const color = t < 60 ? "#7fb3ff" : t <= 105 ? "#7fe3a1" : "#ff8f8f";
+        return `${n} <span style="color:${color}">${Math.round(t)}°</span>`;
+      })
+      .join("  ");
+  }
+
   // Live delta vs ghost: compare tick counts at equal lap progress.
   if (ghost && !frozen && countdownMs <= 0 && curr.lapProgress > 0.01) {
     while (deltaPtr < ghost.lapTicks - 1 && ghost.progress[deltaPtr] < curr.lapProgress) deltaPtr++;

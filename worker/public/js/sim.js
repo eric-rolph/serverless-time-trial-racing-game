@@ -84,4 +84,7 @@ export class Sim {
 
   /** Steering rack torque (Nm) — ABI 1.1 export; 0 on older binaries. */
   ffbTorque() { return this.e.sim_ffb_torque ? this.e.sim_ffb_torque() : 0; }
+
+  /** Tire surface temperature °C (ABI 1.2 export; null on older binaries). */
+  tireTemp(i) { return this.e.sim_tire_temp ? this.e.sim_tire_temp(i) : null; }
 }

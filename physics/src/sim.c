@@ -2,6 +2,7 @@
 // state export, FNV-1a-64 state hash. See docs/CONTRACTS.md §1, §8 (binding).
 
 #include "sim/sim.h"
+#include "road.h"
 #include "vehicle.h"
 
 #include "box3d/box3d.h"
@@ -13,13 +14,9 @@
 // Track data (parsed TRK1, CONTRACTS §8)
 // ---------------------------------------------------------------------------
 
-typedef struct CenterlineSample
-{
-	b3Vec3 pos;
-	b3Vec3 up;
-	b3Vec3 tangent;
-	float width;
-} CenterlineSample;
+// Centerline samples are stored directly as RoadSample (road.h) — the
+// analytic road surface borrows the array.
+typedef RoadSample CenterlineSample;
 
 typedef struct Track
 {
@@ -31,6 +28,10 @@ typedef struct Track
 	// Geometry retained for the lifetime of the mesh shape (Box3D keeps a
 	// reference to b3MeshData; the def arrays below are cloned by b3CreateMesh).
 	b3MeshData* mesh;
+
+	// Analytic road surface for wheel contact (docs/ROAD-SURFACE.md §1).
+	// Borrows `samples`; owns its precomputed smoothed-curvature array.
+	Road road;
 
 	uint32_t spawn_index;
 	float spawn_yaw;
@@ -148,6 +149,7 @@ static float sReadF32( Reader* r )
 
 static void sFreeTrack( Track* t )
 {
+	road_free( &t->road );
 	free( t->samples );
 	free( t->checkpoints );
 	if ( t->mesh != NULL )
@@ -309,6 +311,14 @@ int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 	{
 		sFreeTrack( t );
 		return SIM_ERR_BAD_GEOMETRY;
+	}
+
+	// --- Analytic road surface: precompute the smoothed curvature array
+	// (S floats, docs/ROAD-SURFACE.md §1) ---
+	if ( road_load( &t->road, t->samples, sample_count ) != 0 )
+	{
+		sFreeTrack( t );
+		return SIM_ERR_ALLOC;
 	}
 	g_sim.track_valid = 1;
 
@@ -579,7 +589,7 @@ uint32_t sim_step( int32_t steer, uint32_t throttle, uint32_t brake, uint32_t fl
 	float throttle_f = (float)th / 65535.0f;
 	float brake_f = (float)br / 65535.0f;
 
-	vehicle_update( sim->world, &sim->vehicle, steer_f, throttle_f, brake_f, flags );
+	vehicle_update( sim->world, &sim->vehicle, &sim->track.road, steer_f, throttle_f, brake_f, flags );
 	b3World_Step( sim->world, SIM_DT, 4 );
 
 	sim->state.tick += 1;
@@ -620,6 +630,17 @@ uint32_t sim_lap_time_ticks( void )
 float sim_ffb_torque( void )
 {
 	return g_sim.vehicle.rack_torque;
+}
+
+float sim_tire_temp( uint32_t wheel )
+{
+	// ABI 1.2 (additive): tire surface temperature, output-only — reads never
+	// affect simulation state or hashes. Out of range / no world → 0.
+	if ( !g_sim.world_valid || wheel >= SIM_WHEEL_COUNT )
+	{
+		return 0.0f;
+	}
+	return g_sim.vehicle.wheels[wheel].t_surf;
 }
 
 const SimStateV1* sim_state( void )

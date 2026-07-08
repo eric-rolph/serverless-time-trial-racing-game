@@ -206,6 +206,140 @@ pneumatic trail, two-node thermal layer per tire).
   LAP COMPLETE, 61.910 s (24 764 ticks), final hash `79ab68ecea9ca914` —
   cold-tire grip (0.85 floor at 25 °C) did not require lowering the target.
 
+## Analytic road surface (2026-07-07, docs/ROAD-SURFACE.md wave)
+
+Wheels no longer raycast the low-poly collision mesh: each wheel queries an
+analytic C1 surface interpolated from the TRK1 centerline (new src/road.{h,c}).
+The chassis body still collides with the mesh; the mesh raycast remains only
+as the off-domain fallback (|lateral| > width/2 + 8). Also in this wave:
+track-conduction cooling + lockup flash-heat validation, 4x sub-stepping of
+the per-wheel pipeline, and the additive `sim_tire_temp` export (ABI 1.2).
+
+### road.c interface / architecture
+
+- `RoadSample` (road.h) is the TRK1 centerline sample layout; sim.c's Track
+  stores its samples as this type (`typedef RoadSample CenterlineSample`) and
+  the Road BORROWS that array — `road_load(&track.road, samples, S)` only
+  allocates the S-float smoothed-kappa array (malloc, freed by `road_free`
+  from `sFreeTrack`). No copy of the centerline.
+- `road_query(road, p, hint, out)` → surface point, unit normal, signed
+  lateral, `on_road`, and `seg` (feed back as the next hint). Fixed iteration
+  everywhere: ±6-sample window search around the hint (same incremental trick
+  as the lap logic), initial u from clamped projection onto the two polyline
+  segments adjacent to the nearest sample, then exactly 2 Newton steps on
+  f(u) = (c(u)−p)·c'(u) with u clamped to [0,1]. Segment-boundary behavior:
+  the clamped-u answer from either neighboring segment agrees to within the
+  CR-vs-polyline sagitta (~2 cm of arc position at R = 40 m, sub-mm in
+  height), well inside the 5 mm/1° continuity gates.
+- Frames: up/tangent interpolated with the same Catmull-Rom weights and
+  re-orthonormalized (tangent normalized, up made ⟂ tangent, side = up×tan);
+  width and kappa linear in u.
+- Lateral profile: crown −0.025·(2l/width)² on the road proper; kerb band
+  (width/2 ≤ |l| ≤ width/2+1.1 AND smoothed |κ| > 0.022) is the 0..20 mm
+  sinusoid; otherwise the band and beyond is the linear shoulder ramp
+  −1.2·(|l|−width/2)/8, which matches the trackgen mesh ribbon (the mesh ramp
+  also starts at the road edge). Normal = normalize(up − (∂h/∂l)·side) —
+  continuous camber through banking transitions.
+- Kerb phase without floor/fmod: sample spacing 2.5 m is exactly two 1.25 m
+  rumble periods, so sin(2π·s/1.25) with s = (i+u)·2.5 reduces to sin(4π·u);
+  b3ComputeCosSin unwinds internally (remainderf, IEEE-exact). C1 across
+  segment boundaries by construction.
+- **Deviation from the spec text**: raw κ is the trackgen cross-of-tangents
+  formula divided by the ACTUAL per-segment distance, not the nominal 2.5 m.
+  Identical on real arc-length-resampled tracks; required for the test ovals
+  (uniform-angle ellipse ⇒ ~1.23 m mean spacing), where the /2.5 version
+  underestimates κ ~2x and the kerb gate never fires. Smoothing window 15,
+  circular, mirroring trackgen.
+
+### Wheel contact
+
+- Suspension ray (origin = hardpoint, dir = −chassis up, len = rest+radius)
+  intersects the local tangent plane of the analytic surface; compression
+  from that distance, exactly like the old raycast fraction. Guard: surface
+  must face the ray (dot(up, normal) > 0.2) — otherwise (rolled car on the
+  road) the wheel is treated as airborne and chassis mesh collision handles
+  it. Hardpoint below the surface ⇒ hit_dist clamps to 0 (full compression,
+  bounded by max_travel as before).
+- The query normal now feeds the TIRE BASIS: wheel forward is projected onto
+  the contact plane (mesh-fallback contacts use the mesh normal the same
+  way). Suspension force stays along chassis up (strut axis). On flat ground
+  this is numerically the old behavior; on banking the slip/force basis
+  follows the surface — the continuity point of the spec.
+- Per-wheel incremental hint (`road_hint` in WheelRuntime) bootstraps via a
+  one-time full O(S) deterministic scan after create/reset
+  (`road_nearest_global`), then stays within the ±6 window (≤ ~0.13 m of car
+  motion per tick ≪ 15 m of window).
+
+### Sub-stepping (ROAD-SURFACE §3)
+
+- Fixed `SIM_TIRE_SUBSTEPS 4` inner steps of SIM_DT/4 (1600 Hz): slip calc →
+  brush patch → thermal → wheel spin integration. Chassis pose/velocity are
+  frozen within the tick (Box3D integrates at tick level), so v_long/v_lat
+  and Fz are per-tick constants; only omega (⇒ slip ratio ⇒ fx/fy ⇒ heating)
+  sub-steps.
+- **Force application choice**: the chassis receives the sub-step MEAN force
+  once per tick at the patch. Box3D integrates F·SIM_DT, so the mean exactly
+  preserves the summed sub-step impulses Σ Fₖ·(SIM_DT/4) — cheaper than four
+  ApplyForce calls and bit-identical in intent. FFB rack likewise averages
+  the four sub-step samples; exported slip_ratio is the last sub-step's
+  (deterministic either way).
+- The airborne/zero-load paths sub-step the same way. The airborne wheel now
+  uses the same clamped brake integration as the contact path (the old
+  airborne branch could oscillate omega through zero) and the handbrake hard
+  lock applies airborne too — behavior change, strictly more physical, hash
+  changes anyway.
+
+### Thermal depth (ROAD-SURFACE §2)
+
+- Track conduction added: `−h_track·(T_surf − T_track)` while in contact,
+  `T_track = 30 °C`, `h_track = 0.02 /s` (spec constants, in kTuning).
+  `sTireThermal` became `vehicle_tire_thermal(w, power, speed, in_contact,
+  dt)` — non-static (like vehicle_brush_patch) so test_road drives it; NOT a
+  wasm export.
+- Lockup flash-heat measured (test_road): 1 s locked at 30 m/s under Fz0
+  from 25 °C ⇒ T_surf 87.8 °C (+62.8 °C, gate > 20). After release (rolling,
+  in contact, 30 m/s): monotonic decay, −12.5 °C in 5 s. That is a ~20 s time
+  constant, not the spec's "a few seconds": total cooling at 30 m/s is
+  h_conv·2.5 + h_track + h_int ≈ 0.046 /s. Deliberately NOT retuned — pushing
+  h_int high enough for a few-second τ would bleed the surface node so hard
+  the lap-scale warm-up (70–90 °C after a hard lap, tuned in the brush-tire
+  wave) collapses. The binding gate ("decays after release") passes; noted as
+  a scope-honest deviation.
+
+### New export (ABI 1.2, additive)
+
+- `sim_tire_temp(u32 wheel) -> f32` in sim.h/sim.c, reading
+  `vehicle.wheels[w].t_surf`; out-of-range or no world ⇒ 0. Added
+  `_sim_tire_temp` to build_wasm.sh EXPORTS and `src/road.c` to both builds.
+  `sim_abi_version()` still returns 1 (CONTRACTS §1.1 keeps `= 1`; the
+  addition is purely additive). Verified export surface = previous list +
+  sim_tire_temp; imports unchanged (emscripten_notify_memory_growth,
+  fd_write only).
+
+### Measured (2026-07-07, this wave)
+
+- test_determinism PASS, native 8000-tick final hash `a305f4cd3421cef5`
+  (was `b5bccb81c606e0b8` — expected, wheel physics changed; stable across
+  repeated process runs).
+- test_vehicle PASS with NO threshold changes: settle compression 0.0552 m,
+  0→7.13 m/s in 2 s, oval pursuit lap 30.50 s (12 201 ticks vs 12 198
+  pre-road — the flat-oval surface is nearly identical by design).
+- test_tire PASS (patch model untouched).
+- test_road PASS: flat-oval walk max |dh| 0.034 mm & dnormal 0.020°/10 cm;
+  banked-oval walk (0→0.07 rad transition) max |dh| 1.41 mm & 0.028°/10 cm;
+  banked-corner normal.y = 0.99755 = cos(0.07); crown drop at width/4 =
+  6.250 mm (exact); kerb band sweeps 0.0–20.0 mm through the κ = 0.0375
+  corner and is the −82.5 mm shoulder ramp on the κ = 0.011 corner;
+  flash-heat numbers above.
+- wasm build 410 175 bytes; wasm_smoke PASS, step-vs-replay hash
+  `b8729a7de50d1b0c` (was `e9eadd8e6b64fb8d`).
+- sim_tire_temp via wasm on dev-next: 25.00 at reset, rears warm faster than
+  fronts under a hard RWD launch (35.7/33.8 vs 25.7/25.4 after 10 s), 0 for
+  wheel ≥ 4.
+- tools/autopilot_lap.mjs on assets/tracks/dev-next/track.bin at
+  --target-speed 15: LAP COMPLETE, 65.375 s (26 150 ticks), final hash
+  `690a50d23d211840` — inside the ≤ 65.4 s gate.
+
 ## Open items
 
 - Native-vs-wasm hashes differ (expected and allowed — only wasm-vs-wasm

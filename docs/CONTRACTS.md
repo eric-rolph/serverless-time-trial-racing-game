@@ -47,6 +47,8 @@ sim_lap_time_ticks() -> u32               // valid when LAP_COMPLETE set
 sim_ffb_torque() -> f32                   // ABI 1.1: steering rack torque (Nm)
                                           // for FFB — output-only, never affects
                                           // simulation state or hashes
+sim_tire_temp(wheel: u32) -> f32          // ABI 1.2: tire surface temp (°C),
+                                          // wheel 0-3 (FL FR RL RR); output-only
 ```
 
 ### 1.2 `SimStateV1` (packed, little-endian, fixed offsets)

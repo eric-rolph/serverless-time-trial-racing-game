@@ -44,14 +44,14 @@ BOX3D_SRC=(
     weld_joint.c wheel_joint.c
 )
 
-SRC=( src/sim.c src/vehicle.c src/wasm_api.c )
+SRC=( src/sim.c src/road.c src/vehicle.c src/wasm_api.c )
 for f in "${BOX3D_SRC[@]}"; do
     SRC+=( "box3d/src/$f" )
 done
 
 # CONTRACTS §1.1 export list, underscore-prefixed for EXPORTED_FUNCTIONS.
 # memory is exported automatically by STANDALONE_WASM.
-EXPORTS=_sim_abi_version,_sim_alloc,_sim_load_track,_sim_reset,_sim_step,_sim_replay,_sim_state_ptr,_sim_state_size,_sim_state_hash_lo,_sim_state_hash_hi,_sim_lap_time_ticks,_sim_ffb_torque
+EXPORTS=_sim_abi_version,_sim_alloc,_sim_load_track,_sim_reset,_sim_step,_sim_replay,_sim_state_ptr,_sim_state_size,_sim_state_hash_lo,_sim_state_hash_hi,_sim_lap_time_ticks,_sim_ffb_torque,_sim_tire_temp
 
 "$EMCC" \
     -O2 \
