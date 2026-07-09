@@ -143,9 +143,9 @@ static const VehicleTuning kTuning = {
 	.aero_cl_rear = 1.4f,
 
 	.hardpoint_y = -0.25f,
-	.track_half = 0.80f,
+	.track_half = 0.84f,
 	.wheelbase_half = 1.30f,
-	.rest_length = 0.35f,
+	.rest_length = 0.31f,
 	.max_travel = 0.25f,
 	.wheel_radius = 0.33f,
 	.spring_k = 60000.0f,
@@ -241,13 +241,19 @@ typedef struct MassPoint
 	b3Vec3 p;
 } MassPoint;
 
-#define SIM_BOX_MASS 900.0f // tub/body: uniform 1.9 x 1.1 x 4.4 box at origin
+#define SIM_BOX_MASS 900.0f // tub/body: uniform 1.9 x 1.1 x 4.4 box
+// Rollover fix (skidpad-derived): with the tub at the origin the composite
+// CoM sat ~0.83 m high — rollover threshold 0.97 g vs a ~1.15 g grip ceiling,
+// so the car TIPPED at the limit instead of sliding. Race cars mount all the
+// heavy bits on the floor: tub center lowered, every point mass dropped.
+// Result (with wider track + lower ride in kTuning): threshold ~1.3 g.
+#define SIM_BOX_CENTER_Y ( -0.12f ) // floor/undertray-heavy monocoque
 
 static const MassPoint kMassPoints[] = {
-	{ 220.0f, { 0.0f, -0.10f, -0.90f } }, // engine + gearbox
-	{ 80.0f, { 0.0f, 0.00f, 0.20f } },	  // driver
-	{ 40.0f, { 0.0f, -0.20f, -0.30f } },  // fuel
-	{ 22.0f, { 0.0f, -0.30f, 0.60f } },	  // ballast (remainder to 1350 total)
+	{ 220.0f, { 0.0f, -0.35f, -0.90f } }, // engine + gearbox (dry sump, low)
+	{ 80.0f, { 0.0f, -0.15f, 0.20f } },	  // driver (reclined)
+	{ 40.0f, { 0.0f, -0.40f, -0.30f } },  // fuel (floor cell)
+	{ 22.0f, { 0.0f, -0.55f, 0.60f } },	  // ballast (bolted to the floor)
 };
 #define SIM_MASS_POINT_COUNT 4
 
@@ -271,9 +277,9 @@ b3MassData vehicle_mass_data( void )
 		pts[SIM_MASS_POINT_COUNT + i].p = sVehicleHardpoint( i );
 	}
 
-	// Composite CoM (box sits at the origin, contributes no moment).
+	// Composite CoM (box center contributes its moment at SIM_BOX_CENTER_Y).
 	float total = SIM_BOX_MASS;
-	b3Vec3 moment = b3Vec3_zero;
+	b3Vec3 moment = { 0.0f, SIM_BOX_MASS * SIM_BOX_CENTER_Y, 0.0f };
 	for ( int i = 0; i < SIM_MASS_POINT_COUNT + SIM_WHEEL_COUNT; ++i )
 	{
 		total += pts[i].m;
@@ -285,9 +291,10 @@ b3MassData vehicle_mass_data( void )
 	float w = 2.0f * t->half_extent_x;
 	float h = 2.0f * t->half_extent_y;
 	float d = 2.0f * t->half_extent_z;
-	float ixx = ( SIM_BOX_MASS / 12.0f ) * ( h * h + d * d ) + SIM_BOX_MASS * ( com.y * com.y + com.z * com.z );
+	float box_dy = SIM_BOX_CENTER_Y - com.y;
+	float ixx = ( SIM_BOX_MASS / 12.0f ) * ( h * h + d * d ) + SIM_BOX_MASS * ( box_dy * box_dy + com.z * com.z );
 	float iyy = ( SIM_BOX_MASS / 12.0f ) * ( w * w + d * d ) + SIM_BOX_MASS * ( com.x * com.x + com.z * com.z );
-	float izz = ( SIM_BOX_MASS / 12.0f ) * ( w * w + h * h ) + SIM_BOX_MASS * ( com.x * com.x + com.y * com.y );
+	float izz = ( SIM_BOX_MASS / 12.0f ) * ( w * w + h * h ) + SIM_BOX_MASS * ( com.x * com.x + box_dy * box_dy );
 
 	for ( int i = 0; i < SIM_MASS_POINT_COUNT + SIM_WHEEL_COUNT; ++i )
 	{
