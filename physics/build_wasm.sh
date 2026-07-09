@@ -51,7 +51,7 @@ done
 
 # CONTRACTS §1.1 export list, underscore-prefixed for EXPORTED_FUNCTIONS.
 # memory is exported automatically by STANDALONE_WASM.
-EXPORTS=_sim_abi_version,_sim_alloc,_sim_load_track,_sim_reset,_sim_step,_sim_replay,_sim_state_ptr,_sim_state_size,_sim_state_hash_lo,_sim_state_hash_hi,_sim_lap_time_ticks,_sim_ffb_torque,_sim_tire_temp
+EXPORTS=_sim_abi_version,_sim_alloc,_sim_load_track,_sim_reset,_sim_step,_sim_replay,_sim_state_ptr,_sim_state_size,_sim_state_hash_lo,_sim_state_hash_hi,_sim_lap_time_ticks,_sim_ffb_torque,_sim_tire_temp,_sim_damage
 
 "$EMCC" \
     -O2 \

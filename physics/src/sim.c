@@ -592,6 +592,12 @@ uint32_t sim_step( int32_t steer, uint32_t throttle, uint32_t brake, uint32_t fl
 	vehicle_update( sim->world, &sim->vehicle, &sim->track.road, steer_f, throttle_f, brake_f, flags );
 	b3World_Step( sim->world, SIM_DT, 4 );
 
+	// Fold this step's chassis contact hit events into the deterministic crash
+	// damage (docs/SOFTBODY.md Phase 2). vehicle_update this tick used the
+	// PRIOR damage; the accumulation here feeds the NEXT tick (correct causality
+	// and fully deterministic — Box3D is single-threaded here).
+	vehicle_accumulate_damage( sim->world, &sim->vehicle );
+
 	sim->state.tick += 1;
 
 	uint32_t status = SIM_STATUS_RUNNING;
@@ -641,6 +647,31 @@ float sim_tire_temp( uint32_t wheel )
 		return 0.0f;
 	}
 	return g_sim.vehicle.wheels[wheel].t_surf;
+}
+
+float sim_damage( uint32_t component )
+{
+	// ABI 1.3 (additive): deterministic crash-damage readout for the HUD,
+	// output-only — reads never affect simulation state or hashes. No world or
+	// out-of-range component → 0.
+	if ( !g_sim.world_valid )
+	{
+		return 0.0f;
+	}
+	const Vehicle* v = &g_sim.vehicle;
+	switch ( component )
+	{
+		case 0:
+			return v->damage_overall; // 0..1 overall (HUD)
+		case 1:
+			return v->damage_steer; // 0..1 steering
+		case 2:
+			return b3AbsFloat( v->damage_toe_front ); // |front toe| (rad)
+		case 3:
+			return b3AbsFloat( v->damage_toe_rear ); // |rear toe| (rad)
+		default:
+			return 0.0f;
+	}
 }
 
 const SimStateV1* sim_state( void )

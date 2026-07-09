@@ -22,7 +22,10 @@ DAMAGE LAYER on top of the rigid core is a great fit.** Reasons and plan:
 
 ## What we take from BeamNG: a damage lattice (phased)
 
-**Phase 1 — visual deformation (web client, no kernel change).**
+**Phase 1 — visual deformation (web client, no kernel change). — DONE.**
+Shipped as `worker/public/js/crumple.js` (45-node 3×3×5 lattice, 160 beams,
+plastic-yield rest-length drag); player car only, ghost stays pristine, reset on
+new lap/respawn. Render-only — no determinism/replay impact.
 ~40-node lattice mapped to the car-mesh vertices. On chassis contact events
 (detectable today: chassis mesh collision ⇒ large Δvelocity spikes at the
 body), apply impulse to the nearest lattice nodes; beams (neighbor springs
@@ -30,7 +33,10 @@ with plastic yield) relax each frame; skin the render mesh to the lattice.
 Crumpled nose after a wall hit, permanent, cheap ((~200 spring evals/frame,
 JS). Cosmetic ⇒ no determinism/replay impact.
 
-**Phase 2 — deterministic damage state (kernel, ABI-additive).**
+**Phase 2 — deterministic damage state (kernel, ABI-additive). — DONE.**
+Shipped as the `sim_damage(component)` export (ABI 1.3, CONTRACTS §1.1): overall +
+steer + front/rear toe scalars, zero on a clean lap, driving both HUD and the
+crumple severity so the visible dent matches the referee-scored damage.
 Kernel tracks per-corner damage scalars from contact impulses (deterministic:
 same log ⇒ same damage): aero_cl loss, toe offset, max_steer reduction.
 Exported for HUD; affects physics ⇒ replays stay honest because it derives

@@ -49,6 +49,13 @@ sim_ffb_torque() -> f32                   // ABI 1.1: steering rack torque (Nm)
                                           // simulation state or hashes
 sim_tire_temp(wheel: u32) -> f32          // ABI 1.2: tire surface temp (°C),
                                           // wheel 0-3 (FL FR RL RR); output-only
+sim_damage(component: u32) -> f32         // ABI 1.3: deterministic crash damage,
+                                          // component 0 = overall [0,1],
+                                          // 1 = steer loss [0,1], 2 = |front toe| rad,
+                                          // 3 = |rear toe| rad. Additive export;
+                                          // derived purely from the input log, so
+                                          // replays stay honest. Output-only read —
+                                          // out-of-range/no-world → 0.
 ```
 
 ### 1.2 `SimStateV1` (packed, little-endian, fixed offsets)

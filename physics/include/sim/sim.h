@@ -146,6 +146,16 @@ float sim_ffb_torque( void );
 // simulation or hashes. Added in ABI 1.2 (additive); hosts may ignore.
 float sim_tire_temp( uint32_t wheel );
 
+// Deterministic crash-damage readout (docs/SOFTBODY.md Phase 2) for the HUD:
+//   component 0 → overall damage (0..1)
+//   component 1 → steering damage (0..1)
+//   component 2 → |front toe damage| (rad)
+//   component 3 → |rear toe damage| (rad)
+// Out of range (or no loaded world) returns 0. Output-only — reads never affect
+// simulation or hashes (the damage state itself is part of the hashed dynamics,
+// like tire temperature). Added in ABI 1.3 (additive); hosts may ignore.
+float sim_damage( uint32_t component );
+
 // Native-test helper (not a wasm export): direct state access.
 const SimStateV1* sim_state( void );
 

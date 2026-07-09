@@ -75,6 +75,11 @@
   #tireTemps .fl { left: 0; top: 7px; }  #tireTemps .fr { right: 0; top: 7px; }
   #tireTemps .rl { left: 0; bottom: 5px; } #tireTemps .rr { right: 0; bottom: 5px; }
 
+  /* --- crash damage: one quiet line above the car glyph. Hidden while
+     pristine; muted for light damage, hardening to --bad as it worsens. --- */
+  #damage { left: 24px; bottom: 320px; width: 34px; text-align: center;
+            font-size: 10px; letter-spacing: .12em; color: var(--muted); display: none; }
+
   /* --- minimap: bare canvas, shadow instead of a panel --- */
   #map { left: 14px; bottom: 14px; }
   #map canvas { display: block; filter: drop-shadow(0 2px 8px rgba(0,0,0,.55)); }
@@ -142,6 +147,8 @@
   <span class="wheel fl"></span><span class="wheel fr"></span>
   <span class="wheel rl"></span><span class="wheel rr"></span>
 </div>
+
+<div id="damage" class="hud"></div>
 
 <div id="map" class="hud"><canvas id="minimap" width="220" height="220"></canvas></div>
 

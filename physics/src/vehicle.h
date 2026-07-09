@@ -45,10 +45,24 @@ typedef struct WheelRuntime
 typedef struct Vehicle
 {
 	b3BodyId chassis;
+	// Chassis collision shape id, stored at create so chassis contact hit
+	// events can be identified in vehicle_accumulate_damage (docs/SOFTBODY.md
+	// Phase 2). Hit events are enabled on this shape.
+	b3ShapeId chassis_shape;
 	WheelRuntime wheels[SIM_WHEEL_COUNT]; // 0=FL 1=FR 2=RL 3=RR
 	// Steering rack torque (Nm at the rim) for force feedback. Pure output —
 	// never feeds back into the simulation, so it has no replay/hash impact.
 	float rack_torque;
+	// Deterministic per-region crash damage (docs/SOFTBODY.md Phase 2).
+	// Accrued from chassis hit events above SIM_DAMAGE_THRESHOLD; feeds back
+	// into vehicle_update (aero / steering / toe), so it IS part of the hashed
+	// dynamics (like tire temperature — never hashed directly, but part of
+	// deterministic vehicle state). Zeroed on create and reset. A CLEAN lap
+	// never touches the chassis hard enough to move these off 0.
+	float damage_overall;	 // 0..1, HUD + aero loss
+	float damage_steer;		 // 0..1, max_steer reduction
+	float damage_toe_front;	 // signed rad, front-axle toe offset
+	float damage_toe_rear;	 // signed rad, rear-axle toe offset
 	int valid;
 } Vehicle;
 
@@ -70,6 +84,37 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 
 // Write per-wheel state into the packed SimStateV1 block.
 void vehicle_export( const Vehicle* v, SimStateV1* state );
+
+// --- Crash damage (docs/SOFTBODY.md Phase 2) -------------------------------
+
+// Contact hit-event approach-speed threshold (m/s): hits at or below this
+// accrue ZERO damage. Set well above anything a clean lap can produce
+// (kerb strikes / banking / bumps ride on the WHEELS; the chassis box only
+// touches terrain in a genuine crash) so leaderboard laps stay pristine.
+#define SIM_DAMAGE_THRESHOLD 6.0f
+
+// Accumulate deterministic damage from ONE chassis impact. approachSpeed is
+// the b3ContactHitEvent approach speed (m/s, positive); localPoint is the hit
+// point in chassis-local coordinates (+Z forward, +X right). Severity scales
+// with (approachSpeed - threshold); region (front/rear via local Z, side via
+// local X) routes it to steering / per-axle toe. Below threshold: no-op.
+// Pure float math (mul/add/div/compare + b3ClampFloat) — deterministic.
+// Exposed for tests/test_damage.c; NOT a wasm export.
+void vehicle_apply_impact( Vehicle* v, float approachSpeed, b3Vec3 localPoint );
+
+// Read this step's contact hit events from `world`, keep only those touching
+// the chassis shape, and fold each into the damage scalars via
+// vehicle_apply_impact. Called from sim_step AFTER b3World_Step, so damage
+// accrues for the NEXT tick (correct causality, fully deterministic since
+// Box3D is single-threaded here). NOT a wasm export.
+void vehicle_accumulate_damage( b3WorldId world, Vehicle* v );
+
+// Damage-scaled effect readouts at their vehicle_update use sites, exposed for
+// tests/test_damage.c monotonicity checks (NOT wasm exports):
+//   aero front downforce coefficient after damage_overall,
+//   max steering lock (rad) after damage_steer.
+float vehicle_effect_aero_front( const Vehicle* v );
+float vehicle_effect_max_steer( const Vehicle* v );
 
 // Brush contact-patch evaluation (docs/TIRE-MODEL.md §1) — the per-tire force
 // model used inside vehicle_update, exposed for tests/test_tire.c sweeps.

@@ -490,3 +490,64 @@ the wasm export surface unchanged.
   fd_write} so hot-path imports can't sneak back in.
 - Launch acceleration is mild (engine-limited); gear ratio / torque curve are
   the knobs if the game wants a livelier car.
+
+## Damage system (Phase 2)
+
+Deterministic per-region crash damage in the kernel (docs/SOFTBODY.md Phase 2,
+ABI 1.3 additive). The chassis Box3D hull now has `enableHitEvents = true`; its
+shape id is stored in `Vehicle.chassis_shape` at create. After each
+`b3World_Step`, `sim_step` calls `vehicle_accumulate_damage`, which reads
+`b3World_GetContactEvents`, keeps only hitEvents touching the chassis shape,
+transforms `point` into the chassis-local frame (`b3Body_GetLocalPoint`) and
+folds each into four damage scalars on the Vehicle (`damage_overall`,
+`damage_steer`, `damage_toe_front`, `damage_toe_rear`). Causality: a tick's
+`vehicle_update` uses the PRIOR damage; accumulation feeds the NEXT tick.
+
+- **Threshold = 6.0 m/s** (`SIM_DAMAGE_THRESHOLD`). Hits at/below accrue ZERO
+  damage. Chosen well above anything a clean lap produces: the car rides on the
+  WHEELS (analytic road / raycast), so the chassis box only ever touches the
+  terrain mesh in a genuine crash. Kerb strikes, banking and bumps never move
+  damage off 0. A real wall strike approaches at ~15-30 m/s, comfortably above.
+- **Severity** = clamp((approachSpeed − 6) · 0.045, 0, 1). ~22 m/s over
+  threshold ⇒ destroyed (sev 1); a solid ~15 m/s total strike ⇒ ~0.4.
+- **Per-component gains**: overall += sev·0.60; front hits (local z ≥ 0)
+  steer += sev·0.55 and front toe ±= sev·0.015 rad (sign from local x); rear
+  hits bend rear toe likewise. Toe clamped to ±0.030 rad (~1.7°).
+- **Effects** (applied in `vehicle_update` by scaling tunables at the use site;
+  `kTuning` never mutated): aero cl_front/cl_rear ·= (1 − 0.40·damage_overall);
+  max_steer ·= (1 − 0.30·damage_steer); damage_toe_{front,rear} added to the
+  respective axle toe. A destroyed car keeps 60% aero / 70% steer — it limps,
+  autopilot still finishes. Zeroed in `vehicle_create` and `vehicle_reset`.
+
+**Export**: `float sim_damage(uint32_t component)` — 0=overall(0..1),
+1=steer(0..1), 2=|front toe| rad, 3=|rear toe| rad; out-of-range / no world ⇒ 0.
+Output-only (reads never affect sim/hash). Damage itself is part of the hashed
+dynamics implicitly (like tire temperature — stored in Vehicle, reset on reset,
+never hashed directly) because it feeds forces.
+
+**Clean-lap-zero guarantee (the linchpin)**: when damage = 0 the effect math is
+an exact IEEE identity — `x·1.0f == x`, `x + 0.0f == x` — and Box3D hit events
+are purely observational (both `contact_solver.c` sites only set a reporting
+bit; they never touch impulses/velocities/positions). PROVEN empirically:
+compiling the kernel with the whole feature neutralized (`-DSIM_DAMAGE_OFF`,
+temporary guards since removed) gives the **identical** 8000-tick determinism
+hash `5ec1a7132b229092` as the feature-active build. So a non-crashing lap is
+bit-identical to pre-Phase-2; leaderboard laps stay comparable. (The old NOTES
+baseline `f349e9180a8ffd61` is stale — physics changed in intervening commits;
+the current pre-Phase-2 and post-Phase-2 clean hash is `5ec1a7132b229092`.)
+
+**Test contact (test_damage.c)**: created via the non-exported helper
+`vehicle_apply_impact(v, approachSpeed, localPoint)` (documented option B) — no
+world geometry needed, so impacts are perfectly reproducible.
+
+**Gates** (all PASS): test_determinism (2× in-process, hash
+`5ec1a7132b229092`), test_vehicle, test_tire, test_road, test_suspension,
+test_damage. wasm builds (412027 bytes); `wasm_smoke` PASS, step==replay hash
+`ea0284163b73636d`; exports = previous 13 sim_* + `sim_damage` (14), imports
+unchanged {emscripten_notify_memory_growth, fd_write}. Autopilot on
+assets/tracks/dev5/track.bin --target-speed 18: **LAP COMPLETE 49.197 s**
+(19679 ticks); replaying that laplog through sim.wasm reads sim_damage(0..3) =
+**0, 0, 0, 0** — clean lap accrued EXACTLY zero damage.
+
+Files changed: src/vehicle.h, src/vehicle.c, src/sim.c, include/sim/sim.h,
+build_wasm.sh, CMakeLists.txt, tests/test_damage.c (new).

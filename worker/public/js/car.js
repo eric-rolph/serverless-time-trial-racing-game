@@ -54,8 +54,15 @@ export function buildWheel(opacity = 1) {
 /** Formula-style car. color = main paint; opacity < 1 → translucent ghost
  *  (transparent + depthWrite:false on EVERY material). withWheels adds four
  *  static slicks for the ghost (the player's wheels are separate physics-posed
- *  meshes — see wheelMeshes in app.js). */
-export function buildCar(color, opacity = 1, withWheels = false) {
+ *  meshes — see wheelMeshes in app.js).
+ *
+ *  deformable = true bakes every body primitive's local transform into its
+ *  geometry (mesh transform reset to identity) so all body vertices live in a
+ *  single group-local frame, then publishes the flat list of body meshes on
+ *  group.userData.bodyMeshes. crumple.js binds those vertices to a control
+ *  lattice for cosmetic crash denting. Purely a mesh/geometry change — visually
+ *  identical, no simulation coupling. Default false keeps the old behaviour. */
+export function buildCar(color, opacity = 1, withWheels = false, deformable = false) {
   const group = new THREE.Group();
   const translucent = opacity < 1;
   const mat = (c, extra = {}) =>
@@ -125,6 +132,24 @@ export function buildCar(color, opacity = 1, withWheels = false) {
       w.position.set(x, -0.15, z);
       group.add(w);
     }
+
+  // Deformable player car: bake each body primitive into group space so a
+  // single lattice can re-skin every vertex. Wheel holders are Groups, not
+  // Meshes, so they are naturally skipped (and only added when withWheels).
+  if (deformable) {
+    const bodyMeshes = [];
+    for (const child of group.children) {
+      if (!child.isMesh) continue;
+      child.updateMatrix();
+      child.geometry.applyMatrix4(child.matrix); // fold transform into vertices
+      child.position.set(0, 0, 0);
+      child.rotation.set(0, 0, 0);
+      child.scale.set(1, 1, 1);
+      child.updateMatrix();
+      bodyMeshes.push(child);
+    }
+    group.userData.bodyMeshes = bodyMeshes;
+  }
 
   return group;
 }

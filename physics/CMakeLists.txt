@@ -69,10 +69,20 @@ target_include_directories(test_suspension PRIVATE src)
 set_target_properties(test_suspension PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
 add_test(NAME suspension COMMAND test_suspension)
 
+# test_damage drives the crash-damage model: vehicle_apply_impact / effect
+# readouts / vehicle_reset directly (vehicle.h lives in src/) plus a full clean
+# lap on the flat oval asserting zero damage (docs/SOFTBODY.md Phase 2).
+add_executable(test_damage tests/test_damage.c tests/make_test_track.c)
+target_link_libraries(test_damage PRIVATE sim)
+target_include_directories(test_damage PRIVATE src)
+set_target_properties(test_damage PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
+add_test(NAME damage COMMAND test_damage)
+
 if (UNIX)
     target_link_libraries(test_determinism PRIVATE m)
     target_link_libraries(test_vehicle PRIVATE m)
     target_link_libraries(test_tire PRIVATE m)
     target_link_libraries(test_road PRIVATE m)
     target_link_libraries(test_suspension PRIVATE m)
+    target_link_libraries(test_damage PRIVATE m)
 endif()

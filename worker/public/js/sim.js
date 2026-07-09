@@ -66,6 +66,10 @@ export class Sim {
       tick: dv.getUint32(0, true),
       pos: [dv.getFloat32(4, true), dv.getFloat32(8, true), dv.getFloat32(12, true)],
       quat: [dv.getFloat32(16, true), dv.getFloat32(20, true), dv.getFloat32(24, true), dv.getFloat32(28, true)],
+      // Chassis linear velocity (world frame, m/s). Read for the cosmetic
+      // crash-deformation trigger only — never fed back into the sim, so
+      // determinism/replay are untouched (CONTRACTS §1.2, offset 32).
+      linVel: [dv.getFloat32(32, true), dv.getFloat32(36, true), dv.getFloat32(40, true)],
       wheels,
       speed: dv.getFloat32(184, true),
       lapProgress: dv.getFloat32(188, true),
@@ -87,4 +91,11 @@ export class Sim {
 
   /** Tire surface temperature °C (ABI 1.2 export; null on older binaries). */
   tireTemp(i) { return this.e.sim_tire_temp ? this.e.sim_tire_temp(i) : null; }
+
+  /** Crash-damage scalar (ABI 1.3 export; null on older binaries). Component
+   *  0 = overall [0,1], 1 = steer loss [0,1], 2 = |front toe| rad,
+   *  3 = |rear toe| rad. Output-only — this is the SAME deterministic value the
+   *  referee recomputes from the input log, so it can drive cosmetics that must
+   *  agree with the physics. Never fed back into the sim (determinism intact). */
+  damage(component) { return this.e.sim_damage ? this.e.sim_damage(component) : null; }
 }

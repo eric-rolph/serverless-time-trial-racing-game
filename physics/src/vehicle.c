@@ -352,9 +352,13 @@ void vehicle_create( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 	shapeDef.baseMaterial.restitution = 0.0f;
 	shapeDef.filter.categoryBits = SIM_CAT_CHASSIS;
 	shapeDef.filter.maskBits = SIM_CAT_TERRAIN;
+	// Crash damage (docs/SOFTBODY.md Phase 2): hit events on the chassis feed
+	// the deterministic damage model. Output-only telemetry that also drives
+	// physics — the events themselves never alter the step, only what we read.
+	shapeDef.enableHitEvents = true;
 
 	b3BoxHull box = b3MakeBoxHull( t->half_extent_x, t->half_extent_y, t->half_extent_z );
-	b3CreateHullShape( v->chassis, &shapeDef, &box.base );
+	v->chassis_shape = b3CreateHullShape( v->chassis, &shapeDef, &box.base );
 
 	// Mass properties computed from the docs/SUSPENSION.md §4 mass layout
 	// (sprung translational mass, full-layout CoM + principal tensor).
@@ -367,6 +371,11 @@ void vehicle_create( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 		v->wheels[i].t_surf = t->thermal_t_amb;
 		v->wheels[i].t_core = t->thermal_t_amb;
 	}
+	v->rack_torque = 0.0f;
+	v->damage_overall = 0.0f;
+	v->damage_steer = 0.0f;
+	v->damage_toe_front = 0.0f;
+	v->damage_toe_rear = 0.0f;
 	v->valid = 1;
 }
 
@@ -394,6 +403,90 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 		v->wheels[i].t_core = kTuning.thermal_t_amb;
 	}
 	v->rack_torque = 0.0f;
+	// A reset run must replay identically: crash damage back to pristine.
+	v->damage_overall = 0.0f;
+	v->damage_steer = 0.0f;
+	v->damage_toe_front = 0.0f;
+	v->damage_toe_rear = 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Crash damage (docs/SOFTBODY.md Phase 2)
+// ---------------------------------------------------------------------------
+
+// Severity per (m/s) of approach speed above SIM_DAMAGE_THRESHOLD, mapped to a
+// normalized [0,1] impact severity. At 0.045: a hit ~22 m/s over threshold is
+// "destroyed" (sev=1); a solid ~15 m/s total wall strike (~9 over) lands ~0.4.
+#define SIM_DAMAGE_SEV_PER_MS 0.045f
+// Per-component gains from one impact's severity.
+#define SIM_DAMAGE_K_OVERALL 0.60f	  // damage_overall increment at sev=1
+#define SIM_DAMAGE_K_STEER 0.55f	  // damage_steer increment (front impacts)
+#define SIM_DAMAGE_K_TOE 0.015f		  // toe bend (rad) increment at sev=1
+#define SIM_DAMAGE_TOE_CLAMP 0.030f	  // |toe damage| clamp (rad) ~1.7 deg
+// Effect magnitudes felt in vehicle_update.
+#define SIM_DAMAGE_AERO_LOSS 0.40f	  // cl *= (1 - LOSS*damage_overall)
+#define SIM_DAMAGE_STEER_LOSS 0.30f	  // max_steer *= (1 - LOSS*damage_steer)
+
+static float sClampMag( float x, float m )
+{
+	return b3ClampFloat( x, -m, m );
+}
+
+void vehicle_apply_impact( Vehicle* v, float approachSpeed, b3Vec3 localPoint )
+{
+	if ( approachSpeed <= SIM_DAMAGE_THRESHOLD )
+	{
+		return; // below threshold: pristine, no damage (clean-lap guarantee)
+	}
+	float sev = ( approachSpeed - SIM_DAMAGE_THRESHOLD ) * SIM_DAMAGE_SEV_PER_MS;
+	sev = b3ClampFloat( sev, 0.0f, 1.0f );
+
+	// Overall damage accrues from every impact (HUD + aero loss).
+	v->damage_overall = b3ClampFloat( v->damage_overall + sev * SIM_DAMAGE_K_OVERALL, 0.0f, 1.0f );
+
+	// Region: front (+Z) vs rear (-Z); side sign from local X (+ = right).
+	int front = localPoint.z >= 0.0f;
+	float side = ( localPoint.x >= 0.0f ) ? 1.0f : -1.0f;
+
+	if ( front )
+	{
+		// Front-end hits bend the steering and the front toe.
+		v->damage_steer = b3ClampFloat( v->damage_steer + sev * SIM_DAMAGE_K_STEER, 0.0f, 1.0f );
+		v->damage_toe_front = sClampMag( v->damage_toe_front + side * sev * SIM_DAMAGE_K_TOE, SIM_DAMAGE_TOE_CLAMP );
+	}
+	else
+	{
+		// Rear hits bend the rear toe.
+		v->damage_toe_rear = sClampMag( v->damage_toe_rear + side * sev * SIM_DAMAGE_K_TOE, SIM_DAMAGE_TOE_CLAMP );
+	}
+}
+
+void vehicle_accumulate_damage( b3WorldId world, Vehicle* v )
+{
+	b3ContactEvents ev = b3World_GetContactEvents( world );
+	for ( int i = 0; i < ev.hitCount; ++i )
+	{
+		const b3ContactHitEvent* h = &ev.hitEvents[i];
+		int is_chassis =
+			B3_ID_EQUALS( h->shapeIdA, v->chassis_shape ) || B3_ID_EQUALS( h->shapeIdB, v->chassis_shape );
+		if ( !is_chassis )
+		{
+			continue;
+		}
+		// Hit point into the chassis-local frame for region routing.
+		b3Vec3 local = b3Body_GetLocalPoint( v->chassis, h->point );
+		vehicle_apply_impact( v, h->approachSpeed, local );
+	}
+}
+
+float vehicle_effect_aero_front( const Vehicle* v )
+{
+	return kTuning.aero_cl_front * ( 1.0f - SIM_DAMAGE_AERO_LOSS * v->damage_overall );
+}
+
+float vehicle_effect_max_steer( const Vehicle* v )
+{
+	return kTuning.max_steer * ( 1.0f - SIM_DAMAGE_STEER_LOSS * v->damage_steer );
 }
 
 // ---------------------------------------------------------------------------
@@ -682,8 +775,11 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 	b3Vec3 chassis_vel = b3Body_GetLinearVelocity( chassis );
 	float chassis_speed = b3Length( chassis_vel );
 
-	// Steering: linear map, front axle only.
-	float steer_angle = steer * t->max_steer;
+	// Steering: linear map, front axle only. Front-end crash damage shrinks the
+	// lock (docs/SOFTBODY.md Phase 2). At damage_steer = 0 the factor is exactly
+	// 1.0, so a clean lap is bit-identical to an undamaged car.
+	float damaged_max_steer = t->max_steer * ( 1.0f - SIM_DAMAGE_STEER_LOSS * v->damage_steer );
+	float steer_angle = steer * damaged_max_steer;
 
 	// FFB: front-axle rack torque accumulated over the wheel loop.
 	float rack = 0.0f;
@@ -707,7 +803,10 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 		// (docs/SUSPENSION.md §2). Travel clamps keep it in [0, max_travel].
 		float camber_conv, toe_add;
 		vehicle_wheel_kinematics( i, t->rest_length - w->travel, &camber_conv, &toe_add );
-		w->steer_angle = ( front ? steer_angle : 0.0f ) + toe_add;
+		// Crash toe damage bends the axle (docs/SOFTBODY.md Phase 2); 0 when
+		// undamaged, so a clean lap adds exactly 0.0f (bit-identical).
+		float damage_toe = front ? v->damage_toe_front : v->damage_toe_rear;
+		w->steer_angle = ( front ? steer_angle : 0.0f ) + toe_add + damage_toe;
 
 		b3Vec3 hp_local = sVehicleHardpoint( i );
 		b3Pos origin = b3Body_GetWorldPoint( chassis, hp_local );
@@ -948,12 +1047,18 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 	}
 
 	// --- Aerodynamic downforce, per axle along -body-up ---
+	// Crash damage sheds downforce (docs/SOFTBODY.md Phase 2): a wrecked wing/
+	// floor makes less grip. At damage_overall = 0 the factor is exactly 1.0,
+	// keeping a clean lap bit-identical to the undamaged car.
 	{
 		float v2 = chassis_speed * chassis_speed;
+		float aero_factor = 1.0f - SIM_DAMAGE_AERO_LOSS * v->damage_overall;
+		float cl_front = t->aero_cl_front * aero_factor;
+		float cl_rear = t->aero_cl_rear * aero_factor;
 		b3Pos front_ax = b3Body_GetWorldPoint( chassis, ( b3Vec3 ){ 0.0f, t->hardpoint_y, t->wheelbase_half } );
 		b3Pos rear_ax = b3Body_GetWorldPoint( chassis, ( b3Vec3 ){ 0.0f, t->hardpoint_y, -t->wheelbase_half } );
-		b3Body_ApplyForce( chassis, b3MulSV( -t->aero_cl_front * v2, up ), front_ax, true );
-		b3Body_ApplyForce( chassis, b3MulSV( -t->aero_cl_rear * v2, up ), rear_ax, true );
+		b3Body_ApplyForce( chassis, b3MulSV( -cl_front * v2, up ), front_ax, true );
+		b3Body_ApplyForce( chassis, b3MulSV( -cl_rear * v2, up ), rear_ax, true );
 	}
 }
 

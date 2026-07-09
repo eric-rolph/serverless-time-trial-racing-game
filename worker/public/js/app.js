@@ -7,6 +7,7 @@ import { Input, quantize } from "./input.js";
 import { buildLapLog, submitLap, fetchLeaderboard, fetchReplay, fmtMs } from "./lap.js";
 import { EngineAudio } from "./audio.js";
 import { buildCar, buildWheel } from "./car.js";
+import { Crumple } from "./crumple.js";
 import { buildAmbience } from "./ambience.js";
 import { Lighting } from "./lighting.js";
 import { FanatecFFB } from "./ffb.js";
@@ -41,8 +42,11 @@ scene.add(buildTrackMeshes(track));
 const ambience = buildAmbience(track, trackHash);
 scene.add(ambience);
 
-const car = buildCar(0xd9483b);
+const car = buildCar(0xd9483b, 1, false, true); // deformable body for crash denting
 scene.add(car);
+// Cosmetic crash deformation (SOFTBODY.md Phase 1). Only the player car owns a
+// Crumple; the ghost keeps its own pristine geometries and gets none.
+const crumple = new Crumple(car);
 const ghostCar = buildCar(0xbfd9ff, 0.35, true); // translucent, with static wheels
 ghostCar.visible = false;
 scene.add(ghostCar);
@@ -195,6 +199,9 @@ let sessionGhostName = null;
 async function resetRun() {
   sim.reset();
   prev = curr = sim.state();
+  crumple.reset(); // restore the player car to pristine (undented)
+  impactCooldown = 0;
+  prevDamage = 0;  // sim_reset() zeroes kernel damage; rebaseline the delta trigger
   ticks = [];
   frozen = false;
   invalid = false;
@@ -429,6 +436,71 @@ const tmpQa = new THREE.Quaternion(), tmpQb = new THREE.Quaternion();
 const camTarget = new THREE.Vector3(), camPos = new THREE.Vector3(0, 6, -12);
 let fov = 62; // speed-breathing FOV, smoothed toward its target each frame
 
+// Crash-deformation trigger (render-only). Two sources, preferring the
+// authoritative one:
+//
+//   • ABI 1.3+ binaries export sim_damage(0) — the kernel's DETERMINISTIC
+//     overall crash-damage scalar, the exact value the edge referee recomputes
+//     from the input log. We drive the visible crumple SEVERITY from its
+//     per-tick increase, so the dent the player sees matches the physics damage
+//     that will be scored. Direction still comes from the chassis Δvelocity
+//     (which face was struck — purely cosmetic).
+//   • Older binaries lack the export → fall back to the self-contained Phase-1
+//     Δvelocity trigger below.
+//
+// Either way this is render-only: it never feeds back into the sim, the input
+// quantiser, or the lap log, so determinism/replay are untouched.
+const IMPACT_DV = 0.7;         // m/s of horizontal Δv in one tick to count as a hit (fallback)
+const IMPACT_SEV_SCALE = 2.4;  // Δv (above threshold) that maps to severity 1 (fallback)
+const IMPACT_COOLDOWN = 48;    // ticks to wait before another auto-impact (fallback)
+const DAMAGE_SEV_SCALE = 4.0;  // kernel overall-damage Δ (per tick) → crumple severity
+const DAMAGE_DELTA_MIN = 1e-4; // ignore float noise; a clean lap reads exactly 0 damage
+let impactCooldown = 0;
+let prevDamage = 0;            // previous tick's sim_damage(0), for the delta trigger
+const _dv = new THREE.Vector3();
+const _iq = new THREE.Quaternion();
+
+/** World Δv (prev→curr chassis velocity, horizontal) → normalised car-local
+ *  crush direction. Returns the magnitude of the world Δv. */
+function localCrushDir(prevS, currS) {
+  _dv.set(currS.linVel[0] - prevS.linVel[0], 0, currS.linVel[2] - prevS.linVel[2]);
+  const mag = _dv.length();
+  if (mag > 1e-4) {
+    _iq.set(currS.quat[0], currS.quat[1], currS.quat[2], currS.quat[3]).invert();
+    _dv.applyQuaternion(_iq).normalize();
+  }
+  return mag;
+}
+
+/** Dent the player car on impact. Cosmetic only — never feeds back into the sim. */
+function detectImpact(prevS, currS) {
+  const dmg = sim.damage(0); // authoritative overall damage, or null on old binaries
+
+  if (dmg !== null) {
+    // --- authoritative path: severity tracks the deterministic damage delta ---
+    const delta = dmg - prevDamage;
+    prevDamage = dmg;
+    if (delta <= DAMAGE_DELTA_MIN) return; // no new damage this tick
+    const severity = Math.min(1.5, delta * DAMAGE_SEV_SCALE);
+    if (localCrushDir(prevS, currS) <= 1e-4) {
+      // Damage rose without a velocity swing (rare): infer the struck axle from
+      // whichever toe component took the hit — nose (−Z) vs tail (+Z).
+      const front = sim.damage(2) ?? 0, rear = sim.damage(3) ?? 0;
+      _dv.set(0, 0, front >= rear ? -1 : 1);
+    }
+    crumple.applyImpact(_dv, severity);
+    return;
+  }
+
+  // --- fallback path (pre-1.3 binaries): Phase-1 Δvelocity trigger ---
+  if (impactCooldown > 0) { impactCooldown--; return; }
+  const dv = localCrushDir(prevS, currS);
+  if (dv < IMPACT_DV) return;
+  const severity = Math.min(1.5, (dv - IMPACT_DV) / IMPACT_SEV_SCALE + 0.25);
+  crumple.applyImpact(_dv, severity);
+  impactCooldown = IMPACT_COOLDOWN;
+}
+
 /** Step physics by dtMs of wall time. Extracted from the rAF handler so tests
  *  (and the debug hook below) can pump the sim when rAF is throttled. */
 function advance(dtMs) {
@@ -454,6 +526,7 @@ function advance(dtMs) {
     ticks.push(q);
     prev = curr;
     curr = sim.state();
+    detectImpact(prev, curr); // cosmetic crash denting; no sim coupling
 
     // Ghost runs one recorded tick per live tick — true side-by-side racing.
     if (ghost && ghostIdx < ghost.lapTicks) {
@@ -554,6 +627,7 @@ function frame(now) {
     camera.updateProjectionMatrix();
   }
 
+  crumple.update();  // settle crash dents (no-op when the car is undamaged)
   lighting.update(); // time-of-day blend follows the local clock
   renderer.render(scene, camera);
 
@@ -585,6 +659,23 @@ function frame(now) {
       tip += `${TIRE_LABELS[i]} ${Math.round(t)}°C  `;
     }
     $("tireTemps").title = tip.trimEnd();
+  }
+
+  // Crash damage (SOFTBODY.md Phase 2, ABI 1.3). Deterministic overall-damage
+  // scalar from the kernel — the same value the referee scores. Quiet while
+  // pristine; only appears past 1% and tints toward --bad as the car limps.
+  const dmg = sim.damage(0);
+  if (dmg !== null) {
+    const el = $("damage");
+    if (dmg > 0.01) {
+      el.style.display = "block";
+      el.textContent = `DMG ${Math.round(dmg * 100)}%`;
+      // muted → --bad, crossing over as damage passes ~half (car handling hurt).
+      el.style.color = dmg > 0.5 ? "var(--bad)" : "var(--muted)";
+      el.title = `steer −${Math.round((sim.damage(1) ?? 0) * 100)}%`;
+    } else if (el.style.display !== "none") {
+      el.style.display = "none";
+    }
   }
 
   // Live delta vs ghost: compare tick counts at equal lap progress. This is
@@ -626,6 +717,12 @@ window.__sttr = {
   track: { center: track.center, tangent: track.tangent },
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),
+  // Crash deformation (SOFTBODY.md Phase 1). Phase B can drive dents straight
+  // from the kernel's deterministic damage signal via applyImpact(localDir,
+  // severity): localDir = inward crush direction in car-local space (nose hit →
+  // {x:0,y:0,z:-1}); severity ≈ 0..1.5. resetCrumple restores pristine.
+  applyImpact: (localDir, severity) => crumple.applyImpact(localDir, severity),
+  resetCrumple: () => crumple.reset(),
   input,
   scene,
   FanatecFFB,
