@@ -248,6 +248,7 @@ export class Minimap {
     this.ctx = canvas.getContext("2d");
     this.w = canvas.width; this.h = canvas.height;
     this.track = track;
+    this.trail = []; // recent mapped car positions: [x, y, tMs], ~2 s window
     let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
     for (const c of track.center) {
       minX = Math.min(minX, c[0]); maxX = Math.max(maxX, c[0]);
@@ -259,24 +260,44 @@ export class Minimap {
   }
 
   draw(carPos, checkpointMask) {
-    const { ctx, track } = this;
+    const { ctx, track, trail } = this;
     ctx.clearRect(0, 0, this.w, this.h);
-    ctx.strokeStyle = "#4c566a"; ctx.lineWidth = 4; ctx.lineCap = "round";
+    // Track ribbon floats directly over the scene (no panel), so it carries
+    // its own contrast: dark halo under-stroke + thin light line on top —
+    // reads against bright day sky and near-black night alike.
+    ctx.lineCap = ctx.lineJoin = "round";
     ctx.beginPath();
     track.center.forEach((c, i) => {
       const [x, y] = this.map(c);
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     });
-    ctx.closePath(); ctx.stroke();
-    // start + checkpoints
-    const dot = (i, color) => {
+    ctx.closePath();
+    ctx.strokeStyle = "rgba(5,9,15,.55)"; ctx.lineWidth = 4.5; ctx.stroke();
+    ctx.strokeStyle = "#b9c4d4"; ctx.lineWidth = 1.5; ctx.stroke();
+    // start + checkpoints (cleared ones turn green)
+    const dot = (i, color, r = 2.6) => {
       const [x, y] = this.map(track.center[i]);
-      ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, 4, 0, 7); ctx.fill();
+      ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
     };
-    dot(0, "#ffffff");
-    track.checkpoints.forEach((cp, k) => dot(cp, checkpointMask & (1 << k) ? "#7fe3a1" : "#8fd3ff"));
-    // car
+    dot(0, "#ffffff", 2.8);
+    track.checkpoints.forEach((cp, k) => dot(cp, checkpointMask & (1 << k) ? "#7fe3a1" : "rgba(143,211,255,.65)"));
+    // motion trail: last ~2 s of positions, fading with age
     const [cx, cy] = this.map(carPos);
-    ctx.fillStyle = "#ffd479"; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 7); ctx.fill();
+    const now = performance.now();
+    const tail = trail[trail.length - 1];
+    if (tail && Math.hypot(cx - tail[0], cy - tail[1]) > 25) trail.length = 0; // respawn teleport — drop stale streak
+    if (!tail || now - tail[2] > 50) trail.push([cx, cy, now]);
+    while (trail.length && now - trail[0][2] > 2000) trail.shift();
+    ctx.lineWidth = 1.2;
+    for (let i = 1; i < trail.length; i++) {
+      ctx.strokeStyle = `rgba(255,255,255,${(0.45 * (1 - (now - trail[i][2]) / 2000)).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.moveTo(trail[i - 1][0], trail[i - 1][1]);
+      ctx.lineTo(trail[i][0], trail[i][1]);
+      ctx.stroke();
+    }
+    // car
+    ctx.fillStyle = "#ffffff"; ctx.strokeStyle = "rgba(0,0,0,.6)"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(cx, cy, 3.5, 0, 7); ctx.fill(); ctx.stroke();
   }
 }

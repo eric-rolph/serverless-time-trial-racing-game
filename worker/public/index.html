@@ -5,65 +5,154 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Serverless Time Trial</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e14; color: #e6e6e6;
-               font-family: "Segoe UI", system-ui, sans-serif; }
+  /* Tufte pass: no boxes around data — type floats over the scene, separated
+     by a dark text halo (layering, not enclosure). One accent (gold) reserved
+     for record/leader data; everything else muted grays. Tabular numerals
+     everywhere so times never jitter. */
+  :root {
+    --ink: #e9edf4;        /* primary data */
+    --muted: #9aa5b5;      /* secondary data */
+    --faint: #78828f;      /* labels, chrome */
+    --gold: #ffd479;       /* records & leaders ONLY */
+    --good: #7fe3a1;       /* faster / ok */
+    --bad:  #ff8f8f;       /* slower / error */
+    --halo: 0 1px 2px rgba(0,0,0,.85), 0 0 8px rgba(0,0,0,.45);
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e14; color: var(--ink);
+               font-family: system-ui, "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; }
   #gl { position: fixed; inset: 0; display: block; }
-  .panel { position: fixed; background: rgba(10,14,22,.78); border: 1px solid #2a3448;
+
+  /* Unboxed HUD layers: legible on bright day sky and near-black night alike
+     thanks to the halo; pointer-events off so the scene stays interactive. */
+  .hud { position: fixed; text-shadow: var(--halo); pointer-events: none; }
+  #board, #nameWrap, #sectors, #tireTemps { pointer-events: auto; }
+
+  /* --- timing stack: delta (hero) > lap time > speed > small multiples --- */
+  #hud { top: 16px; left: 50%; transform: translateX(-50%); text-align: center; }
+  #delta { font-size: 46px; font-weight: 700; line-height: 1; min-height: 46px; letter-spacing: .01em; }
+  #delta.ahead { color: var(--good); }
+  #delta.behind { color: var(--bad); }
+  #deltaLabel { font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
+                color: var(--faint); min-height: 13px; margin-top: 2px; }
+  #lapTime { font-size: 30px; font-weight: 600; margin-top: 2px; }
+  #speedRow { font-size: 14px; color: var(--muted); }
+  #speedRow .unit { font-size: 11px; color: var(--faint); }
+  #lapInfo { margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+  #lapInfo .lbl { font-size: 9px; letter-spacing: .14em; color: var(--faint); }
+  #lapInfo .gold { color: var(--gold); }
+
+  /* Sector small multiples: three thin bars, width ∝ sector duration,
+     fill = completed, color = vs best. Hover a bar for the exact time. */
+  #sectors { display: flex; gap: 3px; width: 240px; height: 4px; margin: 8px auto 0; }
+  .sector { border-radius: 2px; background: rgba(233,237,244,.16); min-width: 8px; }
+  .sector.done   { background: #cfd8e6; }
+  .sector.faster { background: var(--good); }
+  .sector.slower { background: var(--bad); }
+  #sectorNote { margin-top: 4px; font-size: 11px; min-height: 13px; color: var(--muted); }
+  #sectorNote.faster { color: var(--good); }
+  #sectorNote.slower { color: var(--bad); }
+
+  /* --- leaderboard: quiet ranked list, leader's time gets the gold --- */
+  #board { top: 16px; right: 18px; text-align: right; max-width: 260px; }
+  #board .caps { font-size: 9px; letter-spacing: .22em; text-transform: uppercase;
+                 color: var(--faint); margin-bottom: 5px; }
+  #entries { list-style: none; margin: 0; padding: 0; font-size: 12.5px; color: var(--muted); }
+  #entries li { margin: 3px 0; white-space: nowrap; }
+  #entries .rank { color: var(--faint); font-size: 10px; margin-right: 5px; }
+  #entries .t { color: var(--ink); }
+  #entries .t.gold { color: var(--gold); }
+  button.race { background: none; border: none; padding: 0 0 0 4px; cursor: pointer;
+                color: var(--faint); font-size: 10px; text-shadow: var(--halo); }
+  button.race:hover { color: var(--ink); }
+
+  /* --- tire temps: car-schematic glyph, wheel fill = temp scale --- */
+  #tireTemps { left: 24px; bottom: 258px; width: 34px; height: 58px; display: none; }
+  #tireTemps .chassis { position: absolute; left: 8px; top: 3px; width: 16px; height: 50px;
+                        border: 1px solid rgba(233,237,244,.30);
+                        border-radius: 8px 8px 5px 5px / 12px 12px 6px 6px; }
+  #tireTemps .wheel { position: absolute; width: 9px; height: 15px; border-radius: 3px;
+                      background: #566; box-shadow: 0 1px 2px rgba(0,0,0,.6); }
+  #tireTemps .fl { left: 0; top: 7px; }  #tireTemps .fr { right: 0; top: 7px; }
+  #tireTemps .rl { left: 0; bottom: 5px; } #tireTemps .rr { right: 0; bottom: 5px; }
+
+  /* --- minimap: bare canvas, shadow instead of a panel --- */
+  #map { left: 14px; bottom: 14px; }
+  #map canvas { display: block; filter: drop-shadow(0 2px 8px rgba(0,0,0,.55)); }
+
+  /* --- status line + key hints: quiet, bottom-center, unboxed --- */
+  #status { bottom: 42px; left: 50%; transform: translateX(-50%); font-size: 13.5px;
+            text-align: center; max-width: 660px; }
+  #status .ok { color: var(--good); } #status .bad { color: var(--bad); } #status .info { color: #8fd3ff; }
+  #keys { bottom: 12px; left: 50%; transform: translateX(-50%); font-size: 10.5px;
+          color: var(--faint); white-space: nowrap; }
+  kbd { color: #c7d0dd; font-weight: 600; font-size: 10.5px; font-family: inherit; }
+
+  /* --- driver name: quiet corner, underline not box --- */
+  #nameWrap { right: 18px; bottom: 14px; }
+  #name { background: transparent; border: none; border-bottom: 1px solid rgba(233,237,244,.22);
+          color: var(--ink); padding: 2px; width: 130px; font-size: 12px; text-align: right;
+          font-family: inherit; text-shadow: var(--halo); outline: none; }
+  #name::placeholder { color: var(--faint); }
+  #name:focus { border-bottom-color: rgba(233,237,244,.5); }
+
+  /* --- countdown: big, light, unboxed --- */
+  #countdown { position: fixed; top: 38%; left: 50%; transform: translate(-50%,-50%);
+               font-size: 110px; font-weight: 800; color: #f3f6fb; pointer-events: none;
+               text-shadow: 0 2px 6px rgba(0,0,0,.6), 0 0 42px rgba(255,255,255,.25); }
+
+  /* --- config: a settings dialog, so a panel is honest here --- */
+  .panel { position: fixed; background: rgba(10,14,22,.86); border: 1px solid #2a3448;
            border-radius: 10px; padding: 10px 14px; backdrop-filter: blur(4px); }
-  #hud { top: 14px; left: 14px; min-width: 210px; }
-  #hud .time { font-size: 34px; font-variant-numeric: tabular-nums; font-weight: 600; }
-  #hud .speed { font-size: 20px; color: #8fd3ff; font-variant-numeric: tabular-nums; }
-  #hud .sub { font-size: 12px; color: #9aa7bd; }
-  #board { top: 14px; right: 14px; width: 250px; }
-  #board h3 { margin: 2px 0 8px; font-size: 14px; letter-spacing: .08em; color: #9aa7bd; }
-  #board ol { margin: 0; padding-left: 22px; font-size: 13px; }
-  #board li { margin: 2px 0; font-variant-numeric: tabular-nums; }
-  #board li b { color: #ffd479; }
-  #map { bottom: 14px; left: 14px; padding: 8px; }
-  #status { bottom: 14px; left: 50%; transform: translateX(-50%); font-size: 14px;
-            text-align: center; max-width: 620px; }
-  #status .ok { color: #7fe3a1; } #status .bad { color: #ff8f8f; } #status .info { color: #8fd3ff; }
-  #config { top: 14px; left: 50%; transform: translateX(-50%); display: none; width: 360px; }
+  #config { top: 50%; left: 50%; transform: translate(-50%,-50%); display: none; width: 380px;
+            z-index: 10; max-height: 88vh; overflow-y: auto; }
   #config h3 { margin: 2px 0 8px; font-size: 14px; }
   #config .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; }
   #config .row label { width: 70px; }
   #config meter { flex: 1; }
+  #config kbd { background: #1a2333; border: 1px solid #33415e; border-radius: 4px; padding: 0 5px; }
+  .sub { font-size: 12px; color: var(--muted); }
   button { background: #21304a; color: #dbe6ff; border: 1px solid #3b4d6e; border-radius: 6px;
            padding: 4px 10px; cursor: pointer; font-size: 12px; }
   button:hover { background: #2b3f61; }
-  input[type=text] { background: #101827; color: #e6e6e6; border: 1px solid #2a3448;
-                     border-radius: 6px; padding: 4px 8px; width: 130px; }
-  kbd { background: #1a2333; border: 1px solid #33415e; border-radius: 4px; padding: 0 5px;
-        font-size: 11px; }
 </style>
 </head>
 <body>
 <canvas id="gl"></canvas>
 
-<div id="hud" class="panel">
-  <div class="time"><span id="lapTime">0:00.000</span> <span id="delta" style="font-size:18px"></span></div>
-  <div class="speed"><span id="speed">0</span> km/h</div>
-  <div class="sub" id="lapInfo">best: — &nbsp; last: —</div>
-  <div class="sub" id="sectors"></div>
-  <div class="sub" id="tireTemps" style="font-variant-numeric:tabular-nums"></div>
-  <div class="sub" style="margin-top:6px">
-    <kbd>←→</kbd>/<kbd>A D</kbd> steer &nbsp;<kbd>↑</kbd>/<kbd>W</kbd> throttle
-    &nbsp;<kbd>↓</kbd>/<kbd>S</kbd> brake &nbsp;<kbd>R</kbd> restart &nbsp;<kbd>C</kbd> camera
-    &nbsp;<kbd>M</kbd> mute &nbsp;<kbd>L</kbd> lighting &nbsp;<kbd>I</kbd> wheel setup
+<div id="hud" class="hud">
+  <div id="delta"></div>
+  <div id="deltaLabel"></div>
+  <div id="lapTime">0:00.000</div>
+  <div id="speedRow"><span id="speed">0</span><span class="unit"> km/h</span></div>
+  <div id="lapInfo">
+    <span class="lbl">BEST</span> <span id="bestVal" class="gold">—</span>
+    <span class="lbl" style="margin-left:10px">LAST</span> <span id="lastVal">—</span>
   </div>
-  <div class="row" style="margin-top:8px; display:flex; gap:6px; align-items:center">
-    <input type="text" id="name" placeholder="driver name" maxlength="24">
-  </div>
+  <div id="sectors"></div>
+  <div id="sectorNote"></div>
 </div>
 
-<div id="board" class="panel">
-  <h3>GLOBAL LEADERBOARD</h3>
+<div id="board" class="hud">
+  <div class="caps">leaderboard</div>
   <ol id="entries"><li class="sub">loading…</li></ol>
 </div>
 
-<div id="map" class="panel"><canvas id="minimap" width="220" height="220"></canvas></div>
+<div id="tireTemps" class="hud">
+  <span class="chassis"></span>
+  <span class="wheel fl"></span><span class="wheel fr"></span>
+  <span class="wheel rl"></span><span class="wheel rr"></span>
+</div>
 
-<div id="status" class="panel"><span class="info" id="statusText">loading physics…</span></div>
+<div id="map" class="hud"><canvas id="minimap" width="220" height="220"></canvas></div>
+
+<div id="status" class="hud"><span class="info" id="statusText">loading physics…</span></div>
+
+<div id="keys" class="hud">
+  <kbd>←→</kbd>/<kbd>A D</kbd> steer · <kbd>↑</kbd>/<kbd>W</kbd> throttle · <kbd>↓</kbd>/<kbd>S</kbd> brake ·
+  <kbd>R</kbd> restart · <kbd>C</kbd> camera · <kbd>M</kbd> mute · <kbd>L</kbd> lighting · <kbd>I</kbd> wheel setup
+</div>
+
+<div id="nameWrap" class="hud"><input type="text" id="name" placeholder="driver name" maxlength="24"></div>
 
 <div id="config" class="panel">
   <h3>WHEEL / PEDAL SETUP <span class="sub">(Gamepad API — wiggle EACH device once so the browser exposes it; wheel, pedals and handbrake can be separate USB devices)</span></h3>
@@ -101,8 +190,7 @@
   <div class="row"><button id="closeConfig">close</button></div>
 </div>
 
-<div id="countdown" style="display:none; position:fixed; top:38%; left:50%; transform:translate(-50%,-50%);
-     font-size:120px; font-weight:800; color:#ffd479; text-shadow:0 0 40px rgba(255,212,121,.5);"></div>
+<div id="countdown" style="display:none"></div>
 
 <script type="module" src="js/app.js"></script>
 </body>

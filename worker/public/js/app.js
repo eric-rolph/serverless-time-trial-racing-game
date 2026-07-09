@@ -154,6 +154,23 @@ autoReconnectHid().then((n) => {
 });
 const minimap = new Minimap($("minimap"), track);
 const audio = new EngineAudio();
+
+// Tire glyph: the four wheel rects of the car schematic, order FL FR RL RR.
+const TIRE_LABELS = ["FL", "FR", "RL", "RR"];
+const tireEls = ["fl", "fr", "rl", "rr"].map((p) => document.querySelector(`#tireTemps .wheel.${p}`));
+/** Continuous temp → color scale: cold blue → operating-window green →
+ *  overheated red (hue interpolated between anchor stops). */
+function tireColor(t) {
+  const stops = [[35, 212], [60, 148], [105, 96], [125, 6]]; // [°C, hue]
+  if (t <= stops[0][0]) return `hsl(${stops[0][1]} 62% 56%)`;
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const [a, ha] = stops[i - 1], [b, hb] = stops[i];
+      return `hsl(${Math.round(ha + ((hb - ha) * (t - a)) / (b - a))} 62% 56%)`;
+    }
+  }
+  return `hsl(${stops[stops.length - 1][1]} 62% 56%)`;
+}
 const fellOffY = Math.min(...track.center.map((c) => c[1])) - 25;
 let prev = sim.state();
 let curr = prev;
@@ -186,7 +203,7 @@ async function resetRun() {
   prevCpMask = 0;
   deltaPtr = 0;
   $("delta").textContent = "";
-  $("sectors").textContent = "";
+  renderSectors([]);
   countdownMs = 3200;
 
   rolloverTicks = 0;
@@ -200,6 +217,8 @@ async function resetRun() {
   } else {
     ghostCar.visible = false;
   }
+  // Annotate what the hero delta compares against (ghost identity).
+  $("deltaLabel").textContent = ghost ? (sessionGhostName ? `vs ${sessionGhostName}` : "vs best lap") : "";
 }
 
 addEventListener("keydown", (e) => {
@@ -305,11 +324,13 @@ let boardEntries = [];
 async function refreshBoard() {
   try {
     boardEntries = (await fetchLeaderboard()).slice(0, 10);
+    // Quiet ranked list — gold is reserved for the record holder's time.
     $("entries").innerHTML = boardEntries.length
       ? boardEntries
           .map(
             (e, i) =>
-              `<li><b>${fmtMs(e.ms)}</b> ${e.name.replace(/[<>&]/g, "")} ` +
+              `<li><span class="rank">${i + 1}</span><span class="t${i === 0 ? " gold" : ""}">${fmtMs(e.ms)}</span> ` +
+              `${e.name.replace(/[<>&]/g, "")}` +
               `<button class="race" data-i="${i}" title="race this lap as a ghost">▶</button></li>`,
           )
           .join("")
@@ -324,15 +345,50 @@ $("entries").addEventListener("click", (e) => {
 });
 refreshBoard();
 
-function fmtSectors(t) {
+// Sector small multiples: one thin bar per sector, width proportional to the
+// sector's duration (best-known, so proportions are stable lap to lap), fill
+// appearing as sectors complete, color = faster/slower than the stored best.
+// Exact times live in each bar's title.
+const sectorCount = track.checkpoints.length + 1;
+const sectorEls = [];
+{
+  const wrap = $("sectors");
+  for (let i = 0; i < sectorCount; i++) {
+    const el = document.createElement("span");
+    el.className = "sector";
+    wrap.appendChild(el);
+    sectorEls.push(el);
+  }
+}
+
+const signed = (s) => (Math.round(s * 100) === 0 ? "0.00" : `${s > 0 ? "+" : "−"}${Math.abs(s).toFixed(2)}`);
+
+function renderSectors(durations) {
   const best = JSON.parse(localStorage.getItem(SECT_KEY) ?? "[]");
-  return t
-    .map((ticks, i) => {
-      const ms = Math.round((ticks * 1000) / 400);
-      const d = best[i] ? ((ticks - best[i]) / 400).toFixed(2) : null;
-      return `S${i + 1} ${fmtMs(ms)}${d !== null ? ` (${d > 0 ? "+" : ""}${d})` : ""}`;
-    })
-    .join("  ");
+  const known = sectorEls.map((_, i) => best[i] ?? durations[i] ?? null);
+  const filled = known.filter((k) => k !== null);
+  const avg = filled.length ? filled.reduce((a, b) => a + b, 0) / filled.length : 1;
+  const widths = known.map((k) => k ?? avg);
+  const total = widths.reduce((a, b) => a + b, 0);
+  let note = "", noteCls = "";
+  for (let i = 0; i < sectorCount; i++) {
+    const el = sectorEls[i];
+    el.style.flexGrow = (widths[i] / total).toFixed(4);
+    if (i < durations.length) {
+      const diff = best[i] ? (durations[i] - best[i]) / 400 : null;
+      el.className = `sector ${diff === null ? "done" : diff <= 0 ? "faster" : "slower"}`;
+      el.title = `S${i + 1} ${fmtMs(Math.round((durations[i] * 1000) / 400))}${diff !== null ? ` (${signed(diff)})` : ""}`;
+      if (i === durations.length - 1 && diff !== null) {
+        note = `S${i + 1} ${signed(diff)}`;
+        noteCls = diff <= 0 ? "faster" : "slower";
+      }
+    } else {
+      el.className = "sector";
+      el.title = `S${i + 1}`;
+    }
+  }
+  $("sectorNote").textContent = note;
+  $("sectorNote").className = noteCls;
 }
 
 async function onLapComplete() {
@@ -346,6 +402,7 @@ async function onLapComplete() {
   // Sector bests + ghost are local-first: saved regardless of server verdict.
   const boundaries = [...sectorTicks, lapTicks];
   const sectors = boundaries.map((t, i) => t - (boundaries[i - 1] ?? 0));
+  renderSectors(sectors); // final sector bar, colored against the old bests
   const prevBest = JSON.parse(localStorage.getItem(SECT_KEY) ?? "[]");
   localStorage.setItem(SECT_KEY, JSON.stringify(sectors.map((s, i) => Math.min(s, prevBest[i] ?? Infinity))));
   if (isPB) await saveGhost(ticks, lapTicks);
@@ -370,6 +427,7 @@ async function onLapComplete() {
 // ---------------------------------------------------------------- main loop
 const tmpQa = new THREE.Quaternion(), tmpQb = new THREE.Quaternion();
 const camTarget = new THREE.Vector3(), camPos = new THREE.Vector3(0, 6, -12);
+let fov = 62; // speed-breathing FOV, smoothed toward its target each frame
 
 /** Step physics by dtMs of wall time. Extracted from the rAF handler so tests
  *  (and the debug hook below) can pump the sim when rAF is throttled. */
@@ -410,9 +468,7 @@ function advance(dtMs) {
     if (curr.checkpoints !== prevCpMask) {
       sectorTicks.push(ticks.length);
       prevCpMask = curr.checkpoints;
-      $("sectors").textContent = fmtSectors(
-        sectorTicks.map((t, i) => t - (sectorTicks[i - 1] ?? 0)),
-      );
+      renderSectors(sectorTicks.map((t, i) => t - (sectorTicks[i - 1] ?? 0)));
     }
 
     if (status & STATUS.LAP_INVALID && !invalid) {
@@ -489,6 +545,15 @@ function frame(now) {
     camPos.copy(hood);
   }
 
+  // Delight touch: speed-sensitive FOV breathing — 62° at rest widening to
+  // 68° flat-out (~200 km/h), exponentially smoothed so it reads as pace,
+  // never as a zoom cut. One uniform + matrix update; render cost ~zero.
+  fov += (62 + 6 * Math.min(1, curr.speed / 55) - fov) * (1 - Math.exp(-2.5 * (dtMs / 1000)));
+  if (Math.abs(camera.fov - fov) > 0.005) {
+    camera.fov = fov;
+    camera.updateProjectionMatrix();
+  }
+
   lighting.update(); // time-of-day blend follows the local clock
   renderer.render(scene, camera);
 
@@ -504,28 +569,31 @@ function frame(now) {
   const runningTicks = frozen ? sim.lapTimeTicks() || ticks.length : ticks.length;
   $("lapTime").textContent = fmtMs(Math.round((runningTicks * 1000) / 400));
   $("speed").textContent = Math.round(curr.speed * 3.6);
-  $("lapInfo").textContent = `best: ${bestMs ? fmtMs(bestMs) : "—"}   last: ${lastMs ? fmtMs(lastMs) : "—"}`;
+  $("bestVal").textContent = bestMs ? fmtMs(bestMs) : "—";
+  $("lastVal").textContent = lastMs ? fmtMs(lastMs) : "—";
   minimap.draw(car.position.toArray(), curr.checkpoints);
 
-  // Tire surface temps (brush-model thermal layer): blue cold → green in the
-  // window → red overheated. Order FL FR RL RR.
+  // Tire surface temps (brush-model thermal layer) drive the wheel fills of
+  // the car-schematic glyph: cold blue → in-window green → overheated red.
+  // Order FL FR RL RR; exact °C on hover.
   if (sim.tireTemp(0) !== null) {
-    const label = ["FL", "FR", "RL", "RR"];
-    $("tireTemps").innerHTML = label
-      .map((n, i) => {
-        const t = sim.tireTemp(i);
-        const color = t < 60 ? "#7fb3ff" : t <= 105 ? "#7fe3a1" : "#ff8f8f";
-        return `${n} <span style="color:${color}">${Math.round(t)}°</span>`;
-      })
-      .join("  ");
+    if ($("tireTemps").style.display !== "block") $("tireTemps").style.display = "block";
+    let tip = "";
+    for (let i = 0; i < 4; i++) {
+      const t = sim.tireTemp(i);
+      tireEls[i].style.background = tireColor(t);
+      tip += `${TIRE_LABELS[i]} ${Math.round(t)}°C  `;
+    }
+    $("tireTemps").title = tip.trimEnd();
   }
 
-  // Live delta vs ghost: compare tick counts at equal lap progress.
+  // Live delta vs ghost: compare tick counts at equal lap progress. This is
+  // the hero readout — big, centered, green ahead / red behind.
   if (ghost && !frozen && countdownMs <= 0 && curr.lapProgress > 0.01) {
     while (deltaPtr < ghost.lapTicks - 1 && ghost.progress[deltaPtr] < curr.lapProgress) deltaPtr++;
     const d = (ticks.length - deltaPtr) / 400;
-    $("delta").textContent = `${d >= 0 ? "+" : ""}${d.toFixed(2)}`;
-    $("delta").style.color = d >= 0 ? "#ff8f8f" : "#7fe3a1";
+    $("delta").textContent = `${d >= 0 ? "+" : "−"}${Math.abs(d).toFixed(2)}`;
+    $("delta").className = d >= 0 ? "behind" : "ahead";
   }
 
   if ($("config").style.display === "block") {
