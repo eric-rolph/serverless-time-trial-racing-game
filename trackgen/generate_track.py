@@ -230,7 +230,14 @@ def generate(seed: int) -> dict:
         # Banking: rotate `up` about the tangent so the surface leans into the
         # corner (inside edge drops). kappa > 0 = left turn; the normal must
         # lean toward -side (left), hence the negation. side/up stay orthonormal.
-        bank = np.clip(-kappa * BANK_GAIN, -MAX_BANK_RAD, MAX_BANK_RAD)
+        # Banking gain must NOT saturate on near-straights (the old linear
+        # gain 110 hit max bank at kappa=0.0006 ~ R=1.6km, so the road was
+        # fully banked almost everywhere and FLIPPED 8 deg across every
+        # curvature zero-crossing - measured 18 g vertical kicks). tanh
+        # referenced to real-corner curvature + extra smoothing = gentle
+        # straights, full bank only in genuine corners, soft transitions.
+        kappa_b = np.convolve(np.tile(kappa, 3), np.ones(25) / 25.0, mode="same")[n : 2 * n]
+        bank = -MAX_BANK_RAD * np.tanh(kappa_b / 0.015)
         cos_b, sin_b = np.cos(bank)[:, None], np.sin(bank)[:, None]
         up_banked = up * cos_b + side * sin_b
         side = np.cross(up_banked, tangent)
