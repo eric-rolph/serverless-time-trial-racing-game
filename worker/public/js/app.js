@@ -31,8 +31,13 @@ $("name").addEventListener("change", () => localStorage.setItem("sttr-name", $("
 // ---------------------------------------------------------------- three.js
 const renderer = new THREE.WebGLRenderer({ canvas: $("gl"), antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1; // per-condition, driven by Lighting.update
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap; // single 2048² map (Lighting)
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0e1420);
+scene.background = new THREE.Color(0x0e1420); // Lighting owns bg/fog from frame 0
 scene.fog = new THREE.Fog(0x0e1420, 150, 480);
 const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 800);
 
@@ -51,16 +56,19 @@ const ghostCar = buildCar(0xbfd9ff, 0.35, true); // translucent, with static whe
 ghostCar.visible = false;
 scene.add(ghostCar);
 
-// Time-of-day lighting (cosmetic; local clock; L cycles overrides). Owns the
-// hemisphere + sun lights and the car's night headlights.
-const lighting = new Lighting(scene, car, ambience.userData.glowMaterials);
-
 const wheelMeshes = [];
 for (let i = 0; i < 4; i++) {
   const holder = buildWheel(); // racing slick + rim, posed from physics below
   scene.add(holder);
   wheelMeshes.push(holder);
 }
+
+// APEX lighting core (cosmetic; auto = local clock; L cycles the five
+// conditions). Owns sky dome + sun disc, the shadow-casting key light,
+// hemisphere fill, per-condition exposure, and the car's night headlights.
+// Constructed AFTER every scene mesh (car, wheels, track, ambience) so its
+// one-time shadow cast/receive traversal sees them all.
+const lighting = new Lighting(scene, car, ambience.userData.glowMaterials, renderer, track);
 
 function resize() {
   renderer.setSize(innerWidth, innerHeight, false);
@@ -131,7 +139,7 @@ async function saveGhost(tickRecords, lapTicks) {
 }
 
 /** Replay viewer: download a leaderboard lap and race it as the ghost. */
-async function raceReplay(entry) {
+async function raceReplay(entry, rank = null) {
   try {
     setStatus(`downloading ${entry.name}'s lap…`);
     const buf = await fetchReplay(entry.pubkey.slice(0, 16));
@@ -142,6 +150,7 @@ async function raceReplay(entry) {
     const progress = await buildProgress(ticksDv, lapTicks);
     sessionGhost = { lapTicks, ticks: ticksDv, progress };
     sessionGhostName = entry.name;
+    sessionGhostRank = rank;
     await resetRun();
     setStatus(`racing ${entry.name}'s ${fmtMs(entry.ms)} lap — beat the ghost! (R restarts, ghost stays)`, "ok");
   } catch (err) {
@@ -187,6 +196,9 @@ let bestMs = null;
 let lastMs = null;
 let inputOverride = null; // test hook: (state) => RawInput
 let countdownMs = 0; // > 0 → standing start in progress
+// Camera seats (APEX "pick your seat"): C cycles chase → cockpit → bumper → TV.
+const CAMERA_SEATS = ["chase", "cockpit", "bumper", "tv"];
+const CAMERA_NAMES = { chase: "chase", cockpit: "cockpit", bumper: "bumper", tv: "TV" };
 let cameraMode = "chase";
 let ffb = null;
 let lastThrottle = 0;
@@ -195,6 +207,7 @@ let prevCpMask = 0;
 let rolloverTicks = 0;
 let sessionGhost = null; // downloaded leaderboard lap (replay viewer)
 let sessionGhostName = null;
+let sessionGhostRank = null; // leaderboard rank of the downloaded lap (1 = P1)
 
 async function resetRun() {
   sim.reset();
@@ -224,14 +237,22 @@ async function resetRun() {
   } else {
     ghostCar.visible = false;
   }
-  // Annotate what the hero delta compares against (ghost identity).
-  $("deltaLabel").textContent = ghost ? (sessionGhostName ? `vs ${sessionGhostName}` : "vs best lap") : "";
+  // Annotate what the hero delta compares against (ghost identity):
+  // leaderboard ghost → "vs P1 name" (session-best reference, purple when
+  // ahead); own PB ghost → "vs best lap" (green when ahead).
+  $("deltaLabel").textContent = ghost
+    ? (sessionGhostName ? `vs P${sessionGhostRank ?? "?"} ${sessionGhostName}` : "vs best lap")
+    : "";
 }
 
 addEventListener("keydown", (e) => {
   audio.start();
   if (e.code === "KeyR") resetRun();
-  if (e.code === "KeyC") cameraMode = cameraMode === "chase" ? "hood" : "chase";
+  if (e.code === "KeyC") {
+    cameraMode = CAMERA_SEATS[(CAMERA_SEATS.indexOf(cameraMode) + 1) % CAMERA_SEATS.length];
+    if (cameraMode === "tv") tvIdx = -1; // re-pick the nearest tripod on entry
+    setStatus(`camera: ${CAMERA_NAMES[cameraMode]}`);
+  }
   if (e.code === "KeyM") setStatus(audio.toggleMute() ? "muted" : "sound on");
   if (e.code === "KeyL") setStatus(`lighting: ${lighting.cycle()}`);
   if (e.code === "KeyI") $("config").style.display = $("config").style.display === "block" ? "none" : "block";
@@ -331,12 +352,12 @@ let boardEntries = [];
 async function refreshBoard() {
   try {
     boardEntries = (await fetchLeaderboard()).slice(0, 10);
-    // Quiet ranked list — gold is reserved for the record holder's time.
+    // Quiet ranked list — the cyan accent is reserved for the record holder's time.
     $("entries").innerHTML = boardEntries.length
       ? boardEntries
           .map(
             (e, i) =>
-              `<li><span class="rank">${i + 1}</span><span class="t${i === 0 ? " gold" : ""}">${fmtMs(e.ms)}</span> ` +
+              `<li><span class="rank">${i + 1}</span><span class="t${i === 0 ? " accent" : ""}">${fmtMs(e.ms)}</span> ` +
               `${e.name.replace(/[<>&]/g, "")}` +
               `<button class="race" data-i="${i}" title="race this lap as a ghost">▶</button></li>`,
           )
@@ -348,7 +369,7 @@ async function refreshBoard() {
 }
 $("entries").addEventListener("click", (e) => {
   const btn = e.target.closest("button.race");
-  if (btn) raceReplay(boardEntries[Number(btn.dataset.i)]);
+  if (btn) raceReplay(boardEntries[Number(btn.dataset.i)], Number(btn.dataset.i) + 1);
 });
 refreshBoard();
 
@@ -434,7 +455,36 @@ async function onLapComplete() {
 // ---------------------------------------------------------------- main loop
 const tmpQa = new THREE.Quaternion(), tmpQb = new THREE.Quaternion();
 const camTarget = new THREE.Vector3(), camPos = new THREE.Vector3(0, 6, -12);
-let fov = 62; // speed-breathing FOV, smoothed toward its target each frame
+const _camA = new THREE.Vector3(), _camB = new THREE.Vector3(); // per-frame camera scratch
+let fov = 62; // per-seat FOV, smoothed toward its target each frame
+
+// TV seat: ~8 fixed trackside tripods — one every S/8 centerline samples,
+// 14 m outside the loop (away from the track centroid), 4 m up. The camera
+// stands still on the nearest tripod, tracks the car with lookAt, and hands
+// off to the next tripod once the car passes its cross-section — classic
+// broadcast coverage. Built once from track data already in memory.
+const tvPoints = (() => {
+  const S = track.S, n = 8;
+  let cx = 0, cz = 0;
+  for (const c of track.center) { cx += c[0]; cz += c[2]; }
+  cx /= S; cz /= S;
+  const pts = [];
+  for (let k = 0; k < n; k++) {
+    const s = Math.floor((k * S) / n);
+    const c = track.center[s], t = track.tangent[s];
+    let lx = t[2], lz = -t[0]; // horizontal perpendicular to the travel direction
+    const ll = Math.hypot(lx, lz) || 1;
+    lx /= ll; lz /= ll;
+    const side = (c[0] - cx) * lx + (c[2] - cz) * lz >= 0 ? 1 : -1; // outside = away from centroid
+    pts.push({
+      pos: new THREE.Vector3(c[0] + 14 * side * lx, c[1] + 4, c[2] + 14 * side * lz),
+      gate: new THREE.Vector3(c[0], c[1], c[2]), // the tripod's track cross-section
+      dir: new THREE.Vector3(t[0], t[1], t[2]).normalize(), // travel direction there
+    });
+  }
+  return pts;
+})();
+let tvIdx = -1; // active tripod; -1 → pick the nearest on the next TV frame
 
 // Crash-deformation trigger (render-only). Two sources, preferring the
 // authoritative one:
@@ -603,32 +653,65 @@ function frame(now) {
     wheelMeshes[i].rotateX(lerp(wp.spin, wc.spin));
   }
 
-  // Camera: chase (spring-damped) or hood.
+  // Camera seats (C cycles) — all posed from the interpolated render state
+  // (car group position/quaternion), no extra physics reads.
   if (cameraMode === "chase") {
-    const behind = new THREE.Vector3(0, 3.2, -8.5).applyQuaternion(car.quaternion).add(car.position);
+    // Spring-damped chase (the default).
+    const behind = _camA.set(0, 3.2, -8.5).applyQuaternion(car.quaternion).add(car.position);
     camPos.lerp(behind, 1 - Math.exp(-4 * (dtMs / 1000)));
     camera.position.copy(camPos);
     camTarget.lerp(car.position, 0.6);
     camera.lookAt(camTarget.x, camTarget.y + 1.2, camTarget.z);
-  } else {
-    const hood = new THREE.Vector3(0, 1.15, 0.8).applyQuaternion(car.quaternion).add(car.position);
-    const ahead = new THREE.Vector3(0, 0.9, 30).applyQuaternion(car.quaternion).add(car.position);
-    camera.position.copy(hood);
+  } else if (cameraMode === "cockpit") {
+    // Driver eye: looks forward through the halo, nose visible at frame bottom.
+    const eye = _camA.set(0, 0.95, 0.25).applyQuaternion(car.quaternion).add(car.position);
+    const ahead = _camB.set(0, 1.0, 30).applyQuaternion(car.quaternion).add(car.position);
+    camera.position.copy(eye);
     camera.lookAt(ahead);
-    camPos.copy(hood);
+    camPos.copy(eye);
+  } else if (cameraMode === "bumper") {
+    // Nose level, no car in frame — the road rush sells speed.
+    const nose = _camA.set(0, 0.35, 2.3).applyQuaternion(car.quaternion).add(car.position);
+    const ahead = _camB.set(0, 0.45, 32).applyQuaternion(car.quaternion).add(car.position);
+    camera.position.copy(nose);
+    camera.lookAt(ahead);
+    camPos.copy(nose);
+  } else {
+    // TV: stand still on a trackside tripod and pan with the car; hand off to
+    // the next tripod once the car passes this one's track cross-section.
+    if (tvIdx < 0) {
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < tvPoints.length; i++) {
+        const d2 = tvPoints[i].pos.distanceToSquared(car.position);
+        if (d2 < bestD) { bestD = d2; best = i; }
+      }
+      tvIdx = best;
+    }
+    const pt = tvPoints[tvIdx];
+    if (_camA.copy(car.position).sub(pt.gate).dot(pt.dir) > 6) tvIdx = (tvIdx + 1) % tvPoints.length;
+    camera.position.copy(tvPoints[tvIdx].pos);
+    camera.lookAt(car.position);
+    camPos.copy(camera.position);
   }
 
-  // Delight touch: speed-sensitive FOV breathing — 62° at rest widening to
-  // 68° flat-out (~200 km/h), exponentially smoothed so it reads as pace,
-  // never as a zoom cut. One uniform + matrix update; render cost ~zero.
-  fov += (62 + 6 * Math.min(1, curr.speed / 55) - fov) * (1 - Math.exp(-2.5 * (dtMs / 1000)));
+  // Per-seat lens: chase & bumper keep the speed-breathing FOV (62° at rest
+  // widening to 68° flat-out, ~200 km/h) so it reads as pace, never as a zoom
+  // cut; cockpit is a fixed wide 70°; TV is a 45° broadcast lens that squeezes
+  // toward 30° as the car runs away (slight tripod zoom). All exponentially
+  // smoothed; one uniform + matrix update, render cost ~zero.
+  const fovTarget = cameraMode === "cockpit"
+    ? 70
+    : cameraMode === "tv"
+      ? 45 - 15 * Math.min(1, Math.max(0, (camera.position.distanceTo(car.position) - 30) / 90))
+      : 62 + 6 * Math.min(1, curr.speed / 55);
+  fov += (fovTarget - fov) * (1 - Math.exp(-2.5 * (dtMs / 1000)));
   if (Math.abs(camera.fov - fov) > 0.005) {
     camera.fov = fov;
     camera.updateProjectionMatrix();
   }
 
   crumple.update();  // settle crash dents (no-op when the car is undamaged)
-  lighting.update(); // time-of-day blend follows the local clock
+  lighting.update(); // condition blend + sky dome / shadow frustum follow the car
   renderer.render(scene, camera);
 
   // ---- side channels: audio + FFB (read-only on sim state)
@@ -679,12 +762,14 @@ function frame(now) {
   }
 
   // Live delta vs ghost: compare tick counts at equal lap progress. This is
-  // the hero readout — big, centered, green ahead / red behind.
+  // the hero readout — big, centered, timing-tower convention: PURPLE when
+  // ahead of the session-best reference (a downloaded leaderboard ghost),
+  // GREEN when ahead of your own PB ghost, YELLOW when behind either.
   if (ghost && !frozen && countdownMs <= 0 && curr.lapProgress > 0.01) {
     while (deltaPtr < ghost.lapTicks - 1 && ghost.progress[deltaPtr] < curr.lapProgress) deltaPtr++;
     const d = (ticks.length - deltaPtr) / 400;
     $("delta").textContent = `${d >= 0 ? "+" : "−"}${Math.abs(d).toFixed(2)}`;
-    $("delta").className = d >= 0 ? "behind" : "ahead";
+    $("delta").className = d >= 0 ? "behind" : ghost === sessionGhost ? "ahead-session" : "ahead-pb";
   }
 
   if ($("config").style.display === "block") {
@@ -713,7 +798,7 @@ window.__sttr = {
   advance,
   renderOnce: () => frame(performance.now()),
   skipCountdown: () => (countdownMs = 1),
-  info: () => ({ ticks: ticks.length, frozen, invalid, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, ffbNm: sim.ffbTorque() }),
+  info: () => ({ ticks: ticks.length, frozen, invalid, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, camera: cameraMode, ffbNm: sim.ffbTorque() }),
   track: { center: track.center, tangent: track.tangent },
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),

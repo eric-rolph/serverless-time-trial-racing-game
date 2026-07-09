@@ -11,6 +11,11 @@
 //     lighting can boost them at night);
 //   • 3 braking marker boards at 150/100/50 m (60/40/20 samples) before the
 //     tightest corner, striped 3/2/1.
+// APEX "Build the world" layer order, read from the white line outward:
+// white line → kerb → run-off (gravel beds on the two tightest corners,
+// mottled grass elsewhere — see track.js) → barrier (tire stacks on the
+// tightest corners, instanced Armco on the medium ones) → grandstand + crowd
+// (one main stand on the start straight, smaller stands at signature corners).
 import * as THREE from "../vendor/three.module.js";
 import { fnv1a64, smoothedCurvature, KERB_KAPPA } from "./track.js";
 
@@ -89,10 +94,36 @@ export function buildAmbience(track, hash = null) {
     }
   }
 
-  // ------------------------------------------------------------- trees
-  // A candidate 12–25 m off one segment can still sit ON another segment of
-  // the loop (hairpins, straights folding back) — reject anything within
-  // width/2 + 7 m of any centerline sample.
+  // ------------------------------------------- curvature + corner zones
+  // Shared by gravel traps, Armco, tire stacks, brake boards and stands.
+  const kappa = smoothedCurvature(track);
+  // Contiguous |κ| > KERB_KAPPA runs (wrap-aware), ranked tightest-first.
+  const zones = (() => {
+    let a = 0;
+    while (a < n && Math.abs(kappa[a]) > KERB_KAPPA) a++;
+    if (a >= n) return [];
+    const out = [];
+    let runStart = -1;
+    for (let s = 1; s <= n; s++) {
+      const inz = s < n && Math.abs(kappa[(a + s) % n]) > KERB_KAPPA;
+      if (inz && runStart < 0) runStart = s;
+      else if (!inz && runStart >= 0) {
+        let peak = 0, peakIdx = (a + runStart) % n;
+        for (let k = runStart; k < s; k++) {
+          const ii = (a + k) % n;
+          if (Math.abs(kappa[ii]) > peak) { peak = Math.abs(kappa[ii]); peakIdx = ii; }
+        }
+        out.push({ start: (a + runStart) % n, len: s - runStart, peak, peakIdx });
+        runStart = -1;
+      }
+    }
+    out.sort((p, q) => q.peak - p.peak);
+    return out;
+  })();
+
+  // A point 10–25 m off one segment can still sit ON another segment of the
+  // loop (hairpins, straights folding back) — reject anything within
+  // width/2 + 7 m of any centerline sample. Used by trees and stands.
   const clearOfTrack = (p) => {
     for (let i = 0; i < n; i += 2) {
       const c = track.center[i];
@@ -102,6 +133,127 @@ export function buildAmbience(track, hash = null) {
     }
     return true;
   };
+
+  // ------------------------------------------- grandstands + crowd
+  // Placed BEFORE the trees so tree candidates inside a stand footprint can
+  // be culled. One main tiered stand along the start straight (sample 0) +
+  // up to 3 smaller stands at the signature (tightest) corners. All boxes go
+  // through two InstancedMeshes (grey structure, carbon-dark roofs); the
+  // crowd is one merged quad mesh with a shared random-pixel canvas texture.
+  const standFootprints = []; // {x, z, r} — tree exclusion circles
+  {
+    const upY = new THREE.Vector3(0, 1, 0);
+    const STEP_H = 0.55, STEP_D = 1.3;
+    const standDefs = [];
+    const tryStand = (i0, out, L, tiers, dist) => {
+      const f = frame(i0);
+      const th = f.t.clone().setY(0).normalize();
+      const sh = new THREE.Vector3().crossVectors(upY, th).normalize();
+      const base = f.c.clone().addScaledVector(sh, out * dist);
+      base.y = groundY;
+      const depth = tiers * STEP_D + 2.5;
+      for (const [dl, dd] of [[0, 0], [-L / 2, 0], [L / 2, 0], [0, depth]]) {
+        const p = base.clone().addScaledVector(th, dl).addScaledVector(sh, out * dd);
+        if (!clearOfTrack(p)) return false;
+      }
+      standDefs.push({ base, th, sh, out, L, tiers });
+      standFootprints.push({
+        x: base.x + sh.x * out * depth / 2, z: base.z + sh.z * out * depth / 2,
+        r: Math.hypot(L / 2, depth / 2) + 2,
+      });
+      return true;
+    };
+    // Main grandstand: sized to the flat run around sample 0 (start straight).
+    let run = 1;
+    while (run < 15 && Math.abs(kappa[run % n]) < 0.008 && Math.abs(kappa[(n - run) % n]) < 0.008) run++;
+    const mainL = Math.max(30, Math.min(72, run * 2 * 2.5 * 0.8));
+    const d0 = track.width[0] / 2 + 11;
+    tryStand(0, 1, mainL, 5, d0) || tryStand(0, -1, mainL, 5, d0);
+    // Smaller stands at the tightest corners, on the outside past the run-off.
+    let small = 0;
+    for (const z of zones) {
+      if (small >= 3) break;
+      if (z.len < 4) continue;
+      if (tryStand(z.peakIdx, -insideSign(z.peakIdx), 16, 3, track.width[z.peakIdx] / 2 + 15)) small++;
+    }
+    if (standDefs.length) {
+      const structXf = [], roofXf = [];
+      const crowdPos = [], crowdUv = [], crowdIdx = [];
+      for (const sd of standDefs) {
+        const { base, th, sh, out, L, tiers } = sd;
+        const q = new THREE.Quaternion().setFromRotationMatrix(
+          new THREE.Matrix4().makeBasis(th, upY, new THREE.Vector3().crossVectors(th, upY)));
+        const at = (dAlong, dOut, y) =>
+          base.clone().addScaledVector(th, dAlong).addScaledVector(sh, out * dOut).setY(base.y + y);
+        for (let k = 0; k < tiers; k++) { // solid steps rising away from track
+          const h = (k + 1) * STEP_H;
+          structXf.push({ p: at(0, k * STEP_D + STEP_D / 2, h / 2), q, s: new THREE.Vector3(L, h, STEP_D) });
+        }
+        const wallH = tiers * STEP_H + 1.4; // back wall
+        structXf.push({ p: at(0, tiers * STEP_D + 0.25, wallH / 2), q, s: new THREE.Vector3(L, wallH, 0.5) });
+        const roofY = tiers * STEP_H + 2.6; // front roof posts
+        for (const dl of [-L / 2 + 0.4, L / 2 - 0.4]) {
+          structXf.push({ p: at(dl, 0.3, roofY / 2), q, s: new THREE.Vector3(0.22, roofY, 0.22) });
+        }
+        roofXf.push({ // carbon-dark slab with a slight front overhang
+          p: at(0, tiers * STEP_D / 2 - 0.4, roofY + 0.09), q,
+          s: new THREE.Vector3(L + 1.2, 0.18, tiers * STEP_D + 2.0),
+        });
+        // crowd band: one inclined quad laid over the steps
+        const vbase = crowdPos.length / 3;
+        for (const [dOut, y] of [[0.25, STEP_H + 0.35], [(tiers - 1) * STEP_D + 0.9, tiers * STEP_H + 0.4]]) {
+          for (const dl of [-L / 2, L / 2]) {
+            const p = at(dl, dOut, y);
+            crowdPos.push(p.x, p.y, p.z);
+          }
+        }
+        const rep = L / 24; // one texture repeat / 24 m of seating
+        crowdUv.push(0, 0, rep, 0, 0, 1, rep, 1);
+        crowdIdx.push(vbase, vbase + 1, vbase + 2, vbase + 1, vbase + 3, vbase + 2);
+      }
+      const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+      const m4 = new THREE.Matrix4();
+      const structMesh = new THREE.InstancedMesh(boxGeo,
+        new THREE.MeshStandardMaterial({ color: 0x767e88, roughness: 0.85, metalness: 0.1 }),
+        structXf.length);
+      structXf.forEach((xf, k) => { m4.compose(xf.p, xf.q, xf.s); structMesh.setMatrixAt(k, m4); });
+      const roofMesh = new THREE.InstancedMesh(boxGeo,
+        new THREE.MeshStandardMaterial({ color: 0x14171c, roughness: 0.55, metalness: 0.35 }),
+        roofXf.length);
+      roofXf.forEach((xf, k) => { m4.compose(xf.p, xf.q, xf.s); roofMesh.setMatrixAt(k, m4); });
+      // Crowd texture: random colored pixel blobs in seat rows — reads as
+      // people from track distance. Shared by every stand. Emissive: none.
+      const cvs = document.createElement("canvas");
+      cvs.width = 192; cvs.height = 64;
+      const g2d = cvs.getContext("2d");
+      g2d.fillStyle = "#171b21";
+      g2d.fillRect(0, 0, 192, 64);
+      const cols = ["#c8ccd4", "#8f3d3d", "#3d5c8f", "#c2a23a", "#3f7a55",
+        "#7a4f8f", "#22e0d0", "#b8352b", "#d9dde2", "#37516e"];
+      for (let y = 2; y < 62; y += 4) {
+        for (let x = 1; x < 190; x += 3) {
+          if (rand() < 0.82) {
+            g2d.fillStyle = cols[(rand() * cols.length) | 0];
+            g2d.fillRect(x, y, 2, 3);
+          }
+        }
+      }
+      const crowdTex = new THREE.CanvasTexture(cvs);
+      crowdTex.colorSpace = THREE.SRGBColorSpace;
+      crowdTex.wrapS = THREE.RepeatWrapping;
+      crowdTex.magFilter = THREE.NearestFilter;
+      const cg = new THREE.BufferGeometry();
+      cg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(crowdPos), 3));
+      cg.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(crowdUv), 2));
+      cg.setIndex(crowdIdx);
+      cg.computeVertexNormals();
+      const crowdMesh = new THREE.Mesh(cg,
+        new THREE.MeshLambertMaterial({ map: crowdTex, side: THREE.DoubleSide }));
+      group.add(structMesh, roofMesh, crowdMesh);
+    }
+  }
+
+  // ------------------------------------------------------------- trees
   const trees = [];
   for (let i = 0; i < n; i += 4 + ((rand() * 4) | 0)) { // every 10–20 m
     for (const s of [-1, 1]) {
@@ -113,6 +265,8 @@ export function buildAmbience(track, hash = null) {
         .addScaledVector(f.t, (rand() - 0.5) * 4);
       p.y = groundY; // stand on the ground plane (world beyond shoulders is flat)
       if (!clearOfTrack(p)) continue;
+      if (standFootprints.some((fp) =>
+        (p.x - fp.x) * (p.x - fp.x) + (p.z - fp.z) * (p.z - fp.z) < fp.r * fp.r)) continue;
       trees.push({ p, scale: [0.8, 1.0, 1.35][(rand() * 3) | 0], rot: rand() * Math.PI * 2 });
     }
   }
@@ -140,7 +294,6 @@ export function buildAmbience(track, hash = null) {
   // ------------------------------------------- tire-stack barriers
   // Outside of every corner the kerb painter flags (|smoothed κ| > 0.022),
   // one stack (2 cylinders high, alternating red/white) every ~5 m.
-  const kappa = smoothedCurvature(track);
   const stacks = [];
   for (let i = 0; i < n; i += 2) {
     if (Math.abs(kappa[i]) <= KERB_KAPPA) continue;
@@ -166,6 +319,132 @@ export function buildAmbience(track, hash = null) {
       }
     });
     group.add(barrier);
+  }
+
+  // ------------------------------------------- gravel-trap run-off beds
+  // Sandy beds on the OUTSIDE of the two tightest corners. The physics
+  // terrain mesh is untouched — this is a thin visual lid draped over the
+  // shoulder using the terrain's own vertices (rows 0/1 = −side shoulder,
+  // rows 2/3 = +side; trackgen layout v(i,row) = i*4+row), lifted 5 cm.
+  {
+    const pos = [], col = [], gidx = [];
+    const sand = new THREE.Color(0x8a7f63);
+    for (const z of zones.slice(0, 2)) {
+      const out = -insideSign(z.peakIdx);
+      const rIn = out > 0 ? 2 : 1, rOut = out > 0 ? 3 : 0;
+      const i0 = (z.start - 3 + n) % n;
+      const len = Math.min(n, z.len + 6);
+      const vbase = pos.length / 3;
+      const A = new THREE.Vector3(), B = new THREE.Vector3(), u = new THREE.Vector3();
+      for (let s = 0; s < len; s++) {
+        const i = (i0 + s) % n;
+        u.set(track.up[i][0], track.up[i][1], track.up[i][2]);
+        A.fromArray(track.verts, (i * 4 + rIn) * 3);
+        B.fromArray(track.verts, (i * 4 + rOut) * 3);
+        for (const f of [0.05, 0.5, 0.92]) { // 3 columns → mottle across width
+          const p = A.clone().lerp(B, f).addScaledVector(u, 0.05);
+          pos.push(p.x, p.y, p.z);
+          const m = 1 + (rand() - 0.5) * 0.22; // vertex-color grain
+          col.push(sand.r * m, sand.g * m, sand.b * (m + (rand() - 0.5) * 0.1));
+        }
+        if (s) {
+          const a = vbase + (s - 1) * 3, b = vbase + s * 3;
+          for (let k = 0; k < 2; k++) gidx.push(a + k, b + k, a + k + 1, a + k + 1, b + k, b + k + 1);
+        }
+      }
+    }
+    if (pos.length) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pos), 3));
+      g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(col), 3));
+      g.setIndex(gidx);
+      g.computeVertexNormals();
+      group.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+        vertexColors: true, roughness: 1.0, metalness: 0.0, side: THREE.DoubleSide })));
+    }
+  }
+
+  // ------------------------------------------- Armco guardrails
+  // Medium-speed corners (0.011 < |κ| ≤ KERB_KAPPA) get instanced W-profile
+  // steel rail where the tire stacks are NOT (stacks own the tightest
+  // corners). One 2.55 m rail per sample (2.5 m spacing → continuous run) +
+  // one post per rail, 10–14 m off the centerline, following the shoulder
+  // slope. Capped at ~380 rails.
+  {
+    const MED_LO = 0.011;
+    const med = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      const ak = Math.abs(kappa[i]);
+      med[i] = ak > MED_LO && ak <= KERB_KAPPA ? 1 : 0;
+    }
+    // Rails 10–14 m off one segment can clip another part of the loop —
+    // reject against samples more than 14 indices away (own zone excluded).
+    const clearOfOtherLoop = (p, i) => {
+      for (let k = 0; k < n; k += 2) {
+        const raw = Math.abs(k - i);
+        if (Math.min(raw, n - raw) <= 14) continue;
+        const c = track.center[k];
+        const dx = p.x - c[0], dz = p.z - c[2];
+        const r = track.width[k] / 2 + 5;
+        if (dx * dx + dz * dz < r * r) return false;
+      }
+      return true;
+    };
+    const rails = [];
+    for (let i = 0; i < n; i++) {
+      if (!med[i]) continue;
+      // skip blips: require ≥5 consecutive medium samples around i
+      let runLen = 1;
+      for (let d = 1; d < 6 && med[(i + d) % n]; d++) runLen++;
+      for (let d = 1; d < 6 && med[(i - d + n) % n]; d++) runLen++;
+      if (runLen < 5) continue;
+      const out = -insideSign(i);
+      const half = track.width[i] / 2;
+      const d = Math.min(14, Math.max(10, half + 4.5));
+      const f = frame(i);
+      const p = f.c.clone().addScaledVector(f.side, out * d);
+      p.y -= 1.2 * Math.min(1, Math.max(0, (d - half) / 8)); // shoulder drop
+      if (!clearOfOtherLoop(p, i)) continue;
+      rails.push({ p, t: f.t, u: f.u, out });
+    }
+    if (rails.length) {
+      const stride = Math.max(1, Math.ceil(rails.length / 380));
+      const use = stride > 1 ? rails.filter((_, k) => k % stride === 0) : rails;
+      // W-profile cross-section (y up, z toward the track), extruded along x.
+      const prof = [[0.78, 0.0], [0.72, 0.075], [0.655, 0.02], [0.59, 0.075], [0.53, 0.0]];
+      const rp = new Float32Array(prof.length * 2 * 3);
+      prof.forEach(([y, zz], k) => {
+        rp.set([-1.275, y, zz], k * 6);
+        rp.set([1.275, y, zz], k * 6 + 3);
+      });
+      const ridx = [];
+      for (let k = 0; k < prof.length - 1; k++) {
+        ridx.push(2 * k, 2 * k + 1, 2 * k + 2, 2 * k + 2, 2 * k + 1, 2 * k + 3);
+      }
+      const railGeo = new THREE.BufferGeometry();
+      railGeo.setAttribute("position", new THREE.BufferAttribute(rp, 3));
+      railGeo.setIndex(ridx);
+      railGeo.computeVertexNormals();
+      const railMesh = new THREE.InstancedMesh(railGeo, new THREE.MeshStandardMaterial({
+        color: 0x9ca4ad, metalness: 0.75, roughness: 0.4, side: THREE.DoubleSide }), use.length);
+      const postGeo = new THREE.BoxGeometry(0.14, 0.95, 0.1);
+      postGeo.translate(0, 0.32, 0); // sunk slightly, top just under the rail
+      const postMesh = new THREE.InstancedMesh(postGeo, new THREE.MeshStandardMaterial({
+        color: 0x565d66, metalness: 0.4, roughness: 0.6 }), use.length);
+      const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), one = new THREE.Vector3(1, 1, 1);
+      const x = new THREE.Vector3(), zed = new THREE.Vector3(), po = new THREE.Vector3();
+      use.forEach((st, k) => {
+        x.copy(st.t).multiplyScalar(-st.out); // right-handed: x×u = out·side
+        zed.crossVectors(x, st.u);
+        q.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, st.u, zed));
+        m4.compose(st.p, q, one);
+        railMesh.setMatrixAt(k, m4);
+        po.copy(st.p).addScaledVector(zed, -0.06); // post tucked behind rail
+        m4.compose(po, q, one);
+        postMesh.setMatrixAt(k, m4);
+      });
+      group.add(railMesh, postMesh);
+    }
   }
 
   // ------------------------------------------- start/finish gantry (sample 0)

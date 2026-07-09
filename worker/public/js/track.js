@@ -101,12 +101,33 @@ function asphaltTexture() {
 export function buildTrackMeshes(track) {
   const group = new THREE.Group();
 
-  // Terrain (shoulders + surface base) — dark gray, flat shaded.
+  // Terrain (shoulders + surface base) — dark green with subtle per-vertex
+  // grass mottling (APEX §3 run-off variation), deterministic from the track
+  // hash. Kerb rumble verts (appended after the 4-row ribbon) keep the flat
+  // base tone; their visible paint is the red/white overlay below anyway.
   const terrainGeo = new THREE.BufferGeometry();
   terrainGeo.setAttribute("position", new THREE.BufferAttribute(track.verts.slice(), 3));
   terrainGeo.setIndex(new THREE.BufferAttribute(track.tris.slice(), 1));
   terrainGeo.computeVertexNormals();
-  group.add(new THREE.Mesh(terrainGeo, new THREE.MeshLambertMaterial({ color: 0x2d3b31 })));
+  {
+    const vcount = track.verts.length / 3;
+    const colors = new Float32Array(vcount * 3);
+    let s = (Number(fnv1a64(track.bytes) & 0xffffffffn) >>> 0) || 1;
+    const rnd = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32;
+    const base = new THREE.Color(0x2d3b31);
+    for (let v = 0; v < vcount; v++) {
+      if (v < track.S * 4) {
+        const m = (rnd() - 0.5) * 0.16;
+        colors[v * 3] = base.r * (1 + m * 0.7);
+        colors[v * 3 + 1] = base.g * (1 + m);
+        colors[v * 3 + 2] = base.b * (1 + m * 0.5);
+      } else {
+        colors[v * 3] = base.r; colors[v * 3 + 1] = base.g; colors[v * 3 + 2] = base.b;
+      }
+    }
+    terrainGeo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  }
+  group.add(new THREE.Mesh(terrainGeo, new THREE.MeshLambertMaterial({ color: 0xffffff, vertexColors: true })));
 
   // Ribbon (drivable surface) lifted a hair above the terrain to avoid z-fight.
   // Textured: procedural asphalt (noise + aggregate) tiled along arc length.
@@ -189,11 +210,11 @@ export function buildTrackMeshes(track) {
     group.add(new THREE.Mesh(kg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })));
   }
 
-  // Rubbered-in racing line: a translucent dark band that pulls toward each
-  // corner's inside (apex) proportionally to curvature — the worn groove
-  // every used circuit carries. Purely visual.
+  // Racing-line lateral offsets: pull toward each corner's inside (apex)
+  // proportionally to curvature, smoothed so the line sweeps, not zigzags.
+  // Shared by the rubber band and the off-line dust tint below.
+  const lineOff = new Float32Array(n);
   {
-    const LINE_W = 2.3;
     const offs = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       const u = v3(track.up[i]), t = v3(track.tangent[i]);
@@ -203,26 +224,102 @@ export function buildTrackMeshes(track) {
       const pull = Math.min(1, Math.abs(kappa[i]) / 0.02);
       offs[i] = inside * pull * (track.width[i] * 0.5 - 2.0);
     }
-    // smooth the lateral offsets so the line sweeps, not zigzags
-    const sm = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       let sum = 0;
       for (let k = -8; k <= 8; k++) sum += offs[(i + k + n) % n];
-      sm[i] = sum / 17;
+      lineOff[i] = sum / 17;
     }
+  }
+
+  // Braking factor per sample: 1 just before a tight (|κ| > KERB_KAPPA)
+  // corner, easing off over ~30 m (12 samples) — cars travel toward
+  // increasing sample index. Drives the rubber band's width/darkness.
+  const brake = new Float32Array(n);
+  {
+    const LOOK = 12;
+    for (let i = 0; i < n; i++) {
+      for (let d = 0; d <= LOOK; d++) {
+        if (Math.abs(kappa[(i + d) % n]) > KERB_KAPPA) { brake[i] = 1 - d / (LOOK + 2); break; }
+      }
+    }
+    const sm = new Float32Array(n); // soften so the band swells, not steps
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (let k = -3; k <= 3; k++) sum += brake[(i + k + n) % n];
+      sm[i] = sum / 7;
+    }
+    brake.set(sm);
+  }
+
+  // Rubbered-in racing line: a translucent dark band, the worn groove every
+  // used circuit carries. Grip story (APEX §2): into braking zones before
+  // tight corners the band widens, darkens and gains opacity (heavy rubber +
+  // lock-up dust); per-vertex RGBA (itemSize 4 → vertex alpha). Visual only.
+  {
+    const LINE_W = 2.3;
     const lp = new Float32Array(n * 2 * 3);
+    const lc = new Float32Array(n * 2 * 4);
     for (let i = 0; i < n; i++) {
       const c = v3(track.center[i]), u = v3(track.up[i]), t = v3(track.tangent[i]);
       const side = new THREE.Vector3().crossVectors(u, t).normalize();
-      const a = c.clone().addScaledVector(side, sm[i] - LINE_W / 2).addScaledVector(u, 0.065);
-      const b = c.clone().addScaledVector(side, sm[i] + LINE_W / 2).addScaledVector(u, 0.065);
+      const b = brake[i];
+      const w = LINE_W * (1 + 0.5 * b); // up to ~3.45 m wide under braking
+      const a = c.clone().addScaledVector(side, lineOff[i] - w / 2).addScaledVector(u, 0.065);
+      const d = c.clone().addScaledVector(side, lineOff[i] + w / 2).addScaledVector(u, 0.065);
       lp.set([a.x, a.y, a.z], i * 6);
-      lp.set([b.x, b.y, b.z], i * 6 + 3);
+      lp.set([d.x, d.y, d.z], i * 6 + 3);
+      const shade = 1 - 0.4 * b; // darker rubber where braking is heavy
+      const rgba = [0.078 * shade, 0.094 * shade, 0.122 * shade, 0.16 + 0.17 * b];
+      lc.set(rgba, i * 8);
+      lc.set(rgba, i * 8 + 4);
     }
     const lg = new THREE.BufferGeometry();
     lg.setAttribute("position", new THREE.BufferAttribute(lp, 3));
+    lg.setAttribute("color", new THREE.BufferAttribute(lc, 4));
     lg.setIndex(idx);
-    group.add(new THREE.Mesh(lg, new THREE.MeshBasicMaterial({ color: 0x14181f, transparent: true, opacity: 0.20, depthWrite: false, side: THREE.DoubleSide })));
+    const line = new THREE.Mesh(lg, new THREE.MeshBasicMaterial({
+      vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+    line.renderOrder = 2; // over the dust tint
+    group.add(line);
+  }
+
+  // Off-line dust: a very faint lighter tint near each edge — the track is
+  // cleanest on the groove, dusty where nobody runs. Fades out wherever the
+  // racing line sweeps close to that edge (per-vertex alpha).
+  {
+    const dp = new Float32Array(2 * n * 2 * 3);
+    const dc = new Float32Array(2 * n * 2 * 4);
+    const didx = [];
+    [-1, 1].forEach((sign, sideNo) => {
+      const vbase = sideNo * n * 2;
+      for (let i = 0; i < n; i++) {
+        const c = v3(track.center[i]), u = v3(track.up[i]), t = v3(track.tangent[i]);
+        const side = new THREE.Vector3().crossVectors(u, t).normalize();
+        const half = track.width[i] * 0.5;
+        const mid = sign * (half - 1.3);
+        const gap = Math.abs(lineOff[i] - mid);
+        const alpha = 0.07 * Math.min(1, Math.max(0, (gap - 1.4) / 1.6));
+        [sign * (half - 2.1), sign * (half - 0.55)].forEach((lat, e) => {
+          const p = c.clone().addScaledVector(side, lat).addScaledVector(u, 0.058);
+          const v = vbase + i * 2 + e;
+          dp.set([p.x, p.y, p.z], v * 3);
+          dc.set([0.66, 0.68, 0.71, alpha], v * 4);
+        });
+      }
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        didx.push(vbase + 2 * i, vbase + 2 * i + 1, vbase + 2 * j,
+          vbase + 2 * j, vbase + 2 * i + 1, vbase + 2 * j + 1);
+      }
+    });
+    const dg = new THREE.BufferGeometry();
+    dg.setAttribute("position", new THREE.BufferAttribute(dp, 3));
+    dg.setAttribute("color", new THREE.BufferAttribute(dc, 4));
+    dg.setIndex(didx);
+    const dust = new THREE.Mesh(dg, new THREE.MeshBasicMaterial({
+      vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+    dust.renderOrder = 1; // under the racing line
+    group.add(dust);
   }
 
   // Start line + checkpoint gates: thin bright quads across the track.
