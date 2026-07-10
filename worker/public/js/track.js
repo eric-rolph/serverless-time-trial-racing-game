@@ -134,7 +134,14 @@ export function buildTrackMeshes(track) {
   // toward the plain. Kerb rumble verts (appended after ribbon + apron) keep
   // the flat base tone; their visible paint is the red/white overlay anyway.
   const terrainGeo = new THREE.BufferGeometry();
-  terrainGeo.setAttribute("position", new THREE.BufferAttribute(track.verts.slice(), 3));
+  const terrainVerts = track.verts.slice();
+  // Render-only: sink the road-base rows (1, 2) so the crowned ribbon below
+  // never z-fights them. Collision/physics still use the original blob.
+  for (let i = 0; i < track.S; i++) {
+    terrainVerts[(i * 4 + 1) * 3 + 1] -= 0.04;
+    terrainVerts[(i * 4 + 2) * 3 + 1] -= 0.04;
+  }
+  terrainGeo.setAttribute("position", new THREE.BufferAttribute(terrainVerts, 3));
   terrainGeo.setIndex(new THREE.BufferAttribute(track.tris.slice(), 1));
   terrainGeo.computeVertexNormals();
   {
@@ -166,29 +173,38 @@ export function buildTrackMeshes(track) {
   }
   group.add(new THREE.Mesh(terrainGeo, new THREE.MeshLambertMaterial({ color: 0xffffff, vertexColors: true })));
 
-  // Ribbon (drivable surface) lifted a hair above the terrain to avoid z-fight.
-  // Textured: procedural asphalt (noise + aggregate) tiled along arc length.
+  // Ribbon (drivable surface) — rendered to MATCH the physics lateral
+  // profile (road.c): parabolic crown h = −0.025·(lat/half)², so the tires
+  // (which ride the analytic surface) meet the visible asphalt instead of
+  // hovering/sinking. 5 vertex rows across; tiny 5 mm lift (the terrain's
+  // road-base rows are sunk 40 mm above, so no z-fight).
   const n = track.S;
-  const pos = new Float32Array(n * 2 * 3);
-  const uvs = new Float32Array(n * 2 * 2);
+  const ROWS = [-1, -0.5, 0, 0.5, 1]; // lateral fractions of half-width
+  const roadH = (f) => 0.005 - 0.025 * f * f; // height above the sample, along up
+  const R = ROWS.length;
+  const pos = new Float32Array(n * R * 3);
+  const uvs = new Float32Array(n * R * 2);
   let arc = 0;
   for (let i = 0; i < n; i++) {
     const c = v3(track.center[i]), u = v3(track.up[i]), t = v3(track.tangent[i]);
     const side = new THREE.Vector3().crossVectors(u, t).normalize();
     const half = track.width[i] * 0.5;
-    const l = c.clone().addScaledVector(side, -half).addScaledVector(u, 0.05);
-    const r = c.clone().addScaledVector(side, half).addScaledVector(u, 0.05);
-    pos.set([l.x, l.y, l.z], i * 6);
-    pos.set([r.x, r.y, r.z], i * 6 + 3);
     const uAlong = arc / 6; // one texture repeat per 6 m of road
-    uvs.set([uAlong, 0], i * 4);
-    uvs.set([uAlong, 1], i * 4 + 2);
+    for (let r = 0; r < R; r++) {
+      const f = ROWS[r];
+      const p = c.clone().addScaledVector(side, f * half).addScaledVector(u, roadH(f));
+      pos.set([p.x, p.y, p.z], (i * R + r) * 3);
+      uvs.set([uAlong, (f + 1) / 2], (i * R + r) * 2);
+    }
     arc += 2.5;
   }
   const idx = [];
   for (let i = 0; i < n; i++) {
     const j = (i + 1) % n;
-    idx.push(2 * i, 2 * i + 1, 2 * j, 2 * j, 2 * i + 1, 2 * j + 1);
+    for (let r = 0; r < R - 1; r++) {
+      const a = i * R + r, b = i * R + r + 1, c2 = j * R + r, d = j * R + r + 1;
+      idx.push(a, b, c2, c2, b, d);
+    }
   }
   const ribbonGeo = new THREE.BufferGeometry();
   ribbonGeo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
@@ -198,10 +214,10 @@ export function buildTrackMeshes(track) {
   group.add(new THREE.Mesh(ribbonGeo, new THREE.MeshLambertMaterial({ map: asphaltTexture(), side: THREE.DoubleSide })));
 
   // White edge lines — the single biggest readability win at speed.
-  for (const offset of [0, 3]) {
+  for (const row of [0, R - 1]) {
     const edge = new Float32Array((n + 1) * 3);
     for (let i = 0; i <= n; i++) {
-      const src = (i % n) * 6 + offset;
+      const src = ((i % n) * R + row) * 3;
       edge[i * 3] = pos[src];
       edge[i * 3 + 1] = pos[src + 1] + 0.02;
       edge[i * 3 + 2] = pos[src + 2];
@@ -209,6 +225,14 @@ export function buildTrackMeshes(track) {
     const lineGeo = new THREE.BufferGeometry();
     lineGeo.setAttribute("position", new THREE.BufferAttribute(edge, 3));
     group.add(new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xdfe6f0 })));
+  }
+
+  // Two-row strip index for the translucent overlays below (the ribbon's own
+  // index is 5-row now).
+  const stripIdx = [];
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    stripIdx.push(2 * i, 2 * i + 1, 2 * j, 2 * j, 2 * i + 1, 2 * j + 1);
   }
 
   // Kerb visuals: red/white striped strips through tight corners — the
@@ -301,8 +325,12 @@ export function buildTrackMeshes(track) {
       const side = new THREE.Vector3().crossVectors(u, t).normalize();
       const b = brake[i];
       const w = LINE_W * (1 + 0.5 * b); // up to ~3.45 m wide under braking
-      const a = c.clone().addScaledVector(side, lineOff[i] - w / 2).addScaledVector(u, 0.065);
-      const d = c.clone().addScaledVector(side, lineOff[i] + w / 2).addScaledVector(u, 0.065);
+      const halfW = track.width[i] * 0.5;
+      const latA = lineOff[i] - w / 2, latD = lineOff[i] + w / 2;
+      // Follow the crowned road surface (+8 mm so the band sits on the paint).
+      const hA = roadH(latA / halfW) + 0.008, hD = roadH(latD / halfW) + 0.008;
+      const a = c.clone().addScaledVector(side, latA).addScaledVector(u, hA);
+      const d = c.clone().addScaledVector(side, latD).addScaledVector(u, hD);
       lp.set([a.x, a.y, a.z], i * 6);
       lp.set([d.x, d.y, d.z], i * 6 + 3);
       const shade = 1 - 0.4 * b; // darker rubber where braking is heavy
@@ -313,7 +341,7 @@ export function buildTrackMeshes(track) {
     const lg = new THREE.BufferGeometry();
     lg.setAttribute("position", new THREE.BufferAttribute(lp, 3));
     lg.setAttribute("color", new THREE.BufferAttribute(lc, 4));
-    lg.setIndex(idx);
+    lg.setIndex(stripIdx);
     const line = new THREE.Mesh(lg, new THREE.MeshBasicMaterial({
       vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide }));
     line.renderOrder = 2; // over the dust tint
@@ -337,7 +365,7 @@ export function buildTrackMeshes(track) {
         const gap = Math.abs(lineOff[i] - mid);
         const alpha = 0.07 * Math.min(1, Math.max(0, (gap - 1.4) / 1.6));
         [sign * (half - 2.1), sign * (half - 0.55)].forEach((lat, e) => {
-          const p = c.clone().addScaledVector(side, lat).addScaledVector(u, 0.058);
+          const p = c.clone().addScaledVector(side, lat).addScaledVector(u, roadH(lat / half) + 0.004);
           const v = vbase + i * 2 + e;
           dp.set([p.x, p.y, p.z], v * 3);
           dc.set([0.66, 0.68, 0.71, alpha], v * 4);
