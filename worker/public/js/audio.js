@@ -47,6 +47,8 @@ export class EngineAudio {
     this.muted = false;
     this.prevComp = [0, 0, 0, 0];
     this.kerbEnv = 0;
+    this.prevGear = null; // last sim_gear() seen while driving; null re-arms after idle/reset
+    this.duckUntil = 0;   // ctx time until which a shift-cut envelope owns engineDuck
   }
 
   /** Call from any user-gesture handler; idempotent. */
@@ -75,10 +77,16 @@ export class EngineAudio {
     this.engineFilter.frequency.value = 900;
     this.engineGain = ctx.createGain();
     this.engineGain.gain.value = 0.05;
+    // Duck stage in series AFTER engineGain: update() rewrites engineGain
+    // every frame, so shift-cut dips and the limiter stutter get a gain node
+    // of their own that those per-frame writes can never stomp on.
+    this.engineDuck = ctx.createGain();
+    this.engineDuck.gain.value = 1;
     this.osc1.connect(this.engineFilter);
     this.osc2.connect(this.engineFilter);
     this.engineFilter.connect(this.engineGain);
-    this.engineGain.connect(this.master);
+    this.engineGain.connect(this.engineDuck);
+    this.engineDuck.connect(this.master);
     this.osc1.start();
     this.osc2.start();
 
@@ -193,6 +201,47 @@ export class EngineAudio {
     };
   }
 
+  /** Gear-change punctuation (DRIVETRAIN.md §6): ~70 ms engine-gain dip (the
+   *  audible ignition cut) + a mechanical clunk one-shot (short low-passed
+   *  noise burst). Fired from update() when sim_gear() flips — sim_gear
+   *  reports the outgoing gear until engagement, so this lands exactly when
+   *  drive torque returns, right where the rpm step is. No-op before start()
+   *  or while muted. */
+  shiftCut() {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    // Dip rides the dedicated duck stage (update()'s per-frame engineGain
+    // writes can't overwrite a scheduled envelope there).
+    const dg = this.engineDuck.gain;
+    dg.cancelScheduledValues(t);
+    dg.setValueAtTime(dg.value, t);
+    dg.linearRampToValueAtTime(0.15, t + 0.012);
+    dg.setValueAtTime(0.15, t + 0.058);
+    dg.linearRampToValueAtTime(1, t + 0.085);
+    this.duckUntil = t + 0.09; // limiter stutter keeps its hands off until then
+
+    // Clunk: shared noise buffer → 500 Hz lowpass → fast exponential decay.
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = 500;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.22, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+    src.connect(lp);
+    lp.connect(g);
+    g.connect(this.master);
+    src.start(t);
+    src.stop(t + 0.09);
+    src.onended = () => {
+      src.disconnect();
+      lp.disconnect();
+      g.disconnect();
+    };
+  }
+
   /** state: SimStateV1 view {speed, wheels[]}; throttle 0..1; sim: the Sim
    *  wrapper for guarded tireTemp() reads (may be null); dtMs: real frame
    *  time in ms (kerb transient detection is normalized to a 60 Hz frame);
@@ -225,14 +274,35 @@ export class EngineAudio {
       this.osc2.frequency.setTargetAtTime(f * 1.5 + 3, t, 0.05);
       this.engineFilter.frequency.setTargetAtTime(400, t, 0.1);
       this.engineGain.gain.setTargetAtTime(0.03, t, 0.1);
+      this.engineDuck.gain.setTargetAtTime(1, t, 0.05); // release any stutter/dip
+      this.prevGear = null; // reset re-spawns in 1st — don't clunk on GO
       this.front.gain.gain.setTargetAtTime(0, t, 0.04);
       this.rear.gain.gain.setTargetAtTime(0, t, 0.04);
       this.kerb.gain.gain.setTargetAtTime(0, t, 0.03);
       return;
     }
 
-    // Fake RPM from speed with a throttle bump; single-gear kernel.
-    const rpm = 900 + state.speed * 260 + throttle * 600;
+    // Engine pitch: REAL sim_rpm() when the binary exports it (ABI 1.4 —
+    // shift cuts, auto-blips and limiter bounce all arrive through this
+    // number for free); null-guarded fallback to the legacy speed-fake on
+    // old wasm. Real rpm also retires the fake single-gear illusion.
+    const realRpm = sim?.rpm ? sim.rpm() : null;
+    const rpm = realRpm ?? (900 + state.speed * 260 + throttle * 600);
+    if (realRpm !== null) {
+      // Gear change → 70 ms dip + clunk (see shiftCut). prevGear re-arms via
+      // idle so a reset back to 1st stays silent.
+      const gear = sim.gear ? sim.gear() : null;
+      if (gear !== null && this.prevGear !== null && gear !== this.prevGear) this.shiftCut();
+      if (gear !== null) this.prevGear = gear;
+      // Limiter: hard 15 Hz gain stutter while pinned at the redline. The
+      // fuel cut bounces the needle just under 7500 (kernel holds ~7460 max),
+      // so "pinned" = above 7350 with meaningful throttle.
+      if (t >= this.duckUntil) {
+        const pinned = rpm >= 7350 && throttle > 0.5;
+        const gate = Math.floor(t * 30) % 2 === 0; // 30 half-cycles/s = 15 Hz
+        this.engineDuck.gain.setTargetAtTime(pinned && !gate ? 0.08 : 1, t, 0.004);
+      }
+    }
     const f = rpm / 30; // Hz
     this.osc1.frequency.setTargetAtTime(f, t, 0.02);
     this.osc2.frequency.setTargetAtTime(f * 1.5 + 3, t, 0.02);

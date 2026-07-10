@@ -137,7 +137,7 @@ int main( void )
 		float ft, fs;
 		for ( int k = 0; k < 16000; ++k ) // 10 s: fully settled
 		{
-			vehicle_suspension_step( &w, hit_dist0, 0.0f, GRAVITY, SUB_DT, &ft, &fs );
+			vehicle_suspension_step( &w, hit_dist0, 0.0f, GRAVITY, 0.0f, SUB_DT, &ft, &fs );
 		}
 		float travel_settle = w.travel;
 
@@ -150,7 +150,7 @@ int main( void )
 		float pk_v = 0.0f;
 		for ( int k = 0; k < N_REC; ++k )
 		{
-			vehicle_suspension_step( &w, hit_dist1, 0.0f, GRAVITY, SUB_DT, &ft, &fs );
+			vehicle_suspension_step( &w, hit_dist1, 0.0f, GRAVITY, 0.0f, SUB_DT, &ft, &fs );
 			vel[k] = fabsf( w.travel_vel );
 			if ( vel[k] > pk_v )
 			{
@@ -186,7 +186,7 @@ int main( void )
 		WheelRuntime w2 = w;
 		for ( int k = 0; k < 16000; ++k )
 		{
-			vehicle_suspension_step( &w2, hit_dist1, 0.0f, GRAVITY, SUB_DT, &ft, &fs );
+			vehicle_suspension_step( &w2, hit_dist1, 0.0f, GRAVITY, 0.0f, SUB_DT, &ft, &fs );
 		}
 		float travel_eq2 = w2.travel;
 		float offset0 = fabsf( travel_settle - travel_eq2 );
@@ -196,11 +196,11 @@ int main( void )
 		w3.travel = REST_LENGTH;
 		for ( int k = 0; k < 16000; ++k )
 		{
-			vehicle_suspension_step( &w3, hit_dist0, 0.0f, GRAVITY, SUB_DT, &ft, &fs );
+			vehicle_suspension_step( &w3, hit_dist0, 0.0f, GRAVITY, 0.0f, SUB_DT, &ft, &fs );
 		}
 		for ( int k = 0; k < 480; ++k ) // 300 ms
 		{
-			vehicle_suspension_step( &w3, hit_dist1, 0.0f, GRAVITY, SUB_DT, &ft, &fs );
+			vehicle_suspension_step( &w3, hit_dist1, 0.0f, GRAVITY, 0.0f, SUB_DT, &ft, &fs );
 		}
 		float offset300 = fabsf( w3.travel - travel_eq2 );
 

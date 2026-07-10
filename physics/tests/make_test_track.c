@@ -50,9 +50,10 @@ static void wr_f32( Writer* w, float v )
 	wr( w, &v, 4 );
 }
 
-uint8_t* make_test_track( size_t* out_len )
+uint8_t* make_test_track_ex( size_t* out_len, float rx, float rz, uint32_t samples, float width,
+							 float terrain_half )
 {
-	const uint32_t S = TT_SAMPLES;
+	const uint32_t S = samples;
 	const uint32_t C = TT_CHECKPOINTS;
 	const uint32_t V = 2 * S;
 	const uint32_t T = 2 * S;
@@ -63,6 +64,18 @@ uint8_t* make_test_track( size_t* out_len )
 	{
 		return NULL;
 	}
+
+	// Cached tangents/sides for the terrain strip (heap: S is caller-chosen).
+	float* px = (float*)malloc( sizeof( float ) * 4 * (size_t)S );
+	if ( px == NULL )
+	{
+		free( blob );
+		return NULL;
+	}
+	float* pz = px + S;
+	float* sx = px + 2 * (size_t)S;
+	float* sz = px + 3 * (size_t)S;
+	float tx0 = 0.0f, tz0 = 1.0f;
 
 	Writer w = { blob, 0 };
 
@@ -75,19 +88,15 @@ uint8_t* make_test_track( size_t* out_len )
 	wr_u32( &w, V );
 	wr_u32( &w, T );
 
-	// Centerline samples + cached tangents/sides for the terrain strip
-	static float px[TT_SAMPLES], pz[TT_SAMPLES], sx[TT_SAMPLES], sz[TT_SAMPLES];
-	static float tx0, tz0;
-
 	for ( uint32_t i = 0; i < S; ++i )
 	{
 		double theta = ( 2.0 * 3.14159265358979323846 * (double)i ) / (double)S;
-		float pos_x = (float)( TT_RX * sin( theta ) );
-		float pos_z = (float)( TT_RZ * cos( theta ) );
+		float pos_x = (float)( rx * sin( theta ) );
+		float pos_z = (float)( rz * cos( theta ) );
 
 		// Tangent (direction of travel, increasing i)
-		double dx = TT_RX * cos( theta );
-		double dz = -TT_RZ * sin( theta );
+		double dx = rx * cos( theta );
+		double dz = -rz * sin( theta );
 		double tl = sqrt( dx * dx + dz * dz );
 		float tan_x = (float)( dx / tl );
 		float tan_z = (float)( dz / tl );
@@ -115,7 +124,7 @@ uint8_t* make_test_track( size_t* out_len )
 		wr_f32( &w, tan_x ); // tangent
 		wr_f32( &w, 0.0f );
 		wr_f32( &w, tan_z );
-		wr_f32( &w, TT_WIDTH );
+		wr_f32( &w, width );
 	}
 
 	// Checkpoint sample indices (ascending)
@@ -126,12 +135,12 @@ uint8_t* make_test_track( size_t* out_len )
 	// Terrain vertices: [2i] = left edge, [2i+1] = right edge
 	for ( uint32_t i = 0; i < S; ++i )
 	{
-		wr_f32( &w, px[i] - TT_TERRAIN_HALF * sx[i] );
+		wr_f32( &w, px[i] - terrain_half * sx[i] );
 		wr_f32( &w, 0.0f );
-		wr_f32( &w, pz[i] - TT_TERRAIN_HALF * sz[i] );
-		wr_f32( &w, px[i] + TT_TERRAIN_HALF * sx[i] );
+		wr_f32( &w, pz[i] - terrain_half * sz[i] );
+		wr_f32( &w, px[i] + terrain_half * sx[i] );
 		wr_f32( &w, 0.0f );
-		wr_f32( &w, pz[i] + TT_TERRAIN_HALF * sz[i] );
+		wr_f32( &w, pz[i] + terrain_half * sz[i] );
 	}
 
 	// Terrain triangles: quad per segment (wraps), wound so normals face +Y.
@@ -145,12 +154,12 @@ uint8_t* make_test_track( size_t* out_len )
 		// up = +Y, (l0, l1, r0) and (r0, l1, r1) give upward-facing normals
 		// when the loop runs clockwise viewed from +Y; flip check below keeps
 		// it robust for either travel direction.
-		float ax = px[i] - TT_TERRAIN_HALF * sx[i];
-		float az = pz[i] - TT_TERRAIN_HALF * sz[i];
-		float bx = px[j] - TT_TERRAIN_HALF * sx[j];
-		float bz = pz[j] - TT_TERRAIN_HALF * sz[j];
-		float cx = px[i] + TT_TERRAIN_HALF * sx[i];
-		float cz = pz[i] + TT_TERRAIN_HALF * sz[i];
+		float ax = px[i] - terrain_half * sx[i];
+		float az = pz[i] - terrain_half * sz[i];
+		float bx = px[j] - terrain_half * sx[j];
+		float bz = pz[j] - terrain_half * sz[j];
+		float cx = px[i] + terrain_half * sx[i];
+		float cz = pz[i] + terrain_half * sz[i];
 		// normal.y of cross(b-a, c-a) for y-flat triangles: (bz-az)(cx-ax) - (bx-ax)(cz-az)
 		float ny = ( bz - az ) * ( cx - ax ) - ( bx - ax ) * ( cz - az );
 
@@ -180,6 +189,12 @@ uint8_t* make_test_track( size_t* out_len )
 	wr_f32( &w, (float)atan2( (double)tx0, (double)tz0 ) );
 	wr_f32( &w, 0.0f ); // reserved
 
+	free( px );
 	*out_len = w.off;
 	return blob;
+}
+
+uint8_t* make_test_track( size_t* out_len )
+{
+	return make_test_track_ex( out_len, TT_RX, TT_RZ, TT_SAMPLES, TT_WIDTH, TT_TERRAIN_HALF );
 }

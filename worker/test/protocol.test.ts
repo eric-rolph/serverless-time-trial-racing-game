@@ -48,9 +48,15 @@ describe("parseLapLog", () => {
     expect(() => parseLapLog(buf)).toThrow(/length/);
   });
 
+  it("accepts handbrake + shift flag bits (0-2)", () => {
+    const buf = buildLog(3);
+    new DataView(buf).setUint16(26, 0x0007, true);
+    expect(() => parseLapLog(buf)).not.toThrow();
+  });
+
   it("rejects reserved flag bits", () => {
     const buf = buildLog(3);
-    new DataView(buf).setUint16(26, 0x0002, true);
+    new DataView(buf).setUint16(26, 0x0008, true);
     expect(() => parseLapLog(buf)).toThrow(/reserved/);
   });
 });

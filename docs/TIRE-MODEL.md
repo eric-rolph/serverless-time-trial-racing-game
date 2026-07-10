@@ -128,3 +128,27 @@ archetype track: 65.4 s → 57.6 s at its original target pace.
 - Slip-angle/-ratio fields in SimStateV1 keep their meaning.
 - Physics change ⇒ new binary ⇒ new lap times; the leaderboard rotates with
   the next track seed at deploy.
+
+## 6. Drivetrain-wave addendum (2026-07-09, docs/DRIVETRAIN.md §5)
+
+Two additions to the tire pipeline, implemented in `physics/src/vehicle.c`
+and gated in `tests/test_tire.c`:
+
+- **Load sensitivity** inside `vehicle_brush_patch_mu`:
+  `μ_s(Fz) = μ_s0 · clamp(1 − k_load·(Fz − Fz0)/Fz0, 0.70, 1.15)` with
+  `k_load = 0.07`. At `Fz == Fz0` the factor is exactly 1.0f (IEEE identity),
+  so all reference-load sweeps in §4.3 are bit-identical. A ±1.5 kN
+  transferring axle pair now makes ~1.2 % less total peak force than the
+  untransferred pair — roll stiffness distribution became a real balance
+  lever (that is the ARBs' whole point).
+- **Slip relaxation** (`vehicle_slip_relax`, per-wheel state
+  `sigma_x_rel`/`sigma_y_rel` in WheelRuntime): first-order lag on the slip
+  vector fed to the patch, `τ = min(L/|v|, 50 ms)` with `L = 0.3 m`,
+  integrated at the 1600 Hz substep. Step-input force builds over ~L/v and
+  converges to the unrelaxed steady state within 0.5 % (measured: ~5τ);
+  exported slip_ratio/slip_angle stay the RAW kinematic values.
+- **Patch grip re-tune**: `brush_mu_s` 1.48 → 1.55 (patch-level peak
+  1.023 → 1.071·μ_s0·Fz0, still inside the §4.3 [0.95, 1.10] gate). The
+  load sensitivity above costs ~3–5 % of in-situ grip under lateral
+  transfer; DRIVETRAIN.md §5 mandates a balance re-tune to a 1.05–1.10 g
+  skidpad and this is the knob that keeps the §4.3 gates green.

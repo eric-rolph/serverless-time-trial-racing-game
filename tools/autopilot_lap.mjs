@@ -8,7 +8,15 @@
 //   node tools/autopilot_lap.mjs --wasm physics/out/sim.wasm \
 //     --track assets/tracks/dev/track.bin [--out lap.laplog] \
 //     [--submit wss://sttr-referee.<acct>.workers.dev/api/submit] [--name bot]
-//     [--max-seconds 180] [--target-speed 22]
+//     [--max-seconds 180] [--target-speed 22] [--verify-replay]
+//
+// Auto-shift (DRIVETRAIN.md §6): each tick reads sim_rpm() and emits input
+// flags bit 1 (shift up, 0x2) at >= 7000 rpm / bit 2 (shift down, 0x4) at
+// <= 3000 rpm, with hysteresis and a minimum 200-tick gap between requests;
+// never both in the same tick. The bits are written into the LOGGED tick
+// records — the log IS the input, so replays stay bit-honest. On a wasm
+// without the ABI 1.4 sim_rpm/sim_gear exports the flags stay 0 (identical
+// behavior to the pre-drivetrain tool).
 
 import { readFileSync, writeFileSync } from "node:fs";
 
@@ -115,6 +123,51 @@ function control(st) {
 
 const q16 = (v, lo, hi, scale) => Math.max(lo, Math.min(hi, Math.round(v * scale)));
 
+// ---------------------------------------------------------------- auto-shift
+// DRIVETRAIN.md §6. Null-guarded: pre-ABI-1.4 binaries have no sim_rpm/
+// sim_gear and get flags = 0 every tick, i.e. exactly the old behavior.
+const rpmFn = typeof sim.sim_rpm === "function" ? sim.sim_rpm : null;
+const gearFn = typeof sim.sim_gear === "function" ? sim.sim_gear : null;
+const UP_RPM = 7000; // shift-up request threshold
+const DOWN_RPM = 3000; // shift-down request threshold
+const HYST_RPM = 300; // re-arm band: must retreat this far past the threshold
+const SHIFT_GAP_TICKS = 200; // minimum ticks between any two shift requests
+const FLAG_UP = 0x2, FLAG_DOWN = 0x4; // CONTRACTS §2 flag bits 1 / 2
+let lastShiftTick = -SHIFT_GAP_TICKS;
+let upArmed = true, downArmed = true;
+let upRequests = 0, downRequests = 0;
+const gearTicks = [0, 0, 0, 0, 0, 0, 0]; // [R,1..6] time-in-gear histogram
+
+function shiftFlags(t) {
+  if (!rpmFn) return 0;
+  const rpm = rpmFn();
+  // sim_gear() is the same ABI revision as sim_rpm(); if it were somehow
+  // absent, gear=1 keeps the reverse guard engaged (no downshifts).
+  const gear = gearFn ? gearFn() : 1;
+  if (gear >= 0 && gear <= 6) gearTicks[gear]++;
+  // Hysteresis: a threshold crossing only re-arms after rpm retreats 300 rpm
+  // back past it (so bouncing on 7000/3000 cannot machine-gun requests).
+  if (rpm < UP_RPM - HYST_RPM) upArmed = true;
+  if (rpm > DOWN_RPM + HYST_RPM) downArmed = true;
+  if (t - lastShiftTick < SHIFT_GAP_TICKS) return 0;
+  if (rpm >= UP_RPM && upArmed && gear >= 1 && gear < 6) {
+    upArmed = false;
+    lastShiftTick = t;
+    upRequests++;
+    return FLAG_UP;
+  }
+  // gear > 1 guard: at rest the engine idles at 900 rpm (<= 3000) and the
+  // kernel engages REVERSE on a downshift from 1st below 1 m/s — without
+  // this guard the very first tick would put the car in R.
+  if (rpm <= DOWN_RPM && downArmed && gear > 1) {
+    downArmed = false;
+    lastShiftTick = t;
+    downRequests++;
+    return FLAG_DOWN;
+  }
+  return 0; // never both: up wins by construction (sequential returns)
+}
+
 // ---------------------------------------------------------------- drive
 const ticks = [];
 let status = 0;
@@ -126,8 +179,9 @@ for (let t = 0; t < MAX_TICKS; t++) {
   const steer = q16(c.steer + rnd() * 0.0075, -32767, 32767, 32767);
   const throttle = q16(Math.max(0, c.throttle + rnd() * 0.01), 0, 65535, 65535);
   const brake = q16(Math.max(0, c.brake + rnd() * 0.004), 0, 65535, 65535);
-  ticks.push([steer, throttle, brake, 0]);
-  status = sim.sim_step(steer, throttle, brake, 0) >>> 0;
+  const flags = shiftFlags(t);
+  ticks.push([steer, throttle, brake, flags]);
+  status = sim.sim_step(steer, throttle, brake, flags) >>> 0;
   if (status & 0x80000000) throw new Error(`sim error at tick ${t}`);
   if (status & 0x8) throw new Error(`lap invalid at tick ${t} (corner cut)`);
   if (status & 0x2) break;
@@ -145,6 +199,14 @@ const hashHi = BigInt(sim.sim_state_hash_hi() >>> 0);
 const finalHash = (hashHi << 32n) | hashLo;
 const lapTicks = sim.sim_lap_time_ticks();
 console.log(`LAP COMPLETE: ${(lapTicks / 400).toFixed(3)}s over ${ticks.length} ticks, hash=${finalHash.toString(16)}`);
+if (rpmFn) {
+  const names = ["R", "1", "2", "3", "4", "5", "6"];
+  const hist = gearTicks
+    .map((n, g) => (n > 0 ? `${names[g]}:${n} (${((100 * n) / ticks.length).toFixed(1)}%)` : null))
+    .filter(Boolean)
+    .join("  ");
+  console.log(`gears: ${hist}  shifts: ${upRequests} up / ${downRequests} down`);
+}
 
 // ---------------------------------------------------------------- LAPLOG
 const N = ticks.length;
@@ -165,6 +227,25 @@ ldv.setBigUint64(20 + 8 * N, finalHash, true);
 ldv.setUint32(28 + 8 * N, lapTicks, true);
 writeFileSync(OUT, Buffer.from(log));
 console.log(`wrote ${log.byteLength} bytes -> ${OUT}`);
+
+// ---------------------------------------------------------------- verify
+// --verify-replay: reset the same instance and feed the log's tick records
+// through sim_replay() (the validator's path) — final hash must match the
+// step-by-step hash above bit-for-bit.
+if ("verify-replay" in args) {
+  sim.sim_reset();
+  const recPtr = sim.sim_alloc(8 * N);
+  new Uint8Array(sim.memory.buffer, recPtr, 8 * N).set(new Uint8Array(log, 20, 8 * N));
+  const rStatus = sim.sim_replay(recPtr, N) >>> 0;
+  const rHash = (BigInt(sim.sim_state_hash_hi() >>> 0) << 32n) | BigInt(sim.sim_state_hash_lo() >>> 0);
+  const rTicks = sim.sim_lap_time_ticks();
+  if (!(rStatus & 0x2) || rStatus & 0x8 || rHash !== finalHash || rTicks !== lapTicks) {
+    throw new Error(
+      `replay verify FAILED: status=0x${rStatus.toString(16)} hash=${rHash.toString(16)} (want ${finalHash.toString(16)}) lapTicks=${rTicks} (want ${lapTicks})`,
+    );
+  }
+  console.log(`replay verify: OK — sim_replay hash=${rHash.toString(16)} lapTicks=${rTicks} match step run`);
+}
 
 // ---------------------------------------------------------------- sign+submit
 if (args.submit) {

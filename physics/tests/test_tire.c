@@ -71,6 +71,23 @@ static SweepResult sweep( float sigma_x, float t_surf )
 	return r;
 }
 
+// Peak lateral force over the alpha sweep at an arbitrary load.
+static float sweep_at_fz( float sigma_x, float t_surf, float fz )
+{
+	float peak = 0.0f;
+	for ( float alpha = 0.05f; alpha <= 20.0f; alpha += 0.05f )
+	{
+		float sigma_y = tanf( alpha * DEG2RAD );
+		float fx, fy, trail;
+		vehicle_brush_patch( sigma_x, sigma_y, fz, t_surf, &fx, &fy, &trail );
+		if ( fy > peak )
+		{
+			peak = fy;
+		}
+	}
+	return peak;
+}
+
 static float fy_at( float alpha_deg, float t_surf )
 {
 	float fx, fy, trail;
@@ -141,6 +158,74 @@ int main( void )
 		float ratio = cold.peak_fy / warm.peak_fy;
 		printf( "cold (25 C) peak = %.1f N, %.3f of warm peak\n", (double)cold.peak_fy, (double)ratio );
 		CHECK( ratio > 0.89f && ratio < 0.93f, "cold tire grips ~0.91 of warm (thermal floor, skidpad-retuned)" );
+	}
+
+	// --- load sensitivity (docs/DRIVETRAIN.md §5) ---
+	// mu falls with load above Fz0, so a laterally-transferring axle pair
+	// (Fz0 - d, Fz0 + d) makes LESS total force than the untransferred pair.
+	{
+		// +/- 1.5 kN of transfer: what a ~1 g corner moves across an axle.
+		float peak_lo = sweep_at_fz( 0.0f, T_OPT, FZ0 - 1500.0f );
+		float peak_mid = warm.peak_fy;
+		float peak_hi = sweep_at_fz( 0.0f, T_OPT, FZ0 + 1500.0f );
+		float pair = peak_lo + peak_hi;
+		printf( "load sensitivity: peak Fy at 2.0/3.5/5.0 kN = %.1f / %.1f / %.1f N; axle pair %.1f vs %.1f\n",
+				(double)peak_lo, (double)peak_mid, (double)peak_hi, (double)pair, (double)( 2.0f * peak_mid ) );
+		CHECK( peak_hi / ( FZ0 + 1500.0f ) < peak_mid / FZ0, "mu falls with load (normalized peak decreases)" );
+		CHECK( peak_lo / ( FZ0 - 1500.0f ) > peak_mid / FZ0, "mu rises below the reference load" );
+		CHECK( pair < 2.0f * peak_mid * 0.995f, "peak AXLE force decreases under lateral transfer (>= 0.5%)" );
+	}
+
+	// --- slip relaxation (docs/DRIVETRAIN.md §5) ---
+	// Step input at v = 15 m/s: tau = L/v = 0.02 s. The patch force builds
+	// over ~tau and converges to the unrelaxed steady state within 0.5%.
+	{
+		const float V = 15.0f;
+		const float DT = 0.0025f / 4.0f; // 1600 Hz substep
+		const float SIGMA = 0.08f;
+
+		float fx, fy_ss, fy, trail;
+		vehicle_brush_patch( 0.0f, SIGMA, FZ0, T_OPT, &fx, &fy_ss, &trail );
+
+		WheelRuntime w = { 0 };
+		float fy_at_tau = 0.0f;
+		int converged_at = -1;
+		int n_tau = (int)( 0.02f / DT + 0.5f ); // 32 substeps
+		for ( int k = 1; k <= 480; ++k )		// 0.3 s
+		{
+			vehicle_slip_relax( &w, 0.0f, SIGMA, V, DT );
+			vehicle_brush_patch( w.sigma_x_rel, w.sigma_y_rel, FZ0, T_OPT, &fx, &fy, &trail );
+			if ( k == n_tau )
+			{
+				fy_at_tau = fy;
+			}
+			if ( converged_at < 0 && fabsf( fy - fy_ss ) < 0.005f * fy_ss )
+			{
+				converged_at = k;
+			}
+		}
+		printf( "slip relaxation: Fy(tau)/Fy_ss = %.3f, converged to 0.5%% at %.1f tau (final %.1f vs ss %.1f N)\n",
+				(double)( fy_at_tau / fy_ss ), (double)( (float)converged_at / (float)n_tau ), (double)fy,
+				(double)fy_ss );
+		CHECK( fy_at_tau / fy_ss > 0.55f && fy_at_tau / fy_ss < 0.80f,
+			   "step force builds over ~L/v (63%% +/- lag at one tau)" );
+		CHECK( converged_at > 0 && fabsf( fy - fy_ss ) < 0.005f * fy_ss,
+			   "relaxed force converges to the unrelaxed steady state within 0.5%%" );
+
+		// Low-speed clamp: tau caps at 50 ms.
+		WheelRuntime w2 = { 0 };
+		int k63 = -1;
+		for ( int k = 1; k <= 800; ++k ) // 0.5 s
+		{
+			vehicle_slip_relax( &w2, 0.0f, SIGMA, 0.5f, DT );
+			if ( k63 < 0 && w2.sigma_y_rel >= 0.632f * SIGMA )
+			{
+				k63 = k;
+			}
+		}
+		float t63 = (float)k63 * DT;
+		printf( "low-speed relaxation: 63%% at %.4f s (clamp tau_max = 0.05 s)\n", (double)t63 );
+		CHECK( t63 > 0.040f && t63 < 0.060f, "low-speed tau clamps at ~50 ms (not L/v = 0.6 s)" );
 	}
 
 	if ( g_failures != 0 )

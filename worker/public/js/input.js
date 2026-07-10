@@ -8,10 +8,35 @@
 // Browser quirk: a device only appears in navigator.getGamepads() after you
 // interact with it once (press/turn it) — the setup panel says so.
 
+import { cancelButtonCapture, readReportBit, startButtonCapture } from "./hid-input.js";
+
 const CAL_KEY = "sttr-input-cal-v2"; // v1 was single-device; ignored on load
 const STEER_KEY = "sttr-steer-settings"; // {invert, sensitivity}
+const GEARBOX_KEY = "sttr-shift-mode"; // "auto" | "manual" (absent = auto, the default; key shared with the HUD's fallback read)
 
+// Axis channels (per-device analog detect). Shifter buttons ("shiftUp" /
+// "shiftDown") live in the same calibration blob but bind (reportId, byte,
+// bit) via hid-input's capture flow, not an axis.
 export const CHANNELS = ["steer", "throttle", "brake", "handbrake"];
+
+// Input flags bitfield per CONTRACTS §2. The kernel EDGE-DETECTS bits 1/2
+// (DRIVETRAIN.md §1) — the client reports held button state as-is; a rising
+// edge in the log is one shift request.
+const FLAG_HANDBRAKE = 1;
+const FLAG_SHIFT_UP = 2;
+const FLAG_SHIFT_DOWN = 4;
+
+// Client auto-shifter (DRIVETRAIN.md §6): emits the same logged shift bits
+// from sim_rpm()/sim_gear() thresholds — still just input, replay-honest.
+// GEAR_RATIOS mirrors the kernel's table (DRIVETRAIN.md §6.5 item 2; index
+// 1..6, [0] = |reverse|) so a doomed downshift (matched rpm past the kernel's
+// 7800 refuse line) is skipped instead of spamming refused requests.
+const GEAR_RATIOS = [9.8, 9.8, 7.9, 6.06, 4.77, 3.75, 2.95];
+const AUTO_UP_RPM = 7200;
+const AUTO_DOWN_RPM = 3800;
+const AUTO_MATCH_LIMIT_RPM = 7600; // mirror of the kernel's 7800, with margin
+const AUTO_PULSE_S = 0.02; // bit held ~8 ticks — one clean rising edge
+const AUTO_COOLDOWN_S = 0.25; // > the 120 ms downshift engagement; hysteresis
 
 export class Input {
   constructor() {
@@ -31,11 +56,180 @@ export class Input {
     // wheel-axis travel to full car lock. sensitivity 2 = half the physical
     // rotation reaches full lock (for high-rotation-range DD bases).
     this.steerSettings = { invert: false, sensitivity: 1.0, ...JSON.parse(localStorage.getItem(STEER_KEY) ?? "{}") };
+    // Gearbox mode: AUTO by default; mapping a wheel shifter flips the
+    // profile to MANUAL (DRIVETRAIN §6 — wheel users shift for themselves).
+    this.gearAuto = (localStorage.getItem(GEARBOX_KEY) ?? "auto") !== "manual";
+    this.simHandle = null; // attachSim(), or discovered via globalThis.__sttr.sim
+    this.onGearMode = null; // optional hook(msg); default announce = #statusText
+    this.autoPulseBits = 0;
+    this.autoPulseT = 0;
+    this.autoCooldown = 0;
     addEventListener("keydown", (e) => {
       if (e.target.closest?.("input,textarea")) return; // typing in a field, not driving
-      if (!e.repeat) this.keys.add(e.code);
+      if (e.repeat) return;
+      if (e.code === "KeyG") this.setGearMode(!this.gearAuto);
+      this.keys.add(e.code);
     });
     addEventListener("keyup", (e) => this.keys.delete(e.code));
+    this.wireGearPanel();
+  }
+
+  /** Gearbox mode as the HUD consumes it (app.js shiftModeLabel). */
+  get shiftMode() {
+    return this.gearAuto ? "auto" : "manual";
+  }
+
+  /** Give the auto-shifter its rpm/gear source (the live player sim). Falls
+   *  back to the window.__sttr debug handle when never called. */
+  attachSim(sim) {
+    this.simHandle = sim;
+  }
+
+  sim() {
+    return this.simHandle ?? globalThis.__sttr?.sim ?? null;
+  }
+
+  /** Engine rpm — null when unattached or on a pre-1.4 wasm (auto-shifter
+   *  then stays silent; the 1st-gear fallback still drives). */
+  simRpm() {
+    const s = this.sim();
+    if (!s) return null;
+    if (typeof s.rpm === "function") return s.rpm();
+    return s.e?.sim_rpm ? s.e.sim_rpm() : null;
+  }
+
+  /** Current gear (0 = R, 1..6) — null when unavailable. */
+  simGear() {
+    const s = this.sim();
+    if (!s) return null;
+    if (typeof s.gear === "function") return s.gear();
+    return s.e?.sim_gear ? s.e.sim_gear() : null;
+  }
+
+  setGearMode(auto, note) {
+    this.gearAuto = !!auto;
+    localStorage.setItem(GEARBOX_KEY, this.gearAuto ? "auto" : "manual");
+    const box = typeof document !== "undefined" ? document.getElementById("autoGear") : null;
+    if (box) box.checked = this.gearAuto;
+    const msg = note ?? (this.gearAuto ? "gearbox: AUTO — G for manual" : "gearbox: MANUAL — Q down / E up, G for auto");
+    if (this.onGearMode) this.onGearMode(msg);
+    else {
+      const st = typeof document !== "undefined" ? document.getElementById("statusText") : null;
+      if (st) {
+        st.textContent = msg;
+        st.className = "info";
+      }
+    }
+  }
+
+  /** Held shift-button state across all sources: keyboard Q/E, standard-pad
+   *  LB(4)/RB(5), and mapped wheel-shifter HID bits. Momentary state only —
+   *  edge detection is the kernel's job (DRIVETRAIN §1). */
+  readShiftBits(pads) {
+    let up = this.keys.has("KeyE");
+    let down = this.keys.has("KeyQ");
+    const std = pads.find((g) => g.mapping === "standard");
+    if (std) {
+      down ||= std.buttons[4]?.pressed ?? false;
+      up ||= std.buttons[5]?.pressed ?? false;
+    }
+    if (!up && this.cal?.shiftUp) up = readReportBit(this.cal.shiftUp);
+    if (!down && this.cal?.shiftDown) down = readReportBit(this.cal.shiftDown);
+    return (up ? FLAG_SHIFT_UP : 0) | (down ? FLAG_SHIFT_DOWN : 0);
+  }
+
+  /** Auto-gearbox: pulse a shift bit when sim_rpm crosses the thresholds.
+   *  Pure input-side sugar — the pulses land in the same quantized log as a
+   *  human press, so replays are identical by construction. Hysteresis =
+   *  wide up/down gap + a cooldown longer than any shift in progress. */
+  autoShiftBits(dtSec) {
+    this.autoCooldown = Math.max(0, this.autoCooldown - dtSec);
+    if (this.autoPulseT > 0) {
+      this.autoPulseT -= dtSec;
+      return this.autoPulseBits;
+    }
+    if (!this.gearAuto || this.autoCooldown > 0) return 0;
+    const rpm = this.simRpm();
+    const gear = this.simGear();
+    if (rpm === null || gear === null || gear < 1) return 0; // no sim / old wasm / reverse is the driver's call
+    let bits = 0;
+    if (gear < 6 && rpm >= AUTO_UP_RPM) bits = FLAG_SHIFT_UP;
+    else if (
+      gear > 1 &&
+      rpm <= AUTO_DOWN_RPM &&
+      (rpm * GEAR_RATIOS[gear - 1]) / GEAR_RATIOS[gear] <= AUTO_MATCH_LIMIT_RPM
+    ) {
+      bits = FLAG_SHIFT_DOWN;
+    }
+    if (bits) {
+      this.autoPulseBits = bits;
+      this.autoPulseT = AUTO_PULSE_S;
+      this.autoCooldown = AUTO_COOLDOWN_S;
+    }
+    return bits;
+  }
+
+  /** Wire the config-panel gearbox controls this module owns (checkbox +
+   *  shifter capture-to-map buttons). No-ops when the panel isn't in the DOM
+   *  (tests, tools). */
+  wireGearPanel() {
+    if (typeof document === "undefined") return;
+    const $ = (id) => document.getElementById(id);
+    const msg = (t) => {
+      const el = $("calMsg");
+      if (el) el.textContent = t;
+    };
+    const box = $("autoGear");
+    if (box) {
+      box.checked = this.gearAuto;
+      box.addEventListener("change", () => this.setGearMode(box.checked));
+    }
+    const refresh = () => {
+      for (const ch of ["shiftUp", "shiftDown"]) {
+        const label = $(ch === "shiftUp" ? "bindShiftUp" : "bindShiftDown");
+        const btn = $(ch === "shiftUp" ? "mapShiftUp" : "mapShiftDown");
+        const c = this.cal?.[ch];
+        if (label) {
+          label.textContent = c
+            ? `${c.id.replace("WebHID ", "").slice(0, 22)} — report ${c.reportId}, byte ${c.byte}, bit ${c.bit}`
+            : "not bound";
+        }
+        if (btn) btn.textContent = c ? "re-map" : "map";
+      }
+    };
+    this.refreshShiftUI = refresh; // clearCalibration() re-renders through this
+    refresh();
+    const wire = (btnId, ch, name) => {
+      $(btnId)?.addEventListener("click", () => {
+        cancelButtonCapture();
+        clearTimeout(this.mapPromptTimer);
+        clearTimeout(this.mapTimeoutTimer);
+        const ok = startButtonCapture((binding) => {
+          clearTimeout(this.mapPromptTimer);
+          clearTimeout(this.mapTimeoutTimer);
+          this.cal ??= {};
+          this.cal[ch] = binding;
+          localStorage.setItem(CAL_KEY, JSON.stringify(this.cal));
+          refresh();
+          msg(`${name} → "${binding.id.replace("WebHID ", "").slice(0, 22)}" report ${binding.reportId}, byte ${binding.byte}, bit ${binding.bit}`);
+          // A mapped wheel shifter defaults the profile to MANUAL (§6).
+          if (this.gearAuto) this.setGearMode(false, `${name.toLowerCase()} mapped — gearbox now MANUAL (G toggles auto)`);
+        });
+        if (!ok) {
+          msg("no raw-HID devices — click 'add device via raw HID' first, then map");
+          return;
+        }
+        msg("HOLD EVERYTHING STILL…");
+        this.mapPromptTimer = setTimeout(() => msg(`${name}: press it now!`), 750);
+        this.mapTimeoutTimer = setTimeout(() => {
+          if (cancelButtonCapture()) {
+            msg(`${name}: no button press seen — check the device's report count climbs in the line above, then retry`);
+          }
+        }, 6000);
+      });
+    };
+    wire("mapShiftUp", "shiftUp", "MAP UPSHIFT");
+    wire("mapShiftDown", "shiftDown", "MAP DOWNSHIFT");
   }
 
   /** Register a function returning gamepad-shaped objects — WebHID-backed
@@ -140,7 +334,11 @@ export class Input {
   bindingSummary() {
     if (!this.cal) return "no bindings yet";
     return Object.entries(this.cal)
-      .map(([ch, c]) => `${ch}: ${c.id.replace("WebHID ", "").split("(")[0].trim().slice(0, 18)} ax${c.axis}`)
+      .map(([ch, c]) => {
+        const dev = c.id.replace("WebHID ", "").split("(")[0].trim().slice(0, 18);
+        // Axis channel vs shifter-button binding (reportId/byte/bit).
+        return `${ch}: ${dev} ${c.axis !== undefined ? `ax${c.axis}` : `r${c.reportId} b${c.byte}.${c.bit}`}`;
+      })
       .join(" · ");
   }
 
@@ -169,16 +367,23 @@ export class Input {
     return signed ? Math.max(-1, Math.min(1, -n)) : Math.max(0, Math.min(1, n));
   }
 
-  /** Latest sample as floats: steer -1..1, throttle/brake 0..1. */
+  /** Latest sample as floats: steer -1..1, throttle/brake 0..1, plus the
+   *  momentary shift buttons (booleans — quantize() packs them into flags). */
   sample(dtSec) {
     // One navigator.getGamepads() snapshot per tick — threaded through helpers.
     const pads = this.gamepads();
     const s = this.steerSettings;
     const shape = (v) => Math.max(-1, Math.min(1, v * s.sensitivity * (s.invert ? -1 : 1)));
     const kbBrakeTarget = this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0;
-    // Calibrated multi-device rig takes precedence — any bound channel
-    // activates it (unbound channels read 0 / fall back to keys).
-    if (this.cal && Object.keys(this.cal).length > 0) {
+    // Shift bits are path-independent: manual buttons OR the auto-shifter's
+    // pulses (manual presses still work in auto — the kernel arbitrates).
+    const shiftBits = this.readShiftBits(pads) | this.autoShiftBits(dtSec);
+    const shiftUp = (shiftBits & FLAG_SHIFT_UP) !== 0;
+    const shiftDown = (shiftBits & FLAG_SHIFT_DOWN) !== 0;
+    // Calibrated multi-device rig takes precedence — any bound AXIS channel
+    // activates it (unbound channels read 0 / fall back to keys; a lone
+    // shifter binding must not hijack a standard pad's axes).
+    if (this.cal && CHANNELS.some((ch) => this.cal[ch])) {
       const boundIds = new Set(CHANNELS.map((ch) => this.cal?.[ch]?.id).filter(Boolean));
       const present = [...boundIds].filter((id) => this.padById(id, pads)).length;
       // Keyboard stays usable for unbound channels (e.g. steer on keys while
@@ -193,6 +398,8 @@ export class Input {
         // Real pedal passes through untouched; only the keyboard fallback slews.
         brake: rawBrake !== null ? rawBrake : this.slewBrake(kbBrakeTarget, dtSec),
         handbrake: (this.readChannel("handbrake", false, pads) ?? 0) > 0.5 || this.keys.has("Space"),
+        shiftUp,
+        shiftDown,
         device: `rig: ${present}/${boundIds.size} bound device(s) present`,
       };
     }
@@ -205,7 +412,9 @@ export class Input {
         throttle: std.buttons[7]?.value ?? 0,
         brake: std.buttons[6]?.value ?? 0,
         handbrake: std.buttons[0]?.pressed ?? false,
-        device: `${std.id.slice(0, 40)} (standard mapping) — A = handbrake`,
+        shiftUp,
+        shiftDown,
+        device: `${std.id.slice(0, 40)} (standard mapping) — A = handbrake, LB/RB = shift`,
       };
     }
     // Keyboard: slewed steering and brake so it's actually drivable.
@@ -219,6 +428,8 @@ export class Input {
       throttle: this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0,
       brake: this.slewBrake(kbBrakeTarget, dtSec),
       handbrake: this.keys.has("Space"),
+      shiftUp,
+      shiftDown,
       device: pads.length ? `keyboard (${pads.length} device(s) seen — press I to bind)` : "keyboard",
     };
   }
@@ -229,17 +440,20 @@ export class Input {
   }
 
   clearCalibration() {
-    this.cal = null;
+    this.cal = null; // includes shiftUp/shiftDown button bindings
     localStorage.removeItem(CAL_KEY);
+    this.refreshShiftUI?.();
   }
 }
 
-/** Quantize per CONTRACTS §2 — these integers are the canonical truth. */
+/** Quantize per CONTRACTS §2 — these integers are the canonical truth.
+ *  flags: bit 0 = handbrake, bit 1 = shift up, bit 2 = shift down (held
+ *  state; the kernel edge-detects, DRIVETRAIN §1). */
 export function quantize(raw) {
   return {
     steer: Math.max(-32767, Math.min(32767, Math.round(raw.steer * 32767))),
     throttle: Math.max(0, Math.min(65535, Math.round(raw.throttle * 65535))),
     brake: Math.max(0, Math.min(65535, Math.round(raw.brake * 65535))),
-    flags: raw.handbrake ? 1 : 0,
+    flags: (raw.handbrake ? FLAG_HANDBRAKE : 0) | (raw.shiftUp ? FLAG_SHIFT_UP : 0) | (raw.shiftDown ? FLAG_SHIFT_DOWN : 0),
   };
 }

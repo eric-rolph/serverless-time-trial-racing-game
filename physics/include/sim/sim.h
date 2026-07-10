@@ -36,6 +36,12 @@ extern "C" {
 
 // Input flag bits (CONTRACTS §2)
 #define SIM_FLAG_HANDBRAKE 0x0001u
+// Sequential gearbox shift requests (docs/DRIVETRAIN.md §1). The kernel
+// EDGE-DETECTS these: a rising edge (0 -> 1 vs the previous tick) is one
+// shift request; holding the bit does nothing further. Part of the
+// deterministic input log, so replays are bit-honest by construction.
+#define SIM_FLAG_SHIFT_UP 0x0002u
+#define SIM_FLAG_SHIFT_DOWN 0x0004u
 
 // ---------------------------------------------------------------------------
 // SimStateV1 (CONTRACTS §1.2) — packed little-endian, fixed offsets, 200 bytes
@@ -155,6 +161,17 @@ float sim_tire_temp( uint32_t wheel );
 // simulation or hashes (the damage state itself is part of the hashed dynamics,
 // like tire temperature). Added in ABI 1.3 (additive); hosts may ignore.
 float sim_damage( uint32_t component );
+
+// Engine speed in rpm (docs/DRIVETRAIN.md §4) for the HUD / auto-shifter /
+// audio. No loaded world returns 0. Output-only — reads never affect
+// simulation or hashes (engine speed is deterministic dynamics state like
+// tire temperature). Added in ABI 1.4 (additive); hosts may ignore.
+float sim_rpm( void );
+
+// Engaged gear: 0 = reverse, 1..6 forward (docs/DRIVETRAIN.md §4). During a
+// shift the outgoing gear is reported until the new gear engages. No loaded
+// world returns 1 (the spawn gear). Output-only. Added in ABI 1.4 (additive).
+int32_t sim_gear( void );
 
 // Native-test helper (not a wasm export): direct state access.
 const SimStateV1* sim_state( void );

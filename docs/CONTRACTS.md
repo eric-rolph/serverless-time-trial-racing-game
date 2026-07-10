@@ -56,6 +56,14 @@ sim_damage(component: u32) -> f32         // ABI 1.3: deterministic crash damage
                                           // derived purely from the input log, so
                                           // replays stay honest. Output-only read —
                                           // out-of-range/no-world → 0.
+sim_rpm() -> f32                          // ABI 1.4: engine speed (rpm) for HUD/
+                                          // auto-shifter/audio. Output-only; the
+                                          // engine state itself is deterministic
+                                          // dynamics (never hashed directly — it
+                                          // feeds forces). No world → 0.
+sim_gear() -> i32                         // ABI 1.4: engaged gear, 0 = reverse,
+                                          // 1..6. Reports the outgoing gear during
+                                          // a shift. Output-only. No world → 1.
 ```
 
 ### 1.2 `SimStateV1` (packed, little-endian, fixed offsets)
@@ -99,7 +107,11 @@ the client submits it, the validator recomputes it after replay; mismatch ⇒ re
 - `steer`: i16, −32767..32767 ⇒ −1.0..1.0 (full left..full right at max lock)
 - `throttle`: u16, 0..65535 ⇒ 0.0..1.0
 - `brake`: u16, 0..65535 ⇒ 0.0..1.0
-- `flags`: u16 bitfield — bit 0 = handbrake; bits 1–15 reserved (must be 0 in v1)
+- `flags`: u16 bitfield — bit 0 = handbrake; bit 1 = shift up; bit 2 = shift
+  down (docs/DRIVETRAIN.md §1: the kernel EDGE-DETECTS bits 1–2 — a rising
+  edge vs the previous tick is one shift request, holding the bit does nothing
+  further, so replays are bit-honest by construction); bits 3–15 reserved
+  (must be 0)
 
 The client polls hardware at ~1 kHz; each 400 Hz tick consumes the **latest**
 sample, quantizes it, feeds the sim, and appends the quantized record to the log.

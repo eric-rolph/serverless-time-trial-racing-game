@@ -488,8 +488,9 @@ the wasm export surface unchanged.
   which is bit-identical).
 - CI should assert the wasm import list stays ⊆ {emscripten_notify_memory_growth,
   fd_write} so hot-path imports can't sneak back in.
-- Launch acceleration is mild (engine-limited); gear ratio / torque curve are
-  the knobs if the game wants a livelier car.
+- ~~Launch acceleration is mild (engine-limited); gear ratio / torque curve
+  are the knobs if the game wants a livelier car.~~ RESOLVED by the 2026-07-09
+  drivetrain wave (0-100 km/h in 4.96 s with 1st-gear wheelspin).
 
 ## Damage system (Phase 2)
 
@@ -551,3 +552,112 @@ assets/tracks/dev5/track.bin --target-speed 18: **LAP COMPLETE 49.197 s**
 
 Files changed: src/vehicle.h, src/vehicle.c, src/sim.c, include/sim/sim.h,
 build_wasm.sh, CMakeLists.txt, tests/test_damage.c (new).
+
+## Drivetrain & handling wave (2026-07-09, docs/DRIVETRAIN.md — BREAKING)
+
+Deliberate breaking physics change (spec §7 note): sequential 6-speed +
+reverse with edge-detected shift bits, ONE engine state (kills the
+per-rear-wheel private engines), viscous LSD, engine braking, rev limiter,
+implicit low-speed auto-clutch, front-biased brakes (2200/950), tire load
+sensitivity, front/rear anti-roll bars, per-wheel slip relaxation, and the
+ABI 1.4 additive exports `sim_rpm()` / `sim_gear()`. Full deviation list in
+docs/DRIVETRAIN.md §6.5; tire/suspension addenda in those specs.
+
+### Architecture
+
+- vehicle_update was restructured into phase A (per-wheel kinematics/contact/
+  slip inputs, per-tick constants) and phase B (the 1600 Hz substep loop,
+  substep-outer/wheel-inner) because the rear wheels are now COUPLED through
+  the engine + LSD each substep, and left/right through the ARBs. Chassis
+  forces are still the substep MEAN applied once per tick.
+- Drivetrain state lives in Vehicle (engine_omega, gear, shift timers, shock,
+  prev_flags for edge detection) — deterministic vehicle state like tire
+  temps: reset with the car, never hashed directly (gearing scales forces, so
+  divergence would surface in the chassis hash within ticks).
+- Rigid coupling: ω_e = mean rear ω × ratio; rears carry the reflected crank
+  inertia ½·I_e·ratio² each. Shift cut: torque path 0, ω_e free-integrates
+  under engine braking, LSD clamp collapses (open diff). Auto-clutch below
+  1100 rpm coupled speed (spec §1): engine flares to idle+throttle·(4500−idle)
+  rpm, factor floor 0.9, creep throttle 4%; no engine braking through a
+  slipping clutch.
+- Input flags (CONTRACTS §2): bit 1 shift up / bit 2 shift down, RISING-EDGE
+  detected in the kernel (prev_flags in Vehicle); both bits same tick → up
+  wins; requests during a shift dropped; downshift refused above 7800 rpm
+  predicted; 1→R only below |v| = 1 m/s; R→1 any speed.
+
+### Tuning table (kTuning, final)
+
+- Ratios (overall, incl. final drive): R −9.8, then 9.8 / 7.9 / 6.06 / 4.77 /
+  3.75 / 2.95. Redline speeds 95.2 / 118.1 / 154.0 / 195.6 / 248.8 /
+  (316 geared, 272.3 drag-limited measured) km/h.
+- Engine: torque {1000:300, 3000:350, 5000:348, 6500:310, 7500:0} Nm (raised
+  from 220/320/340/300 — deviation 1 in DRIVETRAIN §6.5), I_e 0.15 kg·m²,
+  idle 900 rpm, limiter 7500, overrev guard 7800, engine braking −20 @ idle →
+  −60 Nm @ redline fading out by 10% throttle.
+- Shifts: up cut 28 ticks, down delay 48 ticks, shock 8 ticks @ 1 Nm/(rad/s)
+  of blip snap (cap 400 Nm axle).
+- LSD k = 25 Nm/(rad/s), clamp ±40% of |transmitted|.
+- Brakes 2200 F / 950 R per wheel (was 1600/1050).
+- Load sensitivity k_load 0.07, clamp [0.70, 1.15]·μ_s0; brush_mu_s
+  1.48 → 1.55 (patch peak 1.071·μ_s0·Fz0 — the §5 balance re-tune).
+- Slip relaxation L 0.3 m, τ ≤ 50 ms, at the 1600 Hz substep; relaxed values
+  feed the patch, RAW values are exported (SimStateV1 meaning unchanged).
+- ARBs 20 kN/m front / 14 kN/m rear (on compression difference, per axle).
+- drag_coef 0.42 → 0.37: measured (shift-cut coast probe) ~0.05·v² of
+  rake-parasitic resistance from strut-along-chassis-up + rear squat; total
+  matches the spec's 0.42·v² budget.
+
+### Measured (all gates green)
+
+- test_determinism: native 8000-tick hash `ea76c9a29a62cda3` (was
+  `5ec1a7132b229092` — expected, breaking change), stable across runs.
+- test_vehicle: 0→12.21 m/s in 2 s (was 7.13 — the gearing is the point),
+  oval pursuit lap 29.57 s, all original gates PASS unmodified.
+- test_drivetrain (NEW): ratio table, hold-the-bit = ONE shift, upshift
+  engages after exactly 28 ticks, downshift after exactly 48 with blip snap
+  2951 → 4134 rpm (wheel-matched within 5%), limiter holds 7458 max rpm with
+  speed plateau at the 1st redline, coast decel 0.605 m/s² in 3rd vs 0.330 in
+  6th, LSD direction/conservation/clamp/coast + engine-brake curve units,
+  reverse rule both ways, overrev protection refuse-then-accept, and the
+  CROWN GATE: 16000-tick shift-heavy log (launch → 6th, brake w/ downshifts,
+  reverse shuffle, pull away) recorded via sim_step, re-run via sim_step, and
+  replayed via sim_replay — all three final hashes `cc8a61ad7d3a213d`
+  bit-identical; engine never under 900 rpm.
+- test_tire (extended): load sensitivity (normalized peak falls with load;
+  ±1.5 kN axle pair loses ≥0.5% total peak) and slip relaxation (step force
+  63%-ish at one τ = L/v, converges to the unrelaxed steady state within
+  0.5% by ~5τ; τ clamps at 50 ms at low speed). Patch peak now 3933 N =
+  1.0703·μ_s0·Fz0 at 6.95°, 15° drop 10.2%, all §4.3 gates PASS.
+- harness_launch (NEW): 0–100 km/h in 4.96 s with 1st-gear wheelspin (max
+  rear slip 0.798 transient; launch-control driver holds ~0.15), gear table
+  above, 6th top speed 272.3 km/h measured drag-limited, stop from 29 m/s
+  39.86 m vs pre-wave baseline 41.01 m (−2.8%, gate ±10%) — front-biased
+  brakes now lock fronts first (stable failure mode).
+- harness_skidpad (NEW): warm limit 10.63 m/s² = 1.083 g sustained 2 s at
+  ~25.2 m/s on R = 60 m; mild limit understeer (front 8.99° vs rear 6.91°
+  mean slip); inside wheels stay loaded (min compression 15.8 mm), roll
+  2.83°; rollover threshold 1.473 g with downforce (1.315 g static) > 1.25.
+- test_track_v2: prop crash + parse matrix unchanged; grass-drive input
+  updated (driver lifts to 40% once on grass — full pedal in the geared 1st
+  just lights the rears to the limiter on the 0.55·μ surface), car rolls at
+  1.21 m/s, never falls through.
+- wasm 415 719 bytes; wasm_smoke PASS, step-vs-replay hash
+  **`7acf8c978fae724b`** — the old golden `ea0284163b73636d` is RETIRED
+  (2026-07-09, deliberate breaking physics change per DRIVETRAIN.md; deploys
+  with a track rotation). Exports = previous 14 + `sim_rpm` + `sim_gear`
+  (verified against the previously staged artifact); imports still exactly
+  {emscripten_notify_memory_growth, fd_write}.
+- Autopilot WITHOUT shifting (client-less fallback guarantee): circuit1
+  (assets/tracks/circuit1/track.bin) at --target-speed 18, stuck in 1st:
+  LAP COMPLETE 171.210 s (68 484 ticks), hash `96a77ab7c49b9acc` — vs the
+  171.4 s single-gear baseline. Slow but sound; the client auto-shifter and
+  autopilot shifting (spec §6) are the client wave's work.
+- Staged: worker/assets/sim.wasm + sim_wasm.bin updated to this build.
+
+Files changed: src/vehicle.{h,c}, src/sim.c, include/sim/sim.h,
+build_wasm.sh, CMakeLists.txt, tests/test_drivetrain.c (new),
+tests/harness_launch.c (new), tests/harness_skidpad.c (new),
+tests/test_tire.c (extended), tests/test_suspension.c (f_arb arg),
+tests/test_track_v2.c (grass input), tests/make_test_track.{h,c}
+(make_test_track_ex), docs/CONTRACTS.md (§1.1, §2), docs/DRIVETRAIN.md
+(§6.5), docs/TIRE-MODEL.md (§6), docs/SUSPENSION.md (addendum).

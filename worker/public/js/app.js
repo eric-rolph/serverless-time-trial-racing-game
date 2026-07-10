@@ -177,6 +177,7 @@ async function raceReplay(entry, rank = null) {
 // ---------------------------------------------------------------- game state
 const input = new Input();
 input.setVirtualPads(hidVirtualPads);
+input.attachSim(sim); // auto-gearbox reads sim.rpm()/sim.gear() thresholds (DRIVETRAIN §6)
 // Reopen previously-granted WebHID input devices (permission persists).
 autoReconnectHid().then((n) => {
   if (n) $("calMsg").textContent = `${n} WebHID device(s) reconnected — bindings ready`;
@@ -200,6 +201,20 @@ function tireColor(t) {
   }
   return `hsl(${stops[stops.length - 1][1]} 62% 56%)`;
 }
+// Drivetrain HUD (ABI 1.4): gear numeral, AUTO/MANUAL tag, thin RPM bar.
+// All hidden until the loaded binary exports sim_rpm — old wasm keeps the
+// pre-gearbox HUD exactly as it was.
+const gearEl = $("gear"), shiftModeEl = $("shiftMode"), rpmBarEl = $("rpmBar"), rpmFillEl = $("rpmFill");
+const SHIFT_LIGHT_RPM = 7200; // cyan pulse threshold (DRIVETRAIN.md §6); redline (fuel cut) is 7500
+const RPM_BAR_MAX = 8000;     // bar full scale — the redline tick sits at 7500/8000 = 93.75% (CSS)
+let drivetrainHudOn = false;
+/** AUTO/MANUAL per the shift-mode contract (DRIVETRAIN.md §6.6): prefer the
+ *  input module's live `.shiftMode` ("auto"|"manual") when it exposes one,
+ *  else the persisted localStorage key "sttr-shift-mode" that the input side
+ *  keeps in sync. A missing key means "auto" — the spec's default-ON. */
+const shiftModeLabel = () =>
+  (input.shiftMode ?? localStorage.getItem("sttr-shift-mode") ?? "auto") === "manual" ? "MANUAL" : "AUTO";
+
 const fellOffY = Math.min(...track.center.map((c) => c[1])) - 25;
 let prev = sim.state();
 let curr = prev;
@@ -980,6 +995,27 @@ function frame(now) {
   $("lastVal").textContent = lastMs ? fmtMs(lastMs) : "—";
   minimap.draw(car.position.toArray(), curr.checkpoints);
 
+  // Drivetrain readouts (ABI 1.4, DRIVETRAIN.md §6): gear numeral ('R' for
+  // reverse) beside the speed, thin RPM bar with its redline tick, cyan
+  // shift-light pulse ≥ 7200 rpm, and the quiet AUTO/MANUAL tag. sim.rpm()
+  // is null on pre-1.4 binaries — everything stays hidden.
+  const rpmNow = sim.rpm();
+  if (rpmNow !== null) {
+    if (!drivetrainHudOn) {
+      drivetrainHudOn = true;
+      gearEl.style.display = "inline";
+      shiftModeEl.style.display = "inline";
+      rpmBarEl.style.display = "block";
+    }
+    const g = sim.gear();
+    const gearTxt = g === 0 ? "R" : String(g ?? 1);
+    if (gearEl.textContent !== gearTxt) gearEl.textContent = gearTxt;
+    rpmFillEl.style.width = `${((Math.min(rpmNow, RPM_BAR_MAX) / RPM_BAR_MAX) * 100).toFixed(1)}%`;
+    rpmBarEl.classList.toggle("shift", rpmNow >= SHIFT_LIGHT_RPM);
+    const mode = shiftModeLabel();
+    if (shiftModeEl.textContent !== mode) shiftModeEl.textContent = mode;
+  }
+
   // Tire surface temps (brush-model thermal layer) drive the wheel fills of
   // the car-schematic glyph: cold blue → in-window green → overheated red.
   // Order FL FR RL RR; exact °C on hover.
@@ -1042,7 +1078,7 @@ function frame(now) {
 // pointerdown / gamepad input) starts the full 3-2-1 — and doubles as the
 // AudioContext unlock. Text-only prompt in the reused #countdown element.
 showOverlay(
-  "press any key to start · W/↑ throttle · A/D steer · S/↓ brake · full keys below",
+  "press any key to start · W/↑ throttle · A/D steer · S/↓ brake · Q/E gears · G auto · full keys below",
   { fontSize: "20px" },
 );
 setStatus(
@@ -1059,7 +1095,7 @@ window.__sttr = {
   advance,
   renderOnce: () => frame(performance.now()),
   skipCountdown: () => (countdownMs = 1),
-  info: () => ({ ticks: ticks.length, frozen, invalid, started, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, camera: cameraMode, ffbNm: sim.ffbTorque() }),
+  info: () => ({ ticks: ticks.length, frozen, invalid, started, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, camera: cameraMode, ffbNm: sim.ffbTorque(), rpm: sim.rpm(), gear: sim.gear(), shiftMode: shiftModeLabel() }),
   track: { center: track.center, tangent: track.tangent },
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),

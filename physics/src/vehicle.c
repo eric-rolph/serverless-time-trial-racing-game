@@ -111,11 +111,43 @@ typedef struct VehicleTuning
 	float thermal_t_track; // asphalt temperature (deg C)
 	float thermal_h_track; // surface->track conduction while in contact (1/s)
 
-	// Drivetrain (RWD, fixed single ratio)
-	float gear_ratio;		// engine:wheel
-	float driveline_eff;	// torque efficiency
+	// Drivetrain (RWD, sequential 6-speed + reverse, docs/DRIVETRAIN.md §1-3)
+	float gear_ratios[7];	 // overall engine:wheel ratios; [0] = reverse (< 0), [1..6] forward
+	float driveline_eff;	 // torque efficiency
 	float engine_rpm_pts[5];
 	float engine_trq_pts[5]; // Nm at engine, piecewise-linear lookup
+	float engine_inertia;	 // crank+flywheel inertia (kg m^2), free-spin during shift cuts
+	float idle_omega;		 // 900 rpm floor (rad/s) — the engine never stalls
+	float clutch_omega;		 // below this coupled speed the auto-clutch slips (1100 rpm, rad/s)
+	float clutch_hold_omega; // slipping-clutch engine speed at full throttle (rad/s)
+	float clutch_min;		 // launch floor of the clutch torque factor [0..1]
+	float creep_throttle;	 // minimum effective throttle in the slip zone (idle creep)
+	float limiter_omega;	 // hard fuel cut above this (7500 rpm, rad/s)
+	float overrev_omega;	 // downshift protection ceiling (7800 rpm, rad/s)
+	float eb_torque_idle;	 // engine braking at idle (Nm, negative)
+	float eb_torque_red;	 // engine braking at redline (Nm, negative)
+	float eb_fade_throttle;	 // engine braking fades to zero by this throttle
+	float k_lsd;			 // viscous LSD coupling (Nm per rad/s of wheel speed difference)
+	float lsd_clamp_frac;	 // LSD transfer clamp as a fraction of |transmitted torque|
+	float shock_k;			 // downshift driveline shock: axle Nm per rad/s of rev-match snap
+	float shock_max;		 // shock torque cap (Nm at the axle)
+
+	// Anti-roll bars (docs/DRIVETRAIN.md §5): F = k_arb * (c_this - c_other)
+	// added to the strut force per corner — pure roll-moment redistribution
+	// (equal and opposite left/right), meaningful through tire load sensitivity.
+	float arb_front; // N per m of left/right spring-compression difference
+	float arb_rear;
+
+	// Tire load sensitivity (docs/DRIVETRAIN.md §5):
+	// mu_s(Fz) = mu_s0 * clamp(1 - k_load * (Fz - Fz0)/Fz0, lo, hi).
+	float k_load;
+	float load_clamp_lo;
+	float load_clamp_hi;
+
+	// Slip relaxation (docs/DRIVETRAIN.md §5): first-order lag on the slip
+	// vector, tau = L/|v| clamped at low speed, at the 1600 Hz substep.
+	float relax_len;	 // relaxation length L (m)
+	float relax_tau_max; // tau clamp at low speed (s)
 
 	// Brakes
 	float brake_torque_front; // Nm per front wheel at full brake
@@ -138,7 +170,12 @@ static const VehicleTuning kTuning = {
 	.half_extent_z = 2.2f,
 	.mass = 1350.0f,
 
-	.drag_coef = 0.42f,
+	// Effective aero coefficient tuned so the TOTAL resistance matches the
+	// spec's 0.42 v^2 budget (docs/DRIVETRAIN.md §1): the quarter-car applies
+	// strut forces along chassis-up, so rear squat under downforce leaks
+	// ~0.05 v^2 of the support force into the horizontal (measured 185 N at
+	// 63 m/s via a shift-cut coast). 0.37 + 0.05 = the spec's 0.42.
+	.drag_coef = 0.37f,
 	.aero_cl_front = 1.1f,
 	.aero_cl_rear = 1.4f,
 
@@ -175,7 +212,13 @@ static const VehicleTuning kTuning = {
 	.brush_cp = 7.0e6f,
 	.brush_a0 = 0.075f,
 	.brush_fz0 = 3500.0f,
-	.brush_mu_s = 1.48f,
+	// 1.48 (patch peak 1.02 x mu_s0 x Fz0) until the drivetrain wave; the
+	// docs/DRIVETRAIN.md §5 load sensitivity costs ~3-5% of in-situ grip
+	// under transfer, so the §5 balance re-tune raises the bristle level to
+	// keep the car in the mandated 1.05-1.10 g skidpad window. Patch peak is
+	// now 1.071 x mu_s0 x Fz0 — still inside TIRE-MODEL.md §4.3's
+	// [0.95, 1.10] gate (verified in test_tire).
+	.brush_mu_s = 1.55f,
 	.brush_mu_k_ratio = 0.65f,
 	.max_load = 9000.0f,
 	.slip_v_min = 0.8f,
@@ -197,13 +240,49 @@ static const VehicleTuning kTuning = {
 	// Wheel-pipeline sub-stepping (docs/ROAD-SURFACE.md §3): fixed 4 inner
 	// steps of SIM_DT/4 (1600 Hz) — see SIM_TIRE_SUBSTEPS below.
 
-	.gear_ratio = 8.2f,
+	// Ratios refined against the torque curve (docs/DRIVETRAIN.md §1): 1st tops
+	// 95.2 km/h at the 7500 rpm limiter (785.4/9.8 * 0.33 m); 2nd is kept
+	// close (8.2, tops 114 km/h) so the 0-100 sprint stays in the meat of the
+	// curve; ~0.79 steps down to 6th = 2.95, whose drag-limited top lands at
+	// ~271 km/h (redline speed 316 km/h is never reached: past ~6500 rpm the
+	// curve dives under the 0.42 v^2 resistance budget). Reverse = -1st.
+	.gear_ratios = { -9.8f, 9.8f, 7.9f, 6.06f, 4.77f, 3.75f, 2.95f },
 	.driveline_eff = 0.90f,
+	// Torque curve: low/mid end raised in the drivetrain wave so drive force
+	// EXCEEDS rear grip through 1st (spec §1: launch wheelspin available) —
+	// the old 220/320 low end was tuned for the single 8.2:1 ratio and left
+	// the geared car torque-limited below 4500 rpm. Peak power is unchanged
+	// (~204 kW at 6500), so the drag-limited top speed is intact.
 	.engine_rpm_pts = { 1000.0f, 3000.0f, 5000.0f, 6500.0f, 7500.0f },
-	.engine_trq_pts = { 220.0f, 320.0f, 340.0f, 300.0f, 0.0f },
+	.engine_trq_pts = { 300.0f, 350.0f, 348.0f, 310.0f, 0.0f },
+	.engine_inertia = 0.15f,			// docs/DRIVETRAIN.md §2
+	.idle_omega = 94.24778f,			// 900 rpm
+	.clutch_omega = 115.19173f,			// 1100 rpm (docs/DRIVETRAIN.md §1)
+	.clutch_hold_omega = 471.23890f,	// 4500 rpm: launch-flare rpm at full throttle
+	.clutch_min = 0.9f,					// clutch torque-factor floor at standstill
+	.creep_throttle = 0.04f,			// idle creep through the slipping clutch
+	.limiter_omega = 785.39816f,		// 7500 rpm
+	.overrev_omega = 816.81409f,		// 7800 rpm
+	.eb_torque_idle = -20.0f,
+	.eb_torque_red = -60.0f,
+	.eb_fade_throttle = 0.10f,
+	.k_lsd = 25.0f,			// skidpad-tuned (docs/DRIVETRAIN.md §3)
+	.lsd_clamp_frac = 0.40f,
+	.shock_k = 1.0f,
+	.shock_max = 400.0f,
 
-	.brake_torque_front = 1600.0f,
-	.brake_torque_rear = 1050.0f,
+	.arb_front = 20000.0f, // skidpad-tuned: front-stiffer = mild limit understeer
+	.arb_rear = 14000.0f,  // (1.06 g steady state, front slips first by ~1 deg)
+
+	.k_load = 0.07f, // docs/DRIVETRAIN.md §5
+	.load_clamp_lo = 0.70f,
+	.load_clamp_hi = 1.15f,
+
+	.relax_len = 0.3f,	   // docs/DRIVETRAIN.md §5
+	.relax_tau_max = 0.05f,
+
+	.brake_torque_front = 2200.0f, // docs/DRIVETRAIN.md §5: front-biased,
+	.brake_torque_rear = 950.0f,   // fronts lock first (stable failure mode)
 	.handbrake_torque = 2500.0f,
 
 	.max_steer = 0.5235988f, // 30 degrees
@@ -372,6 +451,15 @@ void vehicle_create( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 		v->wheels[i].t_core = t->thermal_t_amb;
 	}
 	v->rack_torque = 0.0f;
+	// Drivetrain at spawn: 1st gear engaged, engine at idle, no shift pending.
+	v->engine_omega = t->idle_omega;
+	v->gear = 1;
+	v->shift_ticks = 0;
+	v->shift_target = 1;
+	v->shift_is_down = 0;
+	v->shock_ticks = 0;
+	v->shock_torque = 0.0f;
+	v->prev_flags = 0;
 	v->damage_overall = 0.0f;
 	v->damage_steer = 0.0f;
 	v->damage_toe_front = 0.0f;
@@ -403,6 +491,16 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw )
 		v->wheels[i].t_core = kTuning.thermal_t_amb;
 	}
 	v->rack_torque = 0.0f;
+	// Drivetrain back to the spawn state (1st gear, idle, no shift/shock
+	// pending, edge-detector cleared) — a reset run must replay identically.
+	v->engine_omega = kTuning.idle_omega;
+	v->gear = 1;
+	v->shift_ticks = 0;
+	v->shift_target = 1;
+	v->shift_is_down = 0;
+	v->shock_ticks = 0;
+	v->shock_torque = 0.0f;
+	v->prev_flags = 0;
 	// A reset run must replay identically: crash damage back to pristine.
 	v->damage_overall = 0.0f;
 	v->damage_steer = 0.0f;
@@ -549,7 +647,13 @@ void vehicle_brush_patch_mu( float sigma_x, float sigma_y, float fz, float t_sur
 	float dT = t_surf - t->thermal_t_opt;
 	float mu_t = 1.0f - t->thermal_k_t * dT * dT;
 	mu_t = b3ClampFloat( mu_t, 0.88f, 1.00f );
-	float mu_s = t->brush_mu_s * mu_t * mu_scale;
+	// Load sensitivity (docs/DRIVETRAIN.md §5): friction falls with load above
+	// the reference Fz0, so lateral load transfer costs an axle net grip —
+	// roll stiffness becomes a real balance lever. At Fz == Fz0 the factor is
+	// exactly 1.0f (IEEE identity), so reference-load sweeps are unchanged.
+	float mu_load = 1.0f - t->k_load * ( ( fz - t->brush_fz0 ) / t->brush_fz0 );
+	mu_load = b3ClampFloat( mu_load, t->load_clamp_lo, t->load_clamp_hi );
+	float mu_s = t->brush_mu_s * mu_t * mu_load * mu_scale;
 	float mu_k = t->brush_mu_k_ratio * mu_s;
 
 	float w = ( 2.0f * a ) / (float)SIM_BRUSH_N; // element width
@@ -615,18 +719,19 @@ void vehicle_tire_thermal( WheelRuntime* w, float power, float speed, int in_con
 // pose is frozen within the tick, so hit_dist / hit_dist_dot are per-tick
 // constants supplied by the caller. Semi-implicit Euler (velocity first):
 // omega*dt ~ 0.07 at 1600 Hz, comfortably stable. mul/add/div/compare only.
-void vehicle_suspension_step( WheelRuntime* w, float hit_dist, float hit_dist_dot, float g_along, float dt,
-							  float* out_tire_force, float* out_susp_force )
+void vehicle_suspension_step( WheelRuntime* w, float hit_dist, float hit_dist_dot, float g_along, float f_arb,
+							  float dt, float* out_tire_force, float* out_susp_force )
 {
 	const VehicleTuning* t = &kTuning;
 
-	// Suspension spring/damper between chassis and unsprung mass. Travel
+	// Suspension spring/damper between chassis and unsprung mass, plus the
+	// caller-computed anti-roll-bar share (docs/DRIVETRAIN.md §5). Travel
 	// clamps keep c in [0, max_travel]; the damper may pull (rebound), so the
 	// strut force is clamped symmetrically, not at zero.
 	float c = t->rest_length - w->travel;
 	float c_dot = -w->travel_vel;
 	float damper = c_dot >= 0.0f ? t->damper_bump : t->damper_rebound;
-	float f_susp = t->spring_k * c + damper * c_dot;
+	float f_susp = t->spring_k * c + damper * c_dot + f_arb;
 	f_susp = b3ClampFloat( f_susp, -t->max_load, t->max_load );
 
 	// Tire vertical spring against the road (Fz for the brush model). Pushes
@@ -717,36 +822,264 @@ static float sEngineTorque( float rpm )
 // tick. Compile-time constant — determinism requires a fixed loop bound.
 #define SIM_TIRE_SUBSTEPS 4
 
-// One sub-step of wheel spin dynamics: drive torque (RWD), tire reaction
-// torque, brake clamp that cannot reverse the wheel within the step, and the
-// handbrake hard-lock on the rears. Shared by the contact and airborne paths
-// (the airborne path previously used an unclamped brake integration that
-// could oscillate through zero — the clamped form is strictly better).
-static void sWheelSpinStep( WheelRuntime* w, int front, int handbrake, float throttle, float brake,
-							float reaction_torque, float dt )
+// rad/s <-> rpm
+#define W_TO_RPM 9.5492966f
+
+// Shift timing (400 Hz ticks, docs/DRIVETRAIN.md §1): upshift ignition cut,
+// downshift engagement delay, downshift driveline-shock duration.
+#define SIM_SHIFT_UP_TICKS 28	// 70 ms
+#define SIM_SHIFT_DOWN_TICKS 48 // 120 ms
+#define SIM_SHIFT_SHOCK_TICKS 8 // 20 ms
+// Reverse engages from 1st only below this forward speed (m/s).
+#define SIM_REVERSE_MAX_SPEED 1.0f
+
+float vehicle_gear_ratio( int gear )
+{
+	if ( gear < 0 || gear > 6 )
+	{
+		return 0.0f;
+	}
+	return kTuning.gear_ratios[gear];
+}
+
+// Viscous LSD (docs/DRIVETRAIN.md §3): base 50/50 split of the transmitted
+// axle torque plus k_lsd * (omega_l - omega_r) moved FROM the faster wheel TO
+// the slower one, clamped to +/- lsd_clamp_frac of |t_axle|. Power and coast
+// both flow through the same coupling; with no transmitted torque (shift cut)
+// the clamp collapses to zero and the diff is open.
+void vehicle_lsd_split( float t_axle, float omega_l, float omega_r, float* out_t_left, float* out_t_right )
 {
 	const VehicleTuning* t = &kTuning;
+	float transfer = t->k_lsd * ( omega_l - omega_r );
+	float cap = t->lsd_clamp_frac * b3AbsFloat( t_axle );
+	transfer = b3ClampFloat( transfer, -cap, cap );
+	*out_t_left = 0.5f * t_axle - transfer;
+	*out_t_right = 0.5f * t_axle + transfer;
+}
 
-	float drive = 0.0f;
-	if ( !front && !handbrake )
+// Engine braking (docs/DRIVETRAIN.md §2): closed throttle => negative crank
+// torque, linear from eb_torque_idle at idle to eb_torque_red at the limiter
+// (clamped there for the over-rev bounce), fading to zero by 10% throttle.
+float vehicle_engine_brake_torque( float engine_omega, float throttle )
+{
+	const VehicleTuning* t = &kTuning;
+	float fade = 1.0f - throttle / t->eb_fade_throttle;
+	if ( fade <= 0.0f )
 	{
-		float rpm = w->omega * t->gear_ratio * ( 60.0f / TWO_PI_F );
-		if ( rpm < 1000.0f )
+		return 0.0f;
+	}
+	if ( fade > 1.0f )
+	{
+		fade = 1.0f;
+	}
+	float u = ( engine_omega - t->idle_omega ) / ( t->limiter_omega - t->idle_omega );
+	u = b3ClampFloat( u, 0.0f, 1.0f );
+	return ( t->eb_torque_idle + u * ( t->eb_torque_red - t->eb_torque_idle ) ) * fade;
+}
+
+// Slip relaxation (docs/DRIVETRAIN.md §5): first-order lag on the slip vector
+// fed to the brush patch, tau = L_relax/|v| clamped to tau_max at low speed.
+// One 1600 Hz sub-step; plain float math, deterministic.
+void vehicle_slip_relax( WheelRuntime* w, float target_x, float target_y, float speed, float dt )
+{
+	const VehicleTuning* t = &kTuning;
+	float v = speed > 0.001f ? speed : 0.001f;
+	float tau = t->relax_len / v;
+	if ( tau > t->relax_tau_max )
+	{
+		tau = t->relax_tau_max;
+	}
+	float alpha = dt / tau;
+	if ( alpha > 1.0f )
+	{
+		alpha = 1.0f;
+	}
+	w->sigma_x_rel += alpha * ( target_x - w->sigma_x_rel );
+	w->sigma_y_rel += alpha * ( target_y - w->sigma_y_rel );
+}
+
+// ---------------------------------------------------------------------------
+// Gearbox state machine (docs/DRIVETRAIN.md §1) — one call per 400 Hz tick.
+// Edge-detects shift bits (rising edge = one request; both bits rising in the
+// same tick: up wins), runs the shift timers, and performs the engagement:
+// upshift engages after the 28-tick ignition cut (engine re-couples to the
+// wheel-matched speed on the next sub-step); downshift engages after the
+// 48-tick delay with the engine snapped to the wheel-matched speed (auto-blip
+// illusion) plus a brief driveline shock torque sized by the snap delta.
+// ---------------------------------------------------------------------------
+static void sShiftMachine( Vehicle* v, uint32_t flags, float v_fwd )
+{
+	const VehicleTuning* t = &kTuning;
+	uint32_t rising = flags & ~v->prev_flags;
+	v->prev_flags = flags;
+
+	// Downshift-shock decay runs independently of the shift timer.
+	if ( v->shock_ticks > 0 )
+	{
+		v->shock_ticks--;
+	}
+
+	if ( v->shift_ticks > 0 )
+	{
+		// Shift in progress: requests are dropped (spec §1).
+		v->shift_ticks--;
+		if ( v->shift_ticks == 0 )
 		{
-			rpm = 1000.0f;
+			v->gear = v->shift_target;
+			if ( v->shift_is_down )
+			{
+				float w_mean = 0.5f * ( v->wheels[2].omega + v->wheels[3].omega );
+				float w_matched = w_mean * t->gear_ratios[v->gear];
+				w_matched = b3ClampFloat( w_matched, t->idle_omega, t->overrev_omega );
+				float delta = w_matched - v->engine_omega;
+				if ( delta > 0.0f )
+				{
+					float shock = t->shock_k * delta;
+					v->shock_torque = shock > t->shock_max ? t->shock_max : shock;
+					v->shock_ticks = SIM_SHIFT_SHOCK_TICKS;
+				}
+				v->engine_omega = w_matched; // auto-blip illusion
+			}
 		}
-		drive = throttle * sEngineTorque( rpm ) * t->gear_ratio * t->driveline_eff * 0.5f;
+		return;
 	}
 
-	float brake_cap = front ? t->brake_torque_front : t->brake_torque_rear;
-	float brake_trq = brake * brake_cap;
-	if ( handbrake && !front )
+	if ( rising & SIM_FLAG_SHIFT_UP )
 	{
-		brake_trq += t->handbrake_torque;
+		if ( v->gear == 0 )
+		{
+			// R -> 1: forward-safe at any speed (spec §1 reverse rule).
+			v->shift_target = 1;
+			v->shift_ticks = SIM_SHIFT_UP_TICKS;
+			v->shift_is_down = 0;
+		}
+		else if ( v->gear < 6 )
+		{
+			v->shift_target = v->gear + 1;
+			v->shift_ticks = SIM_SHIFT_UP_TICKS;
+			v->shift_is_down = 0;
+		}
+	}
+	else if ( rising & SIM_FLAG_SHIFT_DOWN )
+	{
+		if ( v->gear == 1 )
+		{
+			// 1 -> R engages only when |v| < 1 m/s (spec §1 reverse rule).
+			if ( b3AbsFloat( v_fwd ) < SIM_REVERSE_MAX_SPEED )
+			{
+				v->shift_target = 0;
+				v->shift_ticks = SIM_SHIFT_DOWN_TICKS;
+				v->shift_is_down = 1;
+			}
+		}
+		else if ( v->gear >= 2 )
+		{
+			// Downshift protection: refuse any downshift that would put the
+			// engine above 7800 rpm at the current wheel speed.
+			float w_mean = 0.5f * ( v->wheels[2].omega + v->wheels[3].omega );
+			float w_pred = w_mean * t->gear_ratios[v->gear - 1];
+			if ( w_pred <= t->overrev_omega )
+			{
+				v->shift_target = v->gear - 1;
+				v->shift_ticks = SIM_SHIFT_DOWN_TICKS;
+				v->shift_is_down = 1;
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Drivetrain sub-step (docs/DRIVETRAIN.md §1-3): one engine state coupled to
+// the mean rear wheel speed through the engaged ratio. Computes the per-rear-
+// wheel drive torques (LSD split + downshift shock) and the effective rear
+// wheel inertia (reflected engine inertia when rigidly coupled). Advances
+// v->engine_omega (slaved when engaged; free integration under engine braking
+// during shift cuts).
+// ---------------------------------------------------------------------------
+static void sDrivetrainSubstep( Vehicle* v, int handbrake, float throttle, float dt, float* out_t_rl,
+								float* out_t_rr, float* out_i_rear )
+{
+	const VehicleTuning* t = &kTuning;
+	float w_mean = 0.5f * ( v->wheels[2].omega + v->wheels[3].omega );
+	float ratio = t->gear_ratios[v->gear];
+	float t_axle = 0.0f;
+	float i_rear = t->wheel_inertia;
+
+	if ( v->shift_ticks > 0 )
+	{
+		// Shift cut: no torque path (upshift ignition cut / downshift neutral
+		// delay). The engine integrates freely under its own inertia + engine
+		// braking (combustion is cut, so the closed-throttle curve applies).
+		float w_e = v->engine_omega + ( vehicle_engine_brake_torque( v->engine_omega, 0.0f ) / t->engine_inertia ) * dt;
+		v->engine_omega = w_e > t->idle_omega ? w_e : t->idle_omega;
+	}
+	else if ( handbrake )
+	{
+		// Handbrake overrides the drive path (rears are hard-locked in the
+		// spin step); the engine sits at the throttle flare rpm, declutched.
+		float w_hold = t->idle_omega + throttle * ( t->clutch_hold_omega - t->idle_omega );
+		v->engine_omega = w_hold;
+	}
+	else
+	{
+		float w_c = w_mean * ratio; // crank speed if rigidly coupled
+		if ( w_c >= t->clutch_omega )
+		{
+			// Rigid coupling: engine slaved to the wheels. Limiter = hard fuel
+			// cut above 7500 rpm; engine braking applies through the same path
+			// (the "natural bounce"). Reflected crank inertia stiffens the
+			// rear wheels' spin dynamics by I_e * ratio^2 (split across two).
+			v->engine_omega = w_c;
+			float t_comb = 0.0f;
+			if ( w_c <= t->limiter_omega )
+			{
+				t_comb = throttle * sEngineTorque( w_c * W_TO_RPM );
+			}
+			float t_eb = vehicle_engine_brake_torque( w_c, throttle );
+			t_axle = ( t_comb + t_eb ) * ratio * t->driveline_eff;
+			i_rear = t->wheel_inertia + 0.5f * t->engine_inertia * ratio * ratio;
+		}
+		else
+		{
+			// Implicit auto-clutch (spec §1): below the coupled speed that
+			// would drag the engine under 1100 rpm the clutch slips. The
+			// engine flares to a throttle-scaled launch rpm (never below
+			// idle — it cannot stall); transmitted torque scales with the
+			// rpm headroom of the coupled speed toward lockup, floored so a
+			// standing start pulls away, with a small creep throttle so the
+			// car creeps at idle. No engine braking through a slipping clutch.
+			float w_hold = t->idle_omega + throttle * ( t->clutch_hold_omega - t->idle_omega );
+			float w_e = w_c > w_hold ? w_c : w_hold;
+			v->engine_omega = w_e;
+			float eff_th = throttle > t->creep_throttle ? throttle : t->creep_throttle;
+			float frac = b3ClampFloat( w_c / t->clutch_omega, 0.0f, 1.0f );
+			float factor = t->clutch_min + ( 1.0f - t->clutch_min ) * frac;
+			t_axle = eff_th * sEngineTorque( w_e * W_TO_RPM ) * factor * ratio * t->driveline_eff;
+		}
 	}
 
-	float omega_new = w->omega + ( ( drive + reaction_torque ) / t->wheel_inertia ) * dt;
-	float brake_dw = ( brake_trq / t->wheel_inertia ) * dt;
+	vehicle_lsd_split( t_axle, v->wheels[2].omega, v->wheels[3].omega, out_t_rl, out_t_rr );
+
+	// Downshift driveline shock (spec §1): brief deterministic retarding
+	// torque on the rear axle right after the rev-match snap.
+	if ( v->shock_ticks > 0 )
+	{
+		float sgn = w_mean >= 0.0f ? 1.0f : -1.0f;
+		*out_t_rl -= 0.5f * v->shock_torque * sgn;
+		*out_t_rr -= 0.5f * v->shock_torque * sgn;
+	}
+
+	*out_i_rear = i_rear;
+}
+
+// One sub-step of wheel spin integration: drive torque (rears, from the
+// drivetrain), tire reaction torque, brake clamp that cannot reverse the
+// wheel within the step, handbrake hard-lock on the rears.
+static void sWheelSpinIntegrate( WheelRuntime* w, float inertia, float drive, float reaction_torque,
+								 float brake_trq, int hard_lock, float dt )
+{
+	float omega_new = w->omega + ( ( drive + reaction_torque ) / inertia ) * dt;
+	float brake_dw = ( brake_trq / inertia ) * dt;
 	if ( omega_new > 0.0f )
 	{
 		omega_new = omega_new > brake_dw ? omega_new - brake_dw : 0.0f;
@@ -755,13 +1088,10 @@ static void sWheelSpinStep( WheelRuntime* w, int front, int handbrake, float thr
 	{
 		omega_new = omega_new < -brake_dw ? omega_new + brake_dw : 0.0f;
 	}
-
-	// Handbrake locks the rears outright.
-	if ( handbrake && !front )
+	if ( hard_lock )
 	{
 		omega_new = 0.0f;
 	}
-
 	w->omega = omega_new;
 	w->spin_angle += w->omega * dt;
 }
@@ -783,6 +1113,34 @@ static void sWrapSpin( WheelRuntime* w )
 // Per-tick update
 // ---------------------------------------------------------------------------
 
+// Per-wheel per-tick context: contact, patch basis and slip inputs are
+// per-tick constants (the chassis pose/velocity integrate at tick level).
+// Filled by phase A of vehicle_update; consumed by the 1600 Hz phase-B loop,
+// which couples the rear wheels through the drivetrain and left/right
+// through the anti-roll bars.
+typedef struct WheelTick
+{
+	b3Vec3 origin; // hardpoint, world
+	int contact;
+	int grass;
+	float hit_dist;
+	float hit_dist_dot;
+	b3Vec3 contact_point;
+	b3Vec3 wheel_fwd;
+	b3Vec3 wheel_side;
+	float v_long;
+	float v_lat;
+	float denom;
+	float sigma_y; // lateral slip target incl. camber thrust
+	float mirror;
+	// Sub-step accumulators / last values
+	float fx_sum;
+	float fy_sum;
+	float rack_sum;
+	float fsusp_sum;
+	float fz; // last sub-step's tire spring force
+} WheelTick;
+
 void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer, float throttle, float brake,
 					 uint32_t flags )
 {
@@ -799,6 +1157,11 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 	// Vehicle speed for tire convective cooling (and reused for drag below).
 	b3Vec3 chassis_vel = b3Body_GetLinearVelocity( chassis );
 	float chassis_speed = b3Length( chassis_vel );
+
+	// Gearbox state machine (docs/DRIVETRAIN.md §1): edge-detected shift bits,
+	// shift timers, engagement. Once per 400 Hz tick, BEFORE the wheel
+	// pipeline so cut timing is exact in ticks. Forward speed gates reverse.
+	sShiftMachine( v, flags, b3Dot( chassis_vel, fwd ) );
 
 	// Steering: linear map, front axle only. Front-end crash damage shrinks the
 	// lock (docs/SOFTBODY.md Phase 2). At damage_steer = 0 the factor is exactly
@@ -819,10 +1182,15 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 	// Gravity component along strut-down (-up): the same for all four corners.
 	const float g_along = 9.81f * up.y;
 
+	WheelTick wt[SIM_WHEEL_COUNT];
+
+	// --- Phase A: per-wheel kinematics, contact and slip inputs -------------
 	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 	{
 		WheelRuntime* w = &v->wheels[i];
+		WheelTick* c = &wt[i];
 		int front = sIsFront( i );
+		*c = ( WheelTick ){ 0 };
 
 		// Kinematic camber/toe from the CURRENT spring compression
 		// (docs/SUSPENSION.md §2). Travel clamps keep it in [0, max_travel].
@@ -835,6 +1203,7 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 
 		b3Vec3 hp_local = sVehicleHardpoint( i );
 		b3Pos origin = b3Body_GetWorldPoint( chassis, hp_local );
+		c->origin = origin;
 
 		// --- Wheel contact (docs/ROAD-SURFACE.md §1): analytic road query at
 		// the hardpoint projected down; compression from the analytic height
@@ -906,30 +1275,12 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 
 		if ( !have_contact )
 		{
-			// Airborne: no tire spring, but the strut still works the 22 kg
-			// unsprung mass toward full droop (and its reaction still pulls
-			// on the chassis), the tire cools (no friction power, no track
-			// conduction) and the free wheel still sees engine/brake torque.
-			float fsusp_sum = 0.0f;
-			for ( int k = 0; k < SIM_TIRE_SUBSTEPS; ++k )
-			{
-				float f_tire, f_susp;
-				vehicle_suspension_step( w, ray_len + 1.0f, 0.0f, g_along, sub_dt, &f_tire, &f_susp );
-				fsusp_sum += f_susp;
-				vehicle_tire_thermal( w, 0.0f, chassis_speed, 0, sub_dt );
-				sWheelSpinStep( w, front, handbrake, throttle, brake, 0.0f, sub_dt );
-			}
-			sWrapSpin( w );
-
-			const float inv_n_air = 1.0f / (float)SIM_TIRE_SUBSTEPS;
-			b3Body_ApplyForce( chassis, b3MulSV( fsusp_sum * inv_n_air, up ), origin, true );
-
-			w->in_contact = 0;
-			w->compression = t->rest_length - w->travel;
-			w->load = 0.0f;
-			w->slip_ratio = 0.0f;
-			w->slip_angle = 0.0f;
-			w->wheel_center = b3MulAdd( origin, -w->travel, up );
+			// Airborne: no tire spring; phase B still works the strut toward
+			// full droop, cools the tire and spins the free wheel under
+			// drivetrain/brake torque. hit_dist beyond reach = no tire force.
+			c->contact = 0;
+			c->hit_dist = ray_len + 1.0f;
+			c->hit_dist_dot = 0.0f;
 			continue;
 		}
 
@@ -1002,89 +1353,175 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 		// through the same bristle adhesion/sliding split, so camber thrust
 		// saturates with everything else. The EXPORTED slip_angle stays the
 		// kinematic one (SimStateV1 field meaning unchanged).
-		float sigma_y = -v_lat / denom + sigma_camber;
 		w->slip_angle = b3Atan2( -v_lat, denom );
 
-		// --- Sub-stepped per-wheel pipeline (docs/ROAD-SURFACE.md §3 +
-		// SUSPENSION.md §1): unsprung strut travel -> slip -> brush patch ->
-		// thermal -> wheel spin at SIM_DT/4. Fz for the brush model is the
-		// TIRE spring force from the quarter-car, per sub-step. Chassis
-		// forces are the sub-step MEAN applied once per tick (Box3D
-		// integrates F·SIM_DT, so the mean preserves the summed impulses):
-		// strut reaction at the hardpoint, tire in-plane force at the patch.
-		// Grass wheels see reduced bristle friction (§6). Asphalt multiplies
-		// by exactly 1.0f — an IEEE identity, so on-corridor sub-steps are
-		// bit-identical to the pre-grass kernel.
-		const float mu_scale = grass ? SIM_GRASS_MU_SCALE : 1.0f;
+		c->contact = 1;
+		c->grass = grass;
+		c->hit_dist = hit_dist;
+		c->hit_dist_dot = hit_dist_dot;
+		c->contact_point = contact_point;
+		c->wheel_fwd = wheel_fwd;
+		c->wheel_side = wheel_side;
+		c->v_long = v_long;
+		c->v_lat = v_lat;
+		c->denom = denom;
+		c->sigma_y = -v_lat / denom + sigma_camber;
+		c->mirror = mirror;
+	}
 
-		float fx_sum = 0.0f;
-		float fy_sum = 0.0f;
-		float rack_sum = 0.0f;
-		float fsusp_sum = 0.0f;
-		float fz = 0.0f;
-		for ( int k = 0; k < SIM_TIRE_SUBSTEPS; ++k )
+	// --- Phase B: 1600 Hz sub-stepped pipeline (docs/ROAD-SURFACE.md §3 +
+	// SUSPENSION.md §1 + DRIVETRAIN.md §1-3, §5): per sub-step — anti-roll
+	// bars from the current left/right compressions, unsprung strut travel,
+	// slip relaxation, brush patch (with load-sensitive friction), thermal,
+	// then ONE drivetrain evaluation coupling the rear axle (engine + LSD)
+	// and wheel spin integration for all four corners. Fz for the brush
+	// model is the tire spring force from the quarter-car, per sub-step.
+	// Grass wheels see reduced bristle friction (§6): asphalt multiplies by
+	// exactly 1.0f — an IEEE identity. ---
+	for ( int k = 0; k < SIM_TIRE_SUBSTEPS; ++k )
+	{
+		// Anti-roll bars (docs/DRIVETRAIN.md §5): F = k_arb * (c_this -
+		// c_other) per axle, equal and opposite left/right — pure roll-moment
+		// redistribution, made meaningful by tire load sensitivity.
+		float dc_front = v->wheels[1].travel - v->wheels[0].travel; // = c_FL - c_FR
+		float dc_rear = v->wheels[3].travel - v->wheels[2].travel;	// = c_RL - c_RR
+		float f_arb[SIM_WHEEL_COUNT];
+		f_arb[0] = t->arb_front * dc_front;
+		f_arb[1] = -f_arb[0];
+		f_arb[2] = t->arb_rear * dc_rear;
+		f_arb[3] = -f_arb[2];
+
+		float fx_k[SIM_WHEEL_COUNT]; // this sub-step's patch fx per wheel
+
+		for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
 		{
-			float f_susp;
-			vehicle_suspension_step( w, hit_dist, hit_dist_dot, g_along, sub_dt, &fz, &f_susp );
-			fsusp_sum += f_susp;
+			WheelRuntime* w = &v->wheels[i];
+			WheelTick* c = &wt[i];
+			int front = sIsFront( i );
 
-			float slip_ratio = ( w->omega * t->wheel_radius - v_long ) / denom;
-			slip_ratio = b3ClampFloat( slip_ratio, -4.0f, 4.0f );
-			w->slip_ratio = slip_ratio; // last sub-step's value is exported
+			float fz, f_susp;
+			vehicle_suspension_step( w, c->hit_dist, c->hit_dist_dot, g_along, f_arb[i], sub_dt, &fz, &f_susp );
+			c->fsusp_sum += f_susp;
+			c->fz = fz;
 
-			float fx, fy, trail;
-			vehicle_brush_patch_mu( slip_ratio, sigma_y, fz, w->t_surf, mu_scale, &fx, &fy, &trail );
-			fx_sum += fx;
-			fy_sum += fy;
-
-			// FFB rack torque (front axle only, output-only): lateral force
-			// behind the steering axis by the EMERGENT pneumatic trail plus
-			// mechanical caster (docs/TIRE-MODEL.md §3). The scrub moment arm
-			// mirrors about the kingpin (left/right wheels are reflections), so
-			// the fx term carries the per-wheel mirror sign: symmetric braking
-			// fx on both fronts cancels at the rack instead of doubling.
-			if ( front )
+			fx_k[i] = 0.0f;
+			if ( c->contact )
 			{
-				rack_sum += fy * ( trail + t->ffb_caster_trail ) + mirror * fx * t->ffb_scrub_radius;
+				float slip_ratio = ( w->omega * t->wheel_radius - c->v_long ) / c->denom;
+				slip_ratio = b3ClampFloat( slip_ratio, -4.0f, 4.0f );
+				w->slip_ratio = slip_ratio; // last sub-step's RAW value is exported
+
+				// Slip relaxation (docs/DRIVETRAIN.md §5), then the brush
+				// patch on the RELAXED slip vector: progressive force
+				// build-up over ~L/v instead of instantaneous response.
+				vehicle_slip_relax( w, slip_ratio, c->sigma_y, c->denom, sub_dt );
+
+				const float mu_scale = c->grass ? SIM_GRASS_MU_SCALE : 1.0f;
+				float fx, fy, trail;
+				vehicle_brush_patch_mu( w->sigma_x_rel, w->sigma_y_rel, fz, w->t_surf, mu_scale, &fx, &fy, &trail );
+				c->fx_sum += fx;
+				c->fy_sum += fy;
+				fx_k[i] = fx;
+
+				// FFB rack torque (front axle only, output-only): lateral
+				// force behind the steering axis by the EMERGENT pneumatic
+				// trail plus mechanical caster (docs/TIRE-MODEL.md §3). The
+				// scrub moment arm mirrors about the kingpin, so the fx term
+				// carries the per-wheel mirror sign: symmetric braking fx on
+				// both fronts cancels at the rack instead of doubling.
+				if ( front )
+				{
+					c->rack_sum += fy * ( trail + t->ffb_caster_trail ) + c->mirror * fx * t->ffb_scrub_radius;
+				}
+
+				// Thermal: friction power from the slip velocity at the
+				// patch, with track conduction while the tread presses the
+				// road (ROAD-SURFACE §2).
+				float v_slip_x = w->omega * t->wheel_radius - c->v_long;
+				float p_fric = b3AbsFloat( fx * v_slip_x ) + b3AbsFloat( fy * c->v_lat );
+				vehicle_tire_thermal( w, p_fric, chassis_speed, fz > 0.0f, sub_dt );
 			}
-
-			// Thermal: friction power from the slip velocity at the patch,
-			// with track conduction while the tread presses the road
-			// (ROAD-SURFACE §2).
-			float v_slip_x = w->omega * t->wheel_radius - v_long;
-			float p_fric = b3AbsFloat( fx * v_slip_x ) + b3AbsFloat( fy * v_lat );
-			vehicle_tire_thermal( w, p_fric, chassis_speed, fz > 0.0f, sub_dt );
-
-			// Wheel spin (RWD drive, brakes on all four, tire reaction).
-			sWheelSpinStep( w, front, handbrake, throttle, brake, -fx * t->wheel_radius, sub_dt );
+			else
+			{
+				// Airborne: slips relax toward zero, the tire cools in the
+				// airflow (no friction power, no track conduction).
+				vehicle_slip_relax( w, 0.0f, 0.0f, 0.0f, sub_dt );
+				vehicle_tire_thermal( w, 0.0f, chassis_speed, 0, sub_dt );
+			}
 		}
+
+		// Drivetrain (docs/DRIVETRAIN.md §1-3): one engine coupled to the
+		// mean rear wheel speed; LSD splits the axle torque; then integrate
+		// wheel spin for all four corners (reflected crank inertia on the
+		// rears while rigidly coupled).
+		float t_rl, t_rr, i_rear;
+		sDrivetrainSubstep( v, handbrake, throttle, sub_dt, &t_rl, &t_rr, &i_rear );
+
+		for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
+		{
+			WheelRuntime* w = &v->wheels[i];
+			int front = sIsFront( i );
+			float drive = front ? 0.0f : ( i == 2 ? t_rl : t_rr );
+			float inertia = front ? t->wheel_inertia : i_rear;
+			float brake_cap = front ? t->brake_torque_front : t->brake_torque_rear;
+			float brake_trq = brake * brake_cap;
+			if ( handbrake && !front )
+			{
+				brake_trq += t->handbrake_torque;
+			}
+			int hard_lock = handbrake && !front;
+			sWheelSpinIntegrate( w, inertia, drive, -fx_k[i] * t->wheel_radius, brake_trq, hard_lock, sub_dt );
+		}
+	}
+
+	// --- Per-wheel epilogue: exports + chassis forces (sub-step MEANS applied
+	// once per tick: Box3D integrates F·SIM_DT, so the mean preserves the
+	// summed sub-step impulses) ---
+	const float inv_n = 1.0f / (float)SIM_TIRE_SUBSTEPS;
+	for ( int i = 0; i < SIM_WHEEL_COUNT; ++i )
+	{
+		WheelRuntime* w = &v->wheels[i];
+		WheelTick* c = &wt[i];
+		int front = sIsFront( i );
 		sWrapSpin( w );
 
-		w->load = fz; // last sub-step's tire spring force
 		w->compression = t->rest_length - w->travel;
-		w->wheel_center = b3MulAdd( origin, -w->travel, up );
+		w->wheel_center = b3MulAdd( c->origin, -w->travel, up );
 
-		const float inv_n = 1.0f / (float)SIM_TIRE_SUBSTEPS;
-		// Strut reaction on the chassis at the hardpoint, along the strut.
-		b3Body_ApplyForce( chassis, b3MulSV( fsusp_sum * inv_n, up ), origin, true );
+		// Strut reaction on the chassis at the hardpoint, along the strut
+		// (applies airborne too: droop extension damping).
+		b3Body_ApplyForce( chassis, b3MulSV( c->fsusp_sum * inv_n, up ), c->origin, true );
+
+		if ( !c->contact )
+		{
+			w->in_contact = 0;
+			w->load = 0.0f;
+			w->slip_ratio = 0.0f;
+			w->slip_angle = 0.0f;
+			continue;
+		}
+
+		w->load = c->fz; // last sub-step's tire spring force
+
 		// Tire in-plane force at the patch (the unsprung mass has no in-plane
 		// DOF, so the patch force transfers rigidly to the chassis).
-		b3Vec3 tire_force = b3Add( b3MulSV( fx_sum * inv_n, wheel_fwd ), b3MulSV( fy_sum * inv_n, wheel_side ) );
-		b3Body_ApplyForce( chassis, tire_force, contact_point, true );
+		b3Vec3 tire_force =
+			b3Add( b3MulSV( c->fx_sum * inv_n, c->wheel_fwd ), b3MulSV( c->fy_sum * inv_n, c->wheel_side ) );
+		b3Body_ApplyForce( chassis, tire_force, c->contact_point, true );
 
 		// Grass rolling drag (§6): linear in the in-plane patch velocity,
 		// ~600 N per wheel at 20 m/s — grass is drivable but slow. This
 		// branch is untaken on the corridor (completely inert on asphalt).
-		if ( grass )
+		if ( c->grass )
 		{
-			b3Vec3 grass_drag = b3Add( b3MulSV( -SIM_GRASS_DRAG_COEF * v_long, wheel_fwd ),
-									   b3MulSV( -SIM_GRASS_DRAG_COEF * v_lat, wheel_side ) );
-			b3Body_ApplyForce( chassis, grass_drag, contact_point, true );
+			b3Vec3 grass_drag = b3Add( b3MulSV( -SIM_GRASS_DRAG_COEF * c->v_long, c->wheel_fwd ),
+									   b3MulSV( -SIM_GRASS_DRAG_COEF * c->v_lat, c->wheel_side ) );
+			b3Body_ApplyForce( chassis, grass_drag, c->contact_point, true );
 		}
 
 		if ( front )
 		{
-			rack += rack_sum * inv_n;
+			rack += c->rack_sum * inv_n;
 		}
 	}
 

@@ -82,3 +82,15 @@ inertia well under the old 2600 kg·m² (mass concentrated near center).
    justify direction: more grip from camber on loaded wheels, livelier yaw).
 4. SimStateV1 unchanged (susp_compression now reports suspension-spring travel;
    wheel pos from unsprung state — keep fields meaningful).
+
+## Addendum (2026-07-09, drivetrain & handling wave — anti-roll bars)
+
+`vehicle_suspension_step` gained an `f_arb` input (docs/DRIVETRAIN.md §5):
+per 1600 Hz substep the caller computes `F = k_arb · (c_this − c_other)` for
+each axle pair from the CURRENT spring compressions and adds it to the strut
+force (before the ±max_load clamp). Left/right forces are equal and opposite:
+no net vertical force, pure roll-moment redistribution between the axles,
+made meaningful by the tire load sensitivity of the same wave. Rates live in
+kTuning (`arb_front = 20 kN/m`, `arb_rear = 14 kN/m`, front-stiffer per
+DRIVETRAIN.md §5); tests/test_suspension.c passes `f_arb = 0` to keep the §5.2
+single-corner gates unchanged.

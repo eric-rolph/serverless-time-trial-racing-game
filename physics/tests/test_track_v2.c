@@ -466,12 +466,19 @@ static void test_grass_drive( void )
 	// Full throttle, dead straight: the oval curves away, the car crosses the
 	// shoulder and the corridor skirt (~13 m lateral, around x ≈ 45) and drops
 	// onto the grass plane. Pre-change this ended in a void fall.
+	//
+	// Input update for the drivetrain wave: once on the grass, the driver
+	// lifts to 40% throttle. The geared 1st (9.8:1) at full throttle just
+	// lights the rears up to the limiter on the 0.55-mu surface (kinetic
+	// bristle friction) and the car bogs into wheelspin — the "drivable,
+	// recoverable" gate is about sane recovery inputs, not a pinned pedal.
 	int error_seen = 0;
 	int off_track_on_grass = 0;
 	float min_y = 1000.0f;
 	for ( int tick = 0; tick < 4000; ++tick ) // 10 s
 	{
-		uint32_t status = sim_step( 0, 65535, 0, 0 );
+		uint32_t throttle = s->pos[0] > 50.0f ? 26214u : 65535u; // lift on grass
+		uint32_t status = sim_step( 0, throttle, 0, 0 );
 		if ( status & SIM_STATUS_ERROR )
 		{
 			error_seen = 1;

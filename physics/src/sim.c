@@ -804,6 +804,27 @@ float sim_damage( uint32_t component )
 	}
 }
 
+float sim_rpm( void )
+{
+	// ABI 1.4 (additive): engine speed for the HUD/auto-shifter/audio,
+	// output-only — reads never affect simulation state or hashes.
+	if ( !g_sim.world_valid )
+	{
+		return 0.0f;
+	}
+	return g_sim.vehicle.engine_omega * 9.5492966f; // rad/s -> rpm (60 / 2 pi)
+}
+
+int32_t sim_gear( void )
+{
+	// ABI 1.4 (additive): engaged gear, 0 = reverse, 1..6. Output-only.
+	if ( !g_sim.world_valid )
+	{
+		return 1; // spawn gear
+	}
+	return (int32_t)g_sim.vehicle.gear;
+}
+
 const SimStateV1* sim_state( void )
 {
 	return &g_sim.state;

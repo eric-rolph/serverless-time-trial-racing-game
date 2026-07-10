@@ -46,7 +46,9 @@ export function parseLapLog(data: ArrayBuffer | ArrayBufferView): LapLog {
   for (let i = 0; i < tickCount; i++) {
     steer[i] = dv.getInt16(20 + 8 * i, true);
     const flags = dv.getUint16(20 + 8 * i + 6, true);
-    if ((flags & ~0x0001) !== 0) throw new LogFormatError("reserved flag bits set");
+    // CONTRACTS §2: bit 0 = handbrake, bit 1 = shift up, bit 2 = shift down
+    // (drivetrain wave, DRIVETRAIN.md §1); bits 3–15 stay reserved (must be 0).
+    if ((flags & ~0x0007) !== 0) throw new LogFormatError("reserved flag bits set");
   }
   return {
     version,

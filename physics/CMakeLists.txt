@@ -88,6 +88,33 @@ target_include_directories(test_track_v2 PRIVATE src)
 set_target_properties(test_track_v2 PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
 add_test(NAME track_v2 COMMAND test_track_v2)
 
+# test_drivetrain covers the gearbox/engine/LSD wave (docs/DRIVETRAIN.md §7
+# gate 2): ratio table, edge-triggered shifts, cut timing in ticks, limiter,
+# engine braking, LSD split, reverse rule, over-rev protection, and the
+# shift-heavy step==step==replay crown gate. Drives internal helpers
+# (vehicle.h lives in src/) plus the sim on a big flat circle.
+add_executable(test_drivetrain tests/test_drivetrain.c tests/make_test_track.c)
+target_link_libraries(test_drivetrain PRIVATE sim)
+target_include_directories(test_drivetrain PRIVATE src)
+set_target_properties(test_drivetrain PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
+add_test(NAME drivetrain COMMAND test_drivetrain)
+
+# Launch harness (docs/DRIVETRAIN.md §7 gate 4): 0-100 km/h, 1st-gear
+# wheelspin, gear/top-speed table, brake-bias stopping-distance check.
+add_executable(harness_launch tests/harness_launch.c tests/make_test_track.c)
+target_link_libraries(harness_launch PRIVATE sim)
+target_include_directories(harness_launch PRIVATE src)
+set_target_properties(harness_launch PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
+add_test(NAME launch COMMAND harness_launch)
+
+# Skidpad harness (docs/DRIVETRAIN.md §7 gate 5): steady-state 1.05-1.10 g,
+# mild limit understeer, rollover threshold > 1.25 g.
+add_executable(harness_skidpad tests/harness_skidpad.c tests/make_test_track.c)
+target_link_libraries(harness_skidpad PRIVATE sim)
+target_include_directories(harness_skidpad PRIVATE src)
+set_target_properties(harness_skidpad PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
+add_test(NAME skidpad COMMAND harness_skidpad)
+
 if (UNIX)
     target_link_libraries(test_determinism PRIVATE m)
     target_link_libraries(test_vehicle PRIVATE m)
@@ -96,4 +123,7 @@ if (UNIX)
     target_link_libraries(test_suspension PRIVATE m)
     target_link_libraries(test_damage PRIVATE m)
     target_link_libraries(test_track_v2 PRIVATE m)
+    target_link_libraries(test_drivetrain PRIVATE m)
+    target_link_libraries(harness_launch PRIVATE m)
+    target_link_libraries(harness_skidpad PRIVATE m)
 endif()

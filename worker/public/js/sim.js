@@ -135,4 +135,14 @@ export class Sim {
    *  referee recomputes from the input log, so it can drive cosmetics that must
    *  agree with the physics. Never fed back into the sim (determinism intact). */
   damage(component) { return this.e.sim_damage ? this.e.sim_damage(component) : null; }
+
+  /** Engine speed in rpm (ABI 1.4 export; null on older binaries). Output-only
+   *  and unhashed (DRIVETRAIN.md §4) — any divergence would surface in the
+   *  chassis hash within ticks because gearing scales forces. */
+  rpm() { return this.e.sim_rpm ? this.e.sim_rpm() : null; }
+
+  /** Engaged gear: 0 = reverse, 1..6 (ABI 1.4 export; null on older binaries).
+   *  Reports the OUTGOING gear during a shift in progress (DRIVETRAIN.md
+   *  §6.5 item 10), so the HUD numeral flips at engagement, not request. */
+  gear() { return this.e.sim_gear ? this.e.sim_gear() : null; }
 }

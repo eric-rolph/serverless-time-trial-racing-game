@@ -26,6 +26,13 @@ typedef struct WheelRuntime
 	float travel_vel; // m/s, d(travel)/dt, + = extending toward droop
 	float slip_ratio;
 	float slip_angle;		// rad
+	// Relaxed slip state (docs/DRIVETRAIN.md §5 slip relaxation): first-order
+	// lag on the slip vector fed to the brush patch, tau = L_relax/|v| clamped
+	// at low speed, integrated at the 1600 Hz substep. The EXPORTED
+	// slip_ratio/slip_angle stay the raw kinematic values. Reset to 0 with the
+	// car (deterministic replays); never hashed directly (feeds forces).
+	float sigma_x_rel; // relaxed slip ratio seen by the contact patch
+	float sigma_y_rel; // relaxed tan(slip angle) (incl. camber thrust) seen by the patch
 	int in_contact;			// road within suspension reach this tick
 	b3Vec3 contact_point;	// world
 	b3Vec3 wheel_center;	// world (unsprung wheel center)
@@ -53,6 +60,21 @@ typedef struct Vehicle
 	// Steering rack torque (Nm at the rim) for force feedback. Pure output —
 	// never feeds back into the simulation, so it has no replay/hash impact.
 	float rack_torque;
+	// --- Drivetrain state (docs/DRIVETRAIN.md §1-§3) ---------------------
+	// ONE engine, rigidly coupled to the mean rear wheel speed through the
+	// engaged ratio except during shift cuts (free integration under engine
+	// inertia + engine braking) and the low-speed auto-clutch slip zone.
+	// All deterministic vehicle state: reset with the car, never hashed
+	// directly (gearing scales forces, so divergence surfaces in the chassis
+	// hash within ticks).
+	float engine_omega; // crank speed (rad/s), >= idle; sim_rpm() reads this
+	int gear;			// engaged gear: 0 = reverse, 1..6 (spawn/reset = 1)
+	int shift_ticks;	// 400 Hz ticks remaining in the shift in progress (0 = engaged)
+	int shift_target;	// gear engaged when shift_ticks reaches 0
+	int shift_is_down;	// downshift: rev-match snap + driveline shock on engage
+	int shock_ticks;	// driveline-shock ticks remaining after a downshift engage
+	float shock_torque; // axle-level retarding torque magnitude (Nm) during shock
+	uint32_t prev_flags; // previous tick's input flags (edge detection, bits 1/2)
 	// Deterministic per-region crash damage (docs/SOFTBODY.md Phase 2).
 	// Accrued from chassis hit events above SIM_DAMAGE_THRESHOLD; feeds back
 	// into vehicle_update (aero / steering / toe), so it IS part of the hashed
@@ -151,12 +173,37 @@ void vehicle_tire_thermal( WheelRuntime* w, float power, float speed, int in_con
 //                  (pass something > rest_length + wheel_radius when airborne)
 //   hit_dist_dot = its rate of change (chassis approaching road < 0)
 //   g_along      = gravity component along strut-down (9.81 * up.y upright)
+//   f_arb        = anti-roll-bar force on this corner (N, same sign as the
+//                  strut force: + pushes the wheel down / chassis up). The
+//                  caller computes k_arb * (c_this - c_other) per axle
+//                  (docs/DRIVETRAIN.md §5); pass 0 for a bar-less corner.
 // Outputs the tire spring force (>= 0, the brush model's Fz) and the
 // suspension strut force (+ = pushing chassis up / wheel down) BEFORE the
 // integration, i.e. the forces acting across this sub-step. Exposed for
 // tests/test_suspension.c; NOT a wasm export.
-void vehicle_suspension_step( WheelRuntime* w, float hit_dist, float hit_dist_dot, float g_along, float dt,
-							  float* out_tire_force, float* out_susp_force );
+void vehicle_suspension_step( WheelRuntime* w, float hit_dist, float hit_dist_dot, float g_along, float f_arb,
+							  float dt, float* out_tire_force, float* out_susp_force );
+
+// --- Drivetrain internals exposed for tests/test_drivetrain.c --------------
+// (like vehicle_brush_patch: internal linkage, NOT wasm exports)
+
+// Overall gear ratio (incl. final drive), engine:wheel. gear 0 = reverse
+// (negative), 1..6 forward. Out of range returns 0.
+float vehicle_gear_ratio( int gear );
+
+// Viscous-LSD torque split (docs/DRIVETRAIN.md §3): base 50/50 of t_axle plus
+// transfer T = k_lsd * (omega_l - omega_r) clamped to +/- 40% of |t_axle|,
+// FROM the faster wheel TO the slower one. Applies on power and coast.
+void vehicle_lsd_split( float t_axle, float omega_l, float omega_r, float* out_t_left, float* out_t_right );
+
+// Engine braking crank torque (Nm, <= 0): linear from -20 Nm at idle to
+// -60 Nm at redline, faded to zero by 10% throttle (docs/DRIVETRAIN.md §2).
+float vehicle_engine_brake_torque( float engine_omega, float throttle );
+
+// One 1600 Hz sub-step of the per-wheel slip relaxation filter
+// (docs/DRIVETRAIN.md §5): advances w->sigma_x_rel / w->sigma_y_rel toward
+// the raw targets with tau = min(L_relax/max(|v|, eps), tau_max).
+void vehicle_slip_relax( WheelRuntime* w, float target_x, float target_y, float speed, float dt );
 
 // Kinematic camber/toe from suspension spring compression (docs/SUSPENSION.md
 // §2). wheel = 0..3 (FL FR RL RR). Outputs conventional signed camber (rad,
