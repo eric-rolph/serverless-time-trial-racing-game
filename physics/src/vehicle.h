@@ -77,8 +77,10 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw );
 
 // Per-tick force computation, before b3World_Step. Inputs are unquantized
 // floats: steer [-1,1], throttle [0,1], brake [0,1], flags bitfield.
-// `road` is the analytic surface the wheels contact (docs/ROAD-SURFACE.md);
-// wheels fall back to the mesh raycast when outside its domain.
+// `road` is the analytic surface the wheels contact (docs/ROAD-SURFACE.md).
+// On v2 tracks the query is total (§6): off-corridor wheels ride the flat
+// grass plane (reduced friction + rolling drag). On v1 tracks off-corridor
+// wheels keep the legacy mesh raycast fallback — bit-identical replays.
 void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer, float throttle, float brake,
 					 uint32_t flags );
 
@@ -126,6 +128,14 @@ float vehicle_effect_max_steer( const Vehicle* v );
 // pneumatic trail: lateral-force centroid distance behind the patch center).
 void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, float* out_fx, float* out_fy,
 						  float* out_trail );
+
+// Surface-aware brush patch: identical to vehicle_brush_patch with the
+// bristle friction (mu_s, and hence mu_k) additionally scaled by mu_scale
+// (docs/ROAD-SURFACE.md §6 — grass uses ~0.55). mu_scale = 1.0f is an exact
+// IEEE identity (x·1.0f == x), so the asphalt path is bit-identical to the
+// pre-grass kernel. NOT a wasm export.
+void vehicle_brush_patch_mu( float sigma_x, float sigma_y, float fz, float t_surf, float mu_scale, float* out_fx,
+							 float* out_fy, float* out_trail );
 
 // Two-node tire thermal step (docs/TIRE-MODEL.md §2 + ROAD-SURFACE.md §2):
 // friction power into the surface, speed-scaled convection, surface↔core

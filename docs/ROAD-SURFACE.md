@@ -93,3 +93,34 @@ declaration in sim.h. Everything else unchanged.
    COMPLETES (--target-speed 15; report time — expect equal or faster than
    65.4 s thanks to the smoother surface).
 4. Export surface = CONTRACTS §1.1 + sim_ffb_torque + sim_tire_temp, nothing else.
+
+## 6. Off-corridor fallback (addendum, 2026-07-09)
+
+On **TRK1 v2 tracks** `road_query` is now TOTAL: outside the corridor
+(|lateral| > width/2 + 8) it no longer reports an unusable domain — it returns
+a flat **grass** plane: `point = (p.x, ground_y, p.z)`, normal exactly +Y,
+zero curvature, and a new `surface_kind` output = 1 (grass; 0 = asphalt /
+kerb / shoulder as before). `ground_y = (min over centerline samples of
+pos.y) − 1.35`, computed once in `road_load` — the same shared formula
+trackgen uses for the ground quad baked into the collision mesh and
+`ambience.js` uses for the visual ground disc (CONTRACTS §8).
+
+Wheels on grass (vehicle.c): the brush-model bristle friction is scaled by
+**0.55** and a rolling drag of **30 N per (m/s)** of in-plane patch velocity
+(~600 N per wheel at 20 m/s, linear in speed) is applied at the patch — grass
+is drivable but slow and slippery; going off costs time but is recoverable
+instead of a void fall. The transition at the corridor skirt is a physical
+drop from the shoulder edge to ground_y (intended). OFF_TRACK / LAP_INVALID
+logic is untouched: grass is off the drivable surface, so checkpoints crossed
+on grass still invalidate the lap — grass shortcuts cannot produce valid laps.
+
+**Compatibility (binding)**: on **v1 tracks the fallback is disabled** and
+off-corridor behavior is bit-identical to the pre-addendum kernel (query
+reports `on_road = 0` with the extrapolated shoulder profile; wheels
+mesh-raycast). This is not optional caution: the wasm smoke script provably
+dangles a wheel ~0.6 m past the corridor edge around tick 3741, so an ungated
+grass plane changes v1 hashes (measured). For on-corridor wheels the math is
+bit-identical on every version (the grass mu multiplier is exactly 1.0f on
+asphalt — an IEEE identity — and the drag branch is untaken); verified by the
+byte-identical smoke hash and a bit-exact pre-change query capture in
+tests/test_track_v2.c.

@@ -78,6 +78,16 @@ target_include_directories(test_damage PRIVATE src)
 set_target_properties(test_damage PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
 add_test(NAME damage COMMAND test_damage)
 
+# test_track_v2 covers the TRK1 v2 format (static props, CONTRACTS §8) and the
+# off-corridor grass fallback (docs/ROAD-SURFACE.md §6): parse/reject matrix,
+# chassis-vs-prop crash damage, road_query grass/legacy modes with a bit-exact
+# pre-change capture, and a full sim drive off the corridor onto grass.
+add_executable(test_track_v2 tests/test_track_v2.c tests/make_test_track.c)
+target_link_libraries(test_track_v2 PRIVATE sim)
+target_include_directories(test_track_v2 PRIVATE src)
+set_target_properties(test_track_v2 PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED YES)
+add_test(NAME track_v2 COMMAND test_track_v2)
+
 if (UNIX)
     target_link_libraries(test_determinism PRIVATE m)
     target_link_libraries(test_vehicle PRIVATE m)
@@ -85,4 +95,5 @@ if (UNIX)
     target_link_libraries(test_road PRIVATE m)
     target_link_libraries(test_suspension PRIVATE m)
     target_link_libraries(test_damage PRIVATE m)
+    target_link_libraries(test_track_v2 PRIVATE m)
 endif()

@@ -32,11 +32,13 @@ def pack(track: dict) -> bytes:
     verts = track["terrain"]["vertices"]
     tris = track["terrain"]["triangles"]
     checkpoints = track["checkpoints"]
+    props = track.get("props")
     s, v, t, c = len(pos), len(verts), len(tris), len(checkpoints)
+    version = 2 if props is not None else 1
 
     out = bytearray()
     out += b"STRK"
-    out += struct.pack("<HH", 1, c)
+    out += struct.pack("<HH", version, c)
     out += struct.pack("<Q", track["seed"] & 0xFFFFFFFFFFFFFFFF)
     out += struct.pack("<III", s, v, t)
     for i in range(s):
@@ -47,6 +49,15 @@ def pack(track: dict) -> bytes:
     for tri in tris:
         out += struct.pack("<3I", *tri)
     out += struct.pack("<Iff", track["spawn"]["index"], track["spawn"]["yaw"], 0.0)
+    if version == 2:
+        # TRK1 v2 props (CONTRACTS §8): 36-byte records, little-endian:
+        # type u16, _pad u16, pos f32[3], yaw f32, half f32[3], reserved u32.
+        if len(props) > 4096:
+            raise SystemExit(f"prop_count {len(props)} exceeds the 4096 cap")
+        out += struct.pack("<I", len(props))
+        for p in props:
+            out += struct.pack("<HH3ff3fI", p["type"], 0, *p["pos"], p["yaw"],
+                               *p["half"], 0)
     return bytes(out)
 
 

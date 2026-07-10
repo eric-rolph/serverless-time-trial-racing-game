@@ -8,6 +8,10 @@
 // where the smoothed |κ| exceeds the trackgen gate, linear shoulder ramp
 // matching the mesh outside. Normal = normalize(up − (∂h/∂l)·side) —
 // continuous camber through banking transitions, which is the point.
+// Off-corridor (|lateral| > width/2 + shoulder) the query returns the flat
+// grass plane at ground_y when grass_fallback is enabled (TRK1 v2 tracks,
+// docs/ROAD-SURFACE.md §6) — the query is then total. v1 tracks keep the
+// legacy off-corridor behavior bit-exactly (archived replays).
 //
 // Determinism: fixed iteration counts, mul/add/div + sqrtf + b3ComputeCosSin
 // only (the kerb sinusoid reduces to sin(4πu) because the 2.5 m sample
@@ -23,10 +27,27 @@
 // tangents, window 15 — mirror trackgen").
 // ---------------------------------------------------------------------------
 
-int road_load( Road* r, const RoadSample* samples, uint32_t count )
+int road_load( Road* r, const RoadSample* samples, uint32_t count, int grass_fallback )
 {
 	r->samples = samples;
 	r->count = count;
+	r->grass_fallback = grass_fallback;
+
+	// Off-corridor grass height (docs/ROAD-SURFACE.md §6, shared formula):
+	// min over centerline samples of pos.y, minus ROAD_GROUND_DROP. Computed
+	// once here; fixed iteration order, plain float compare — deterministic.
+	{
+		float min_y = samples[0].pos.y;
+		for ( uint32_t i = 1; i < count; ++i )
+		{
+			if ( samples[i].pos.y < min_y )
+			{
+				min_y = samples[i].pos.y;
+			}
+		}
+		r->ground_y = min_y - ROAD_GROUND_DROP;
+	}
+
 	r->kappa = (float*)malloc( sizeof( float ) * count );
 	float* raw = (float*)malloc( sizeof( float ) * count );
 	if ( r->kappa == NULL || raw == NULL )
@@ -253,38 +274,58 @@ void road_query( const Road* r, b3Vec3 p, uint32_t hint, RoadQuery* out )
 	float al = b3AbsFloat( l );
 	float sign_l = l >= 0.0f ? 1.0f : -1.0f;
 
-	float h, dh;
-	if ( al <= half )
+	if ( !r->grass_fallback || al <= half + ROAD_SHOULDER_W )
 	{
-		// Crown: h = −crown_m · (2l/width)², 25 mm center-to-edge cross-fall.
-		float ratio = l / half;
-		h = -ROAD_CROWN_M * ratio * ratio;
-		dh = -2.0f * ROAD_CROWN_M * l / ( half * half );
+		// Corridor (road proper / kerb / shoulder): the pre-§6 math,
+		// bit-identical — this is what keeps v1 replay hashes unchanged.
+		// With grass_fallback off (v1 tracks) this path also serves
+		// off-corridor queries exactly as the pre-§6 kernel did (extrapolated
+		// shoulder profile, on_road = 0) — legacy replays depend on it.
+		float h, dh;
+		if ( al <= half )
+		{
+			// Crown: h = −crown_m · (2l/width)², 25 mm center-to-edge cross-fall.
+			float ratio = l / half;
+			h = -ROAD_CROWN_M * ratio * ratio;
+			dh = -2.0f * ROAD_CROWN_M * l / ( half * half );
+		}
+		else
+		{
+			// Shoulder ramp: linear drop from the road edge to −1.2 m at
+			// width/2 + 8 — matches the mesh ribbon (trackgen rows are a straight
+			// line from edge height to edge − SHOULDER_DROP over SHOULDER_W).
+			float over = al - half;
+			h = -ROAD_SHOULDER_DROP * ( over / ROAD_SHOULDER_W );
+			dh = -( ROAD_SHOULDER_DROP / ROAD_SHOULDER_W ) * sign_l;
+
+			if ( over <= ROAD_KERB_WIDTH && b3AbsFloat( kappa ) > ROAD_KERB_KAPPA )
+			{
+				// Kerb band: smooth sinusoidal rumble replacing the mesh teeth
+				// (tires only). h = 0.02·(0.5 + 0.5·sin(2π·s/1.25)) with
+				// s = (i + u)·2.5 m; 2.5/1.25 = 2 exactly, so the phase reduces
+				// to 4π·u (b3ComputeCosSin unwinds the angle internally).
+				b3CosSin cs = b3ComputeCosSin( 2.0f * B3_PI * 2.0f * u );
+				h = ROAD_KERB_HEIGHT * ( 0.5f + 0.5f * cs.sine );
+				dh = 0.0f; // laterally flat band, like the mesh strip
+			}
+		}
+
+		out->point = b3MulAdd( b3MulAdd( c, l, side ), h, up );
+		out->normal = b3Normalize( b3MulAdd( up, -dh, side ) );
+		out->on_road = al <= half + ROAD_SHOULDER_W;
+		out->kind = ROAD_KIND_ASPHALT;
 	}
 	else
 	{
-		// Shoulder ramp: linear drop from the road edge to −1.2 m at
-		// width/2 + 8 — matches the mesh ribbon (trackgen rows are a straight
-		// line from edge height to edge − SHOULDER_DROP over SHOULDER_W).
-		float over = al - half;
-		h = -ROAD_SHOULDER_DROP * ( over / ROAD_SHOULDER_W );
-		dh = -( ROAD_SHOULDER_DROP / ROAD_SHOULDER_W ) * sign_l;
-
-		if ( over <= ROAD_KERB_WIDTH && b3AbsFloat( kappa ) > ROAD_KERB_KAPPA )
-		{
-			// Kerb band: smooth sinusoidal rumble replacing the mesh teeth
-			// (tires only). h = 0.02·(0.5 + 0.5·sin(2π·s/1.25)) with
-			// s = (i + u)·2.5 m; 2.5/1.25 = 2 exactly, so the phase reduces
-			// to 4π·u (b3ComputeCosSin unwinds the angle internally).
-			b3CosSin cs = b3ComputeCosSin( 2.0f * B3_PI * 2.0f * u );
-			h = ROAD_KERB_HEIGHT * ( 0.5f + 0.5f * cs.sine );
-			dh = 0.0f; // laterally flat band, like the mesh strip
-		}
+		// Off-corridor fallback (docs/ROAD-SURFACE.md §6, TRK1 v2 tracks):
+		// flat grass plane at ground_y, normal +Y, zero curvature. Solid
+		// landscape — the car drops from the shoulder skirt onto drivable
+		// grass instead of falling into the void. The drop is intended.
+		out->point = ( b3Vec3 ){ p.x, r->ground_y, p.z };
+		out->normal = ( b3Vec3 ){ 0.0f, 1.0f, 0.0f };
+		out->on_road = 0;
+		out->kind = ROAD_KIND_GRASS;
 	}
-
-	out->point = b3MulAdd( b3MulAdd( c, l, side ), h, up );
-	out->normal = b3Normalize( b3MulAdd( up, -dh, side ) );
 	out->lateral = l;
-	out->on_road = al <= half + ROAD_SHOULDER_W;
 	out->seg = i;
 }

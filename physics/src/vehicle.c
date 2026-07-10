@@ -432,6 +432,18 @@ static float sClampMag( float x, float m )
 	return b3ClampFloat( x, -m, m );
 }
 
+// ---------------------------------------------------------------------------
+// Grass surface (docs/ROAD-SURFACE.md §6) — off-corridor wheels ride the flat
+// grass plane: reduced bristle friction plus a rolling drag, so going off
+// costs time but is recoverable. Both effects are completely inert for
+// on-corridor wheels (mu scale is exactly 1.0f, the drag branch is untaken),
+// which keeps v1 replay hashes byte-identical.
+// ---------------------------------------------------------------------------
+
+#define SIM_GRASS_MU_SCALE 0.55f  // bristle-friction multiplier on grass
+#define SIM_GRASS_DRAG_COEF 30.0f // N per (m/s) of in-plane patch velocity
+								  // (~600 N per wheel at 20 m/s, linear in speed)
+
 void vehicle_apply_impact( Vehicle* v, float approachSpeed, b3Vec3 localPoint )
 {
 	if ( approachSpeed <= SIM_DAMAGE_THRESHOLD )
@@ -509,8 +521,13 @@ float vehicle_effect_max_steer( const Vehicle* v )
 // Both act along sigma-hat, so longitudinal and lateral demand share one
 // friction budget with no ellipse hack. Non-static so test_tire can sweep it
 // directly; NOT in the wasm export list (CONTRACTS §1.1 surface unchanged).
-void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, float* out_fx, float* out_fy,
-						  float* out_trail )
+//
+// vehicle_brush_patch_mu additionally scales the bristle friction by mu_scale
+// (grass, docs/ROAD-SURFACE.md §6). mu_scale = 1.0f multiplies the thermal
+// mu_s by exactly 1.0f — an IEEE identity — so the asphalt path is
+// bit-identical to the pre-grass kernel (v1 replay hashes unchanged).
+void vehicle_brush_patch_mu( float sigma_x, float sigma_y, float fz, float t_surf, float mu_scale, float* out_fx,
+							 float* out_fy, float* out_trail )
 {
 	const VehicleTuning* t = &kTuning;
 
@@ -527,11 +544,12 @@ void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, 
 	float sx_hat = sigma_x * inv_sig;
 	float sy_hat = sigma_y * inv_sig;
 
-	// Thermal grip factor (docs/TIRE-MODEL.md §2)
+	// Thermal grip factor (docs/TIRE-MODEL.md §2), then the surface scale
+	// (grass ~0.55, asphalt exactly 1.0f — IEEE identity, bit-identical).
 	float dT = t_surf - t->thermal_t_opt;
 	float mu_t = 1.0f - t->thermal_k_t * dT * dT;
 	mu_t = b3ClampFloat( mu_t, 0.88f, 1.00f );
-	float mu_s = t->brush_mu_s * mu_t;
+	float mu_s = t->brush_mu_s * mu_t * mu_scale;
 	float mu_k = t->brush_mu_k_ratio * mu_s;
 
 	float w = ( 2.0f * a ) / (float)SIM_BRUSH_N; // element width
@@ -554,6 +572,13 @@ void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, 
 	*out_fx = f_sum * sx_hat;
 	*out_fy = f_sum * sy_hat;
 	*out_trail = ( f_sum > 1.0e-3f ) ? ( m_sum / f_sum ) : a * ( 1.0f / 3.0f );
+}
+
+// Asphalt-only wrapper (the historical signature, kept for the test sweeps).
+void vehicle_brush_patch( float sigma_x, float sigma_y, float fz, float t_surf, float* out_fx, float* out_fy,
+						  float* out_trail )
+{
+	vehicle_brush_patch_mu( sigma_x, sigma_y, fz, t_surf, 1.0f, out_fx, out_fy, out_trail );
 }
 
 // Advance the two-node thermal state of one tire by dt (docs/TIRE-MODEL.md §2
@@ -817,6 +842,7 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 		// query. Mesh raycast only as the off-domain fallback — the chassis
 		// body still collides with the mesh, only the WHEELS go analytic. ---
 		int have_contact = 0;
+		int grass = 0; // contact is the off-corridor grass plane (§6)
 		float hit_dist = 0.0f;
 		b3Vec3 contact_point = origin;
 		b3Vec3 contact_normal = up;
@@ -834,7 +860,15 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 			road_query( road, origin, w->road_hint, &rq );
 			w->road_hint = rq.seg;
 
-			if ( rq.on_road )
+			// On v2 tracks the query is total (docs/ROAD-SURFACE.md §6):
+			// corridor answers are bit-identical to before, off-corridor is
+			// the flat grass plane at ground_y. On v1 tracks off-corridor
+			// queries still report !on_road with kind ASPHALT, so this
+			// condition — and everything downstream — reduces exactly to the
+			// legacy `if (rq.on_road)` control flow (bit-identical replays).
+			// A surface facing away from the ray (rolled car) still ends up
+			// airborne, exactly as before; chassis mesh collision handles it.
+			if ( rq.on_road || rq.kind == ROAD_KIND_GRASS )
 			{
 				need_mesh_fallback = 0;
 				// Suspension ray x(d) = origin - d·up against the local
@@ -849,6 +883,7 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 						hit_dist = d > 0.0f ? d : 0.0f; // below surface → full compression
 						contact_point = b3MulAdd( origin, -hit_dist, up );
 						contact_normal = rq.normal;
+						grass = ( rq.kind == ROAD_KIND_GRASS );
 					}
 				}
 			}
@@ -977,6 +1012,11 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 		// forces are the sub-step MEAN applied once per tick (Box3D
 		// integrates F·SIM_DT, so the mean preserves the summed impulses):
 		// strut reaction at the hardpoint, tire in-plane force at the patch.
+		// Grass wheels see reduced bristle friction (§6). Asphalt multiplies
+		// by exactly 1.0f — an IEEE identity, so on-corridor sub-steps are
+		// bit-identical to the pre-grass kernel.
+		const float mu_scale = grass ? SIM_GRASS_MU_SCALE : 1.0f;
+
 		float fx_sum = 0.0f;
 		float fy_sum = 0.0f;
 		float rack_sum = 0.0f;
@@ -993,7 +1033,7 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 			w->slip_ratio = slip_ratio; // last sub-step's value is exported
 
 			float fx, fy, trail;
-			vehicle_brush_patch( slip_ratio, sigma_y, fz, w->t_surf, &fx, &fy, &trail );
+			vehicle_brush_patch_mu( slip_ratio, sigma_y, fz, w->t_surf, mu_scale, &fx, &fy, &trail );
 			fx_sum += fx;
 			fy_sum += fy;
 
@@ -1031,6 +1071,16 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 		// DOF, so the patch force transfers rigidly to the chassis).
 		b3Vec3 tire_force = b3Add( b3MulSV( fx_sum * inv_n, wheel_fwd ), b3MulSV( fy_sum * inv_n, wheel_side ) );
 		b3Body_ApplyForce( chassis, tire_force, contact_point, true );
+
+		// Grass rolling drag (§6): linear in the in-plane patch velocity,
+		// ~600 N per wheel at 20 m/s — grass is drivable but slow. This
+		// branch is untaken on the corridor (completely inert on asphalt).
+		if ( grass )
+		{
+			b3Vec3 grass_drag = b3Add( b3MulSV( -SIM_GRASS_DRAG_COEF * v_long, wheel_fwd ),
+									   b3MulSV( -SIM_GRASS_DRAG_COEF * v_lat, wheel_side ) );
+			b3Body_ApplyForce( chassis, grass_drag, contact_point, true );
+		}
 
 		if ( front )
 		{

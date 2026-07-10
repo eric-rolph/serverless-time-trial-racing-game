@@ -158,7 +158,7 @@ int main( void )
 	build_oval( banked, 1 );
 
 	Road road_flat, road_banked;
-	if ( road_load( &road_flat, flat, OVAL_S ) != 0 || road_load( &road_banked, banked, OVAL_S ) != 0 )
+	if ( road_load( &road_flat, flat, OVAL_S, 0 ) != 0 || road_load( &road_banked, banked, OVAL_S, 0 ) != 0 )
 	{
 		fprintf( stderr, "road_load failed\n" );
 		return 1;

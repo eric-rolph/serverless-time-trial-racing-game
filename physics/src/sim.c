@@ -60,6 +60,22 @@ static Sim g_sim; // zero-initialized: world_valid = 0, track_valid = 0
 // Incremental nearest-centerline search window (samples each direction).
 #define SIM_SEARCH_WINDOW 12
 
+// TRK1 v2 static props (CONTRACTS §8): hard cap on prop_count and the packed
+// on-disk record stride (type u16, _pad u16, pos f32[3], yaw f32, half f32[3],
+// reserved u32 — 36 bytes).
+#define SIM_MAX_PROPS 4096u
+#define SIM_PROP_RECORD_SIZE 36u
+
+// One parsed v2 prop record (parse-time only — the Box3D static body created
+// from it lives and dies with the world).
+typedef struct TrackProp
+{
+	uint16_t type; // 0 tire_stack, 1 armco_segment, 2 wall_generic (render-only)
+	b3Vec3 pos;	   // world-space center of the collision box
+	float yaw;	   // rotation about +Y (radians)
+	b3Vec3 half;   // box half-extents (m)
+} TrackProp;
+
 // ---------------------------------------------------------------------------
 // FNV-1a-64 (CONTRACTS §1.4)
 // ---------------------------------------------------------------------------
@@ -193,7 +209,7 @@ int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 		return SIM_ERR_BAD_MAGIC;
 	}
 	uint16_t version = sReadU16( &r );
-	if ( version != 1 )
+	if ( version != 1 && version != 2 )
 	{
 		return SIM_ERR_BAD_VERSION;
 	}
@@ -209,9 +225,25 @@ int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 		return SIM_ERR_BAD_COUNTS;
 	}
 
-	// Total size check before allocating
+	// Total size check before allocating. For v2 the prop count lives at a
+	// computable offset (right after the v1 tail), so it is peeked and folded
+	// into the size check here — still BEFORE any allocation.
 	size_t need = 28 + (size_t)40 * sample_count + (size_t)4 * checkpoint_count + (size_t)12 * vertex_count +
 				  (size_t)12 * triangle_count + 12;
+	uint32_t prop_count = 0;
+	if ( version >= 2 )
+	{
+		if ( (size_t)len < need + 4 )
+		{
+			return SIM_ERR_TRUNCATED;
+		}
+		memcpy( &prop_count, r.p + need, 4 );
+		if ( prop_count > SIM_MAX_PROPS )
+		{
+			return SIM_ERR_BAD_COUNTS;
+		}
+		need += 4 + (size_t)SIM_PROP_RECORD_SIZE * prop_count;
+	}
 	if ( (size_t)len < need )
 	{
 		return SIM_ERR_TRUNCATED;
@@ -291,6 +323,64 @@ int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 		return SIM_ERR_TRUNCATED;
 	}
 
+	// --- TRK1 v2: static prop records appended after the v1 tail (CONTRACTS
+	// §8). Version 1 blobs never reach this block — their read sequence is
+	// byte-identical to the pre-v2 parser. ---
+	TrackProp* props = NULL;
+	if ( version >= 2 )
+	{
+		uint32_t prop_count_again = sReadU32( &r );
+		(void)prop_count_again; // same bytes peeked for the size check above
+		if ( prop_count > 0 )
+		{
+			props = (TrackProp*)malloc( sizeof( TrackProp ) * prop_count );
+			if ( props == NULL )
+			{
+				free( verts );
+				free( indices );
+				sFreeTrack( t );
+				return SIM_ERR_ALLOC;
+			}
+		}
+		for ( uint32_t i = 0; i < prop_count; ++i )
+		{
+			TrackProp* pr = &props[i];
+			pr->type = sReadU16( &r );
+			(void)sReadU16( &r ); // _pad
+			pr->pos.x = sReadF32( &r );
+			pr->pos.y = sReadF32( &r );
+			pr->pos.z = sReadF32( &r );
+			pr->yaw = sReadF32( &r );
+			pr->half.x = sReadF32( &r );
+			pr->half.y = sReadF32( &r );
+			pr->half.z = sReadF32( &r );
+			(void)sReadU32( &r ); // reserved (record stride = 36 bytes)
+
+			// Collision-shape sanity: positive bounded half extents, finite
+			// pose (the `>=`/`<=` comparisons reject NaN as well).
+			int ok = pr->half.x > 0.0f && pr->half.x <= 100.0f && pr->half.y > 0.0f && pr->half.y <= 100.0f &&
+					 pr->half.z > 0.0f && pr->half.z <= 100.0f && pr->pos.x >= -1.0e6f && pr->pos.x <= 1.0e6f &&
+					 pr->pos.y >= -1.0e6f && pr->pos.y <= 1.0e6f && pr->pos.z >= -1.0e6f && pr->pos.z <= 1.0e6f &&
+					 pr->yaw >= -1.0e4f && pr->yaw <= 1.0e4f;
+			if ( !ok )
+			{
+				free( props );
+				free( verts );
+				free( indices );
+				sFreeTrack( t );
+				return SIM_ERR_BAD_GEOMETRY;
+			}
+		}
+		if ( r.fail )
+		{
+			free( props );
+			free( verts );
+			free( indices );
+			sFreeTrack( t );
+			return SIM_ERR_TRUNCATED;
+		}
+	}
+
 	// --- Build the collision mesh (static triangle soup, mapping decision in NOTES.md) ---
 	b3MeshDef meshDef = { 0 };
 	meshDef.vertices = verts;
@@ -309,14 +399,18 @@ int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 
 	if ( t->mesh == NULL )
 	{
+		free( props );
 		sFreeTrack( t );
 		return SIM_ERR_BAD_GEOMETRY;
 	}
 
 	// --- Analytic road surface: precompute the smoothed curvature array
-	// (S floats, docs/ROAD-SURFACE.md §1) ---
-	if ( road_load( &t->road, t->samples, sample_count ) != 0 )
+	// (S floats, docs/ROAD-SURFACE.md §1). The §6 off-corridor grass fallback
+	// is enabled for TRK1 v2 tracks only — v1 tracks must replay bit-identically
+	// to the pre-§6 kernel forever (archived laps). ---
+	if ( road_load( &t->road, t->samples, sample_count, version >= 2 ) != 0 )
 	{
+		free( props );
 		sFreeTrack( t );
 		return SIM_ERR_ALLOC;
 	}
@@ -346,6 +440,42 @@ int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 	groundShape.filter.categoryBits = SIM_CAT_TERRAIN;
 	groundShape.filter.maskBits = ~0ull;
 	b3CreateMeshShape( ground, &groundShape, t->mesh, b3Vec3_one );
+
+	// --- TRK1 v2 props: one static Box3D box body per record (CONTRACTS §8).
+	// Filter mirrors the track mesh exactly (category SIM_CAT_TERRAIN, mask
+	// all), so chassis contacts generate hit events → crash damage exactly
+	// like terrain (the chassis shape carries enableHitEvents). Fixed creation
+	// order = deterministic world; the bodies are destroyed with the world in
+	// sTeardownWorld (b3DestroyWorld tears down its bodies and shapes). Props
+	// never move. Version 1 blobs create nothing here (prop_count == 0). ---
+	for ( uint32_t i = 0; i < prop_count; ++i )
+	{
+		const TrackProp* pr = &props[i];
+
+		b3BodyDef propDef = b3DefaultBodyDef();
+		propDef.type = b3_staticBody;
+		propDef.position = pr->pos;
+		// Yaw about +Y via Box3D's deterministic cos/sin (same construction
+		// as the vehicle spawn quat).
+		{
+			b3CosSin cs = b3ComputeCosSin( 0.5f * pr->yaw );
+			propDef.rotation = ( b3Quat ){ { 0.0f, cs.sine, 0.0f }, cs.cosine };
+		}
+		propDef.name = "prop";
+		b3BodyId prop_body = b3CreateBody( g_sim.world, &propDef );
+
+		b3ShapeDef propShape = b3DefaultShapeDef();
+		propShape.baseMaterial.friction = 1.0f;
+		propShape.baseMaterial.restitution = 0.0f;
+		propShape.filter.categoryBits = SIM_CAT_TERRAIN;
+		propShape.filter.maskBits = ~0ull;
+
+		// b3CreateHullShape clones the hull data (same pattern as the chassis).
+		b3BoxHull box = b3MakeBoxHull( pr->half.x, pr->half.y, pr->half.z );
+		b3CreateHullShape( prop_body, &propShape, &box.base );
+	}
+	free( props );
+	props = NULL;
 
 	// --- Vehicle at spawn ---
 	CenterlineSample* spawn = &t->samples[t->spawn_index];

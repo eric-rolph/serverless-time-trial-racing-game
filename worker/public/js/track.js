@@ -5,7 +5,8 @@ export function parseTrack(buf) {
   const bytes = new Uint8Array(buf);
   const dv = new DataView(buf);
   if (dv.getUint32(0, true) !== 0x4b525453) throw new Error("bad TRK1 magic");
-  if (dv.getUint16(4, true) !== 1) throw new Error("bad TRK1 version");
+  const version = dv.getUint16(4, true);
+  if (version !== 1 && version !== 2) throw new Error("bad TRK1 version");
   const checkpointCount = dv.getUint16(6, true);
   const S = dv.getUint32(16, true);
   const V = dv.getUint32(20, true);
@@ -26,8 +27,32 @@ export function parseTrack(buf) {
   const verts = new Float32Array(buf, o, V * 3); o += 12 * V;
   const tris = new Uint32Array(buf, o, T * 3); o += 12 * T;
   const spawnIndex = dv.getUint32(o, true);
+  o += 12; // spawn_index u32, spawn_yaw f32, reserved f32 — end of the v1 payload
 
-  return { bytes, center, up, tangent, width, checkpoints, verts, tris, spawnIndex, S };
+  // TRK1 v2 (CONTRACTS §8): a prop table appended after the v1 tail.
+  // prop_count u32 (0..4096), then prop_count 36-byte records:
+  //   type u16 (0 tire_stack, 1 armco_segment, 2 wall_generic), _pad u16,
+  //   pos f32[3] (world-space box center), yaw f32 (about +Y, radians),
+  //   half f32[3] (box half-extents, m); 4 reserved bytes pad each to 36.
+  // Each prop is one static collision box in the kernel; here we only carry
+  // the data so ambience.js can draw visuals that match the collision.
+  const props = [];
+  if (version === 2) {
+    const propCount = dv.getUint32(o, true);
+    o += 4;
+    if (propCount > 4096) throw new Error("bad TRK1 prop count");
+    for (let p = 0; p < propCount; p++) {
+      props.push({
+        type: dv.getUint16(o, true),
+        pos: [dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true), dv.getFloat32(o + 12, true)],
+        yaw: dv.getFloat32(o + 16, true),
+        half: [dv.getFloat32(o + 20, true), dv.getFloat32(o + 24, true), dv.getFloat32(o + 28, true)],
+      });
+      o += 36;
+    }
+  }
+
+  return { bytes, center, up, tangent, width, checkpoints, verts, tris, spawnIndex, S, props };
 }
 
 export function fnv1a64(bytes) {

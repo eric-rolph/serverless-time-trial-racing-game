@@ -6,6 +6,11 @@
 //     skipped where they'd land on another part of the loop;
 //   • red/white tire-stack barriers lining the OUTSIDE of the tightest
 //     corners (same smoothed-curvature rule the kerb paint uses);
+//     — EXCEPT on TRK1 v2 tracks: tire stacks, Armco and concrete walls are
+//     then placed from track.props (the kernel's collision boxes) so the
+//     visuals match the physics exactly; heuristics remain the v1 fallback.
+//     Trees/gantry/grandstands/brake-boards stay heuristic (no collision,
+//     far off-line by design);
 //   • a start/finish gantry at sample 0 with an emissive strip + banner
 //     (materials exposed via group.userData.glowMaterials so the time-of-day
 //     lighting can boost them at night);
@@ -291,34 +296,96 @@ export function buildAmbience(track, hash = null) {
     group.add(trunks, canopies);
   }
 
+  // ------------------------------------------- collision-prop barriers (v2)
+  // TRK1 v2 tracks carry authored collision boxes (track.props); each becomes
+  // ONE static box in the physics kernel, so the visuals below are sized to
+  // tile each box exactly — what you see is what you hit (never protruding
+  // more than ~10 cm past the box, never visibly inside it). One InstancedMesh
+  // per type family. v1 tracks (empty props) keep the curvature heuristics.
+  const props = track.props && track.props.length ? track.props : null;
+  const upY2 = new THREE.Vector3(0, 1, 0);
+
   // ------------------------------------------- tire-stack barriers
-  // Outside of every corner the kerb painter flags (|smoothed κ| > 0.022),
-  // one stack (2 cylinders high, alternating red/white) every ~5 m.
-  const stacks = [];
-  for (let i = 0; i < n; i += 2) {
-    if (Math.abs(kappa[i]) <= KERB_KAPPA) continue;
-    const f = frame(i);
-    const lat = track.width[i] / 2 + 2.4 + rand() * 0.8;
-    const p = f.c.clone().addScaledVector(f.side, -insideSign(i) * lat)
-      .addScaledVector(f.t, (rand() - 0.5) * 1.2);
-    stacks.push({ p, u: f.u });
-  }
-  if (stacks.length) {
-    const tireGeo = new THREE.CylinderGeometry(0.55, 0.55, 0.55, 10);
-    const barrier = new THREE.InstancedMesh(
-      tireGeo, new THREE.MeshLambertMaterial({ color: 0xffffff }), stacks.length * 2);
-    const red = new THREE.Color(0xb8352b), white = new THREE.Color(0xd9dde2);
-    const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), one = new THREE.Vector3(1, 1, 1);
-    const pos = new THREE.Vector3();
-    stacks.forEach((st, k) => {
-      for (const level of [0, 1]) {
-        pos.copy(st.p).addScaledVector(st.u, 0.28 + level * 0.56);
-        m4.compose(pos, q, one);
-        barrier.setMatrixAt(2 * k + level, m4);
-        barrier.setColorAt(2 * k + level, (k + level) % 2 ? red : white);
+  if (props) {
+    // type 0 → red/white tire stacks. The box is approximated by a row of
+    // stacked cylinders: radius = the box's narrow horizontal half-extent
+    // (so each tire spans the full barrier depth), column count = round(
+    // long/2r) with per-column length-radius stretched so the row spans the
+    // box's long axis edge-to-edge, level count/height chosen the same way
+    // vertically (~0.55 m tires). Cylinders inscribe the box: flush at the
+    // row ends, top and faces; only the gaps between circles sit inside it.
+    const items = [];
+    for (const pr of props) {
+      if (pr.type !== 0) continue;
+      const [hx, hy, hz] = pr.half;
+      const alongX = hx >= hz; // row runs down the box's long local axis
+      const halfLong = Math.max(alongX ? hx : hz, 0.05);
+      const r = Math.max(0.05, Math.min(hx, hz)); // tire radius = narrow half
+      const cols = Math.max(1, Math.min(96, Math.round(halfLong / r)));
+      const rLong = halfLong / cols; // per-column half-length along the row
+      const levels = Math.max(1, Math.min(8, Math.round((2 * hy) / 0.55)));
+      const levelH = Math.max(0.1, (2 * hy) / levels);
+      items.push({ pr, alongX, halfLong, r, cols, rLong, levels, levelH });
+    }
+    const total = items.reduce((s, it) => s + it.cols * it.levels, 0);
+    if (total) {
+      const tireGeo = new THREE.CylinderGeometry(1, 1, 1, 10); // unit; scaled per instance
+      const barrier = new THREE.InstancedMesh(
+        tireGeo, new THREE.MeshLambertMaterial({ color: 0xffffff }), total);
+      const red = new THREE.Color(0xb8352b), white = new THREE.Color(0xd9dde2);
+      const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
+      const dir = new THREE.Vector3(), p = new THREE.Vector3(), s = new THREE.Vector3();
+      let k = 0;
+      for (const it of items) {
+        const { pr } = it;
+        q.setFromAxisAngle(upY2, pr.yaw);
+        dir.set(it.alongX ? 1 : 0, 0, it.alongX ? 0 : 1).applyQuaternion(q);
+        s.set(it.alongX ? it.rLong : it.r, it.levelH, it.alongX ? it.r : it.rLong);
+        const bottomY = pr.pos[1] - pr.half[1];
+        for (let c = 0; c < it.cols; c++) {
+          for (let lev = 0; lev < it.levels; lev++) {
+            p.set(pr.pos[0], 0, pr.pos[2])
+              .addScaledVector(dir, -it.halfLong + (2 * c + 1) * it.rLong);
+            p.y = bottomY + (lev + 0.5) * it.levelH;
+            m4.compose(p, q, s);
+            barrier.setMatrixAt(k, m4);
+            barrier.setColorAt(k, (c + lev) % 2 ? red : white);
+            k++;
+          }
+        }
       }
-    });
-    group.add(barrier);
+      group.add(barrier);
+    }
+  } else {
+    // Heuristic (v1): outside of every corner the kerb painter flags
+    // (|smoothed κ| > 0.022), one stack (2 cylinders high, alternating
+    // red/white) every ~5 m. Visual only — no collision on v1 tracks.
+    const stacks = [];
+    for (let i = 0; i < n; i += 2) {
+      if (Math.abs(kappa[i]) <= KERB_KAPPA) continue;
+      const f = frame(i);
+      const lat = track.width[i] / 2 + 2.4 + rand() * 0.8;
+      const p = f.c.clone().addScaledVector(f.side, -insideSign(i) * lat)
+        .addScaledVector(f.t, (rand() - 0.5) * 1.2);
+      stacks.push({ p, u: f.u });
+    }
+    if (stacks.length) {
+      const tireGeo = new THREE.CylinderGeometry(0.55, 0.55, 0.55, 10);
+      const barrier = new THREE.InstancedMesh(
+        tireGeo, new THREE.MeshLambertMaterial({ color: 0xffffff }), stacks.length * 2);
+      const red = new THREE.Color(0xb8352b), white = new THREE.Color(0xd9dde2);
+      const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), one = new THREE.Vector3(1, 1, 1);
+      const pos = new THREE.Vector3();
+      stacks.forEach((st, k) => {
+        for (const level of [0, 1]) {
+          pos.copy(st.p).addScaledVector(st.u, 0.28 + level * 0.56);
+          m4.compose(pos, q, one);
+          barrier.setMatrixAt(2 * k + level, m4);
+          barrier.setColorAt(2 * k + level, (k + level) % 2 ? red : white);
+        }
+      });
+      group.add(barrier);
+    }
   }
 
   // ------------------------------------------- gravel-trap run-off beds
@@ -365,12 +432,74 @@ export function buildAmbience(track, hash = null) {
   }
 
   // ------------------------------------------- Armco guardrails
-  // Medium-speed corners (0.011 < |κ| ≤ KERB_KAPPA) get instanced W-profile
-  // steel rail where the tire stacks are NOT (stacks own the tightest
-  // corners). One 2.55 m rail per sample (2.5 m spacing → continuous run) +
-  // one post per rail, 10–14 m off the centerline, following the shoulder
-  // slope. Capped at ~380 rails.
-  {
+  if (props) {
+    // type 1 → the Apex W-profile steel rail, driven by the collision boxes.
+    // A normalized corrugated slab: the W cross-section on the front face
+    // (local +z) mirrored on the back (−z) so the ridges kiss BOTH ±hz faces
+    // of the box — correct whichever side faces the road — and the profile is
+    // stretched over the box's full height (ridge peaks flush with the box,
+    // valleys tucked ≤2·hz inside). Local space spans [−1,1]³; each instance
+    // scales by the prop's half-extents and rotates by its yaw.
+    const armco = props.filter((p) => p.type === 1);
+    if (armco.length) {
+      // (y, z) closed-loop cross-section, extruded along x. Front half is the
+      // heuristic rail's W profile renormalized to [−1,1]; back half mirrors.
+      const loop = [
+        [1, 0], [0.52, 1], [0, 0.267], [-0.52, 1], [-1, 0],
+        [-0.52, -1], [0, -0.267], [0.52, -1],
+      ];
+      const m = loop.length;
+      const rp = new Float32Array(m * 2 * 3);
+      loop.forEach(([y, z], k) => {
+        rp.set([-1, y, z], k * 6);
+        rp.set([1, y, z], k * 6 + 3);
+      });
+      const ridx = [];
+      for (let k = 0; k < m; k++) {
+        const j = (k + 1) % m;
+        ridx.push(2 * k, 2 * k + 1, 2 * j, 2 * j, 2 * k + 1, 2 * j + 1);
+      }
+      const railGeo = new THREE.BufferGeometry();
+      railGeo.setAttribute("position", new THREE.BufferAttribute(rp, 3));
+      railGeo.setIndex(ridx);
+      railGeo.computeVertexNormals();
+      const railMesh = new THREE.InstancedMesh(railGeo, new THREE.MeshStandardMaterial({
+        color: 0x9ca4ad, metalness: 0.75, roughness: 0.4, side: THREE.DoubleSide }), armco.length);
+      const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
+      const p = new THREE.Vector3(), s = new THREE.Vector3();
+      armco.forEach((pr, k) => {
+        q.setFromAxisAngle(upY2, pr.yaw);
+        p.set(pr.pos[0], pr.pos[1], pr.pos[2]);
+        s.set(pr.half[0], pr.half[1], pr.half[2]);
+        m4.compose(p, q, s);
+        railMesh.setMatrixAt(k, m4);
+      });
+      group.add(railMesh);
+    }
+    // type 2 → generic concrete wall: a plain box, carbon-grey PBR, matching
+    // the collision box exactly (unit-2 cube scaled by the half-extents).
+    const walls = props.filter((p) => p.type === 2);
+    if (walls.length) {
+      const wallGeo = new THREE.BoxGeometry(2, 2, 2);
+      const wallMesh = new THREE.InstancedMesh(wallGeo, new THREE.MeshStandardMaterial({
+        color: 0x33383f, roughness: 0.78, metalness: 0.18 }), walls.length);
+      const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
+      const p = new THREE.Vector3(), s = new THREE.Vector3();
+      walls.forEach((pr, k) => {
+        q.setFromAxisAngle(upY2, pr.yaw);
+        p.set(pr.pos[0], pr.pos[1], pr.pos[2]);
+        s.set(pr.half[0], pr.half[1], pr.half[2]);
+        m4.compose(p, q, s);
+        wallMesh.setMatrixAt(k, m4);
+      });
+      group.add(wallMesh);
+    }
+  } else {
+    // Heuristic (v1): medium-speed corners (0.011 < |κ| ≤ KERB_KAPPA) get
+    // instanced W-profile steel rail where the tire stacks are NOT (stacks
+    // own the tightest corners). One 2.55 m rail per sample (2.5 m spacing →
+    // continuous run) + one post per rail, 10–14 m off the centerline,
+    // following the shoulder slope. Capped at ~380 rails.
     const MED_LO = 0.011;
     const med = new Uint8Array(n);
     for (let i = 0; i < n; i++) {

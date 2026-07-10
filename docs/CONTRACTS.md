@@ -206,6 +206,45 @@ offset  size  field
   Box3D shape mapping (mesh vs. hull decomposition) is `physics/`-internal.
 - Binary floats are consumed as IEEE bit patterns — no text parsing in C.
 
+### TRK1 v2 — static props (additive)
+
+Everything in v1 is unchanged through the trailing
+(`spawn_index u32, spawn_yaw f32, reserved f32`). A v2 blob sets the version
+field (u16 at offset 4) to **2** and APPENDS after the v1 tail:
+
+```
+prop_count u32   (0..4096)
+then prop_count records of 36 bytes each, packed little-endian:
+  offset 0   type u16     (0 = tire_stack, 1 = armco_segment, 2 = wall_generic;
+                           renderer picks style, collision identical)
+  offset 2   _pad u16     (zero)
+  offset 4   pos f32[3]   (world-space center of the collision box)
+  offset 16  yaw f32      (rotation about +Y, radians)
+  offset 20  half f32[3]  (box half-extents, meters)
+  offset 32  reserved u32 (zero — pads the record to its 36-byte stride)
+```
+
+Kernel: version 1 parses exactly as today (bit-identical behavior, forever —
+archived v1 replays depend on it). Any version other than 1 or 2 →
+`SIM_ERR_BAD_VERSION`. Version 2 parses the v1 payload then the props
+(prop_count is included in the total size check BEFORE any allocation;
+prop_count > 4096 → `SIM_ERR_BAD_COUNTS`, truncated records →
+`SIM_ERR_TRUNCATED`, non-positive/NaN half extents or non-finite pose →
+`SIM_ERR_BAD_GEOMETRY`); each prop becomes ONE static Box3D box body (box hull
+from the half extents, positioned at pos and rotated by yaw about +Y),
+collision category = the same terrain/world category the track mesh uses, so
+chassis contact → hit events → damage all work. Props never move.
+
+**Ground rule (shared formula)**:
+`ground_y = (min over centerline samples of pos.y) − 1.35`.
+trackgen bakes a large ground quad into the COLLISION MESH at ground_y (so the
+mesh itself is the catch-all floor) AND the kernel road query falls back to a
+flat grass plane at ground_y off-corridor **on v2 tracks**
+(docs/ROAD-SURFACE.md §6). The client visual ground disc
+(worker/public/js/ambience.js) already uses this exact formula — all three
+must agree. On v1 tracks the kernel keeps the legacy off-corridor behavior
+(mesh raycast only) so existing lap hashes never change.
+
 ## 9. Versioning
 
 `sim_abi_version() = 1`, LAPLOG v1, TRK1 v1 move in lockstep; a breaking change to
