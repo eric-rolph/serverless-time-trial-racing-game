@@ -173,8 +173,12 @@ export class Lighting {
     sc.left = -45; sc.right = 45; sc.top = 45; sc.bottom = -45;
     sc.near = 10; sc.far = 400;
     sc.updateProjectionMatrix();
-    this.sun.shadow.bias = -0.0003;
-    this.sun.shadow.normalBias = 0.8; // low-poly flat shading needs the slack
+    // normalBias shrinks shadows toward their caster by nb/tan(sunElev) —
+    // at the 15° golden-hour sun, the old 0.8 m pushed shadows ~3 m off the
+    // contact patches and the car read as hovering. Keep it under one shadow
+    // texel (frustum 90 m / 2048 ≈ 4.4 cm) and lean on depth bias for acne.
+    this.sun.shadow.bias = -0.0004;
+    this.sun.shadow.normalBias = 0.02;
     scene.add(this.hemi, this.sun, this.sun.target);
 
     // ---- headlights: spot pair on the nose aiming forward/down. decay=1 so
