@@ -17,6 +17,7 @@ export class Input {
   constructor() {
     this.keys = new Set();
     this.kSteer = 0; // slewed keyboard steering
+    this.kBrake = 0; // slewed keyboard brake (rise ~200ms, fast release)
     this.cal = null; // { steer: {id, axis, rest, ext}, throttle: {...}, ... }
     try {
       const stored = JSON.parse(localStorage.getItem(CAL_KEY) ?? "null");
@@ -31,6 +32,7 @@ export class Input {
     // rotation reaches full lock (for high-rotation-range DD bases).
     this.steerSettings = { invert: false, sensitivity: 1.0, ...JSON.parse(localStorage.getItem(STEER_KEY) ?? "{}") };
     addEventListener("keydown", (e) => {
+      if (e.target.closest?.("input,textarea")) return; // typing in a field, not driving
       if (!e.repeat) this.keys.add(e.code);
     });
     addEventListener("keyup", (e) => this.keys.delete(e.code));
@@ -50,8 +52,8 @@ export class Input {
     return pads;
   }
 
-  padById(id) {
-    return this.gamepads().find((g) => g.id === id) ?? null;
+  padById(id, pads = this.gamepads()) {
+    return pads.find((g) => g.id === id) ?? null;
   }
 
   /** Begin per-channel detection across ALL devices. Two phases:
@@ -142,11 +144,20 @@ export class Input {
       .join(" · ");
   }
 
+  /** Slew the keyboard brake toward 0/1 — same clamp pattern as kSteer, but
+   *  asymmetric: full pedal takes ~200ms (rise 5.0/s), release is fast (12/s).
+   *  Shaping happens BEFORE quantize(); the logged integers stay canonical. */
+  slewBrake(target, dtSec) {
+    const slew = (target > this.kBrake ? 5.0 : 12) * dtSec;
+    this.kBrake += Math.max(-slew, Math.min(slew, target - this.kBrake));
+    return this.kBrake;
+  }
+
   /** Read one calibrated channel from its own device. null = unbound/missing. */
-  readChannel(ch, signed) {
+  readChannel(ch, signed, pads) {
     const c = this.cal?.[ch];
     if (!c) return null;
-    const gp = this.padById(c.id);
+    const gp = this.padById(c.id, pads);
     if (!gp) return null;
     const v = gp.axes[c.axis] ?? c.rest;
     const span = c.ext - c.rest;
@@ -160,49 +171,53 @@ export class Input {
 
   /** Latest sample as floats: steer -1..1, throttle/brake 0..1. */
   sample(dtSec) {
+    // One navigator.getGamepads() snapshot per tick — threaded through helpers.
+    const pads = this.gamepads();
+    const s = this.steerSettings;
+    const shape = (v) => Math.max(-1, Math.min(1, v * s.sensitivity * (s.invert ? -1 : 1)));
+    const kbBrakeTarget = this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0;
     // Calibrated multi-device rig takes precedence — any bound channel
     // activates it (unbound channels read 0 / fall back to keys).
     if (this.cal && Object.keys(this.cal).length > 0) {
       const boundIds = new Set(CHANNELS.map((ch) => this.cal?.[ch]?.id).filter(Boolean));
-      const present = [...boundIds].filter((id) => this.padById(id)).length;
+      const present = [...boundIds].filter((id) => this.padById(id, pads)).length;
       // Keyboard stays usable for unbound channels (e.g. steer on keys while
       // only pedals are bound).
       const kbSteer = (this.keys.has("ArrowLeft") || this.keys.has("KeyA") ? -1 : 0) +
                       (this.keys.has("ArrowRight") || this.keys.has("KeyD") ? 1 : 0);
-      const s = this.steerSettings;
-      const shape = (v) => Math.max(-1, Math.min(1, v * s.sensitivity * (s.invert ? -1 : 1)));
-      const rawSteer = this.readChannel("steer", true);
+      const rawSteer = this.readChannel("steer", true, pads);
+      const rawBrake = this.readChannel("brake", false, pads);
       return {
         steer: rawSteer !== null ? shape(rawSteer) : kbSteer,
-        throttle: this.readChannel("throttle", false) ?? (this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0),
-        brake: this.readChannel("brake", false) ?? (this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0),
-        handbrake: (this.readChannel("handbrake", false) ?? 0) > 0.5 || this.keys.has("Space"),
+        throttle: this.readChannel("throttle", false, pads) ?? (this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0),
+        // Real pedal passes through untouched; only the keyboard fallback slews.
+        brake: rawBrake !== null ? rawBrake : this.slewBrake(kbBrakeTarget, dtSec),
+        handbrake: (this.readChannel("handbrake", false, pads) ?? 0) > 0.5 || this.keys.has("Space"),
         device: `rig: ${present}/${boundIds.size} bound device(s) present`,
       };
     }
     // Zero-config controllers: prefer a standard-mapped pad among ALL devices.
-    const std = this.gamepads().find((g) => g.mapping === "standard");
+    const std = pads.find((g) => g.mapping === "standard");
     if (std) {
       const dz = (v) => (Math.abs(v) < 0.08 ? 0 : v);
       return {
-        steer: dz(std.axes[0] ?? 0),
+        steer: shape(dz(std.axes[0] ?? 0)),
         throttle: std.buttons[7]?.value ?? 0,
         brake: std.buttons[6]?.value ?? 0,
         handbrake: std.buttons[0]?.pressed ?? false,
-        device: `${std.id.slice(0, 40)} (standard mapping)`,
+        device: `${std.id.slice(0, 40)} (standard mapping) — A = handbrake`,
       };
     }
-    // Keyboard: slewed steering so it's actually drivable.
+    // Keyboard: slewed steering and brake so it's actually drivable.
     const target = (this.keys.has("ArrowLeft") || this.keys.has("KeyA") ? -1 : 0) +
                    (this.keys.has("ArrowRight") || this.keys.has("KeyD") ? 1 : 0);
     const slew = 3.0 * dtSec;
     this.kSteer += Math.max(-slew, Math.min(slew, target - this.kSteer));
     if (target === 0) this.kSteer *= Math.max(0, 1 - 6 * dtSec);
-    const pads = this.gamepads();
     return {
       steer: this.kSteer,
       throttle: this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0,
-      brake: this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0,
+      brake: this.slewBrake(kbBrakeTarget, dtSec),
       handbrake: this.keys.has("Space"),
       device: pads.length ? `keyboard (${pads.length} device(s) seen — press I to bind)` : "keyboard",
     };

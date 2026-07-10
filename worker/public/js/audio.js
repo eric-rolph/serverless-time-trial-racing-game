@@ -51,7 +51,13 @@ export class EngineAudio {
 
   /** Call from any user-gesture handler; idempotent. */
   start() {
-    if (this.ctx) return;
+    if (this.ctx) {
+      // A context created outside real user activation (the armed-idle gamepad
+      // start path polls from rAF) comes up suspended; the first genuine
+      // gesture routes here — resume it so audio isn't dead until reload.
+      if (this.ctx.state === "suspended") this.ctx.resume();
+      return;
+    }
     const ctx = new AudioContext();
     this.ctx = ctx;
 
@@ -76,10 +82,12 @@ export class EngineAudio {
     this.osc1.start();
     this.osc2.start();
 
-    // One shared looping noise buffer fans out into all tire voices.
+    // One shared looping noise buffer fans out into all tire voices, and is
+    // reused by one-shot impact() BufferSources.
     const noiseBuf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
     const data = noiseBuf.getChannelData(0);
     for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    this.noiseBuf = noiseBuf;
     this.noise = ctx.createBufferSource();
     this.noise.buffer = noiseBuf;
     this.noise.loop = true;
@@ -101,20 +109,127 @@ export class EngineAudio {
     this.kerb = voice(110, 1.2); // low thump for kerb strikes
     this.noise.start();
 
-    this.master.gain.linearRampToValueAtTime(0.5, ctx.currentTime + 0.5);
+    this.master.gain.linearRampToValueAtTime(this.muted ? 0 : 0.5, ctx.currentTime + 0.5);
   }
 
   toggleMute() {
     this.muted = !this.muted;
-    if (this.ctx) this.master.gain.value = this.muted ? 0 : 0.5;
+    if (this.ctx) {
+      // Smooth 50 ms ramp instead of a hard jump — no clicks.
+      const now = this.ctx.currentTime;
+      this.master.gain.cancelScheduledValues(now);
+      this.master.gain.setTargetAtTime(this.muted ? 0 : 0.5, now, 0.05);
+    }
     return this.muted;
   }
 
-  /** state: SimStateV1 view {speed, wheels[]}; throttle 0..1; sim: the Sim
-   *  wrapper for guarded tireTemp() reads (may be null). Call every frame. */
-  update(state, throttle, sim = null) {
+  /** Fire-and-forget UI/event blip: OscillatorNode with an exponential-decay
+   *  gain envelope. No-op before start() or while muted. */
+  beep(freq, ms, type = "square", gain = 0.15) {
     if (!this.ctx || this.muted) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const dur = Math.max(ms, 1) / 1000;
+    const osc = ctx.createOscillator();
+    osc.type = type;
+    osc.frequency.value = freq;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    osc.connect(g);
+    g.connect(this.master);
+    osc.start(t);
+    osc.stop(t + dur + 0.02);
+    osc.onended = () => {
+      osc.disconnect();
+      g.disconnect();
+    };
+  }
+
+  /** One-shot collision hit: shared noise buffer → lowpass ~2.5 kHz →
+   *  ~120 ms exponential decay, layered with a ~200 ms 60 Hz sine "body
+   *  thump". severity ≥ 0, clamped to 1. No-op before start() or muted. */
+  impact(severity) {
+    if (!this.ctx || this.muted) return;
+    const amp = Math.min(1, severity) * 0.5;
+    if (!(amp > 0)) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // Crunch layer: one-shot BufferSource over the shared noise buffer.
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = 2500;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(amp, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    src.connect(lp);
+    lp.connect(g);
+    g.connect(this.master);
+    src.start(t);
+    src.stop(t + 0.15);
+    src.onended = () => {
+      src.disconnect();
+      lp.disconnect();
+      g.disconnect();
+    };
+
+    // Body thump: low sine under the crunch.
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = 60;
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(amp * 0.8, t);
+    g2.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    osc.connect(g2);
+    g2.connect(this.master);
+    osc.start(t);
+    osc.stop(t + 0.25);
+    osc.onended = () => {
+      osc.disconnect();
+      g2.disconnect();
+    };
+  }
+
+  /** state: SimStateV1 view {speed, wheels[]}; throttle 0..1; sim: the Sim
+   *  wrapper for guarded tireTemp() reads (may be null); dtMs: real frame
+   *  time in ms (kerb transient detection is normalized to a 60 Hz frame);
+   *  idle: post-lap / countdown — engine settles to tickover, tire and kerb
+   *  voices go silent instead of holding their last pitch. Call every frame. */
+  update(state, throttle, sim = null, dtMs = 16.7, idle = false) {
+    if (!this.ctx) return;
+    const dt = Math.max(0.1, dtMs);
+
+    // --- kerb transient bookkeeping runs even when muted or idle, so that
+    // unmuting (or the first driven frame after idle) doesn't see a huge
+    // stale Δcompression and fire a spurious thump.
+    let delta = 0;
+    for (let i = 0; i < 4; i++) {
+      const c = state.wheels[i].compression ?? 0;
+      delta += Math.abs(c - this.prevComp[i]);
+      this.prevComp[i] = c;
+    }
+    // Normalize to a nominal 60 Hz frame so the 8 mm dead zone means the
+    // same thing at any frame rate, then peak-hold with time-based decay.
+    const deltaNorm = delta * (16.7 / dt);
+    this.kerbEnv = Math.max(this.kerbEnv * Math.exp(-dt / 55), idle ? 0 : deltaNorm);
+
+    if (this.muted) return;
     const t = this.ctx.currentTime;
+
+    if (idle) {
+      const f = 900 / 30; // tickover ≈ 900 rpm
+      this.osc1.frequency.setTargetAtTime(f, t, 0.05);
+      this.osc2.frequency.setTargetAtTime(f * 1.5 + 3, t, 0.05);
+      this.engineFilter.frequency.setTargetAtTime(400, t, 0.1);
+      this.engineGain.gain.setTargetAtTime(0.03, t, 0.1);
+      this.front.gain.gain.setTargetAtTime(0, t, 0.04);
+      this.rear.gain.gain.setTargetAtTime(0, t, 0.04);
+      this.kerb.gain.gain.setTargetAtTime(0, t, 0.03);
+      return;
+    }
 
     // Fake RPM from speed with a throttle bump; single-gear kernel.
     const rpm = 900 + state.speed * 260 + throttle * 600;
@@ -165,16 +280,10 @@ export class EngineAudio {
     }
 
     // --- kerb rumble: kerb strikes make the suspension oscillate fast, so
-    // frame-to-frame |Δcompression| spikes an order of magnitude above smooth
-    // cornering/braking weight transfer. Peak-hold envelope with decay, dead
-    // zone 8 mm/frame (sum over 4 wheels), full volume ~45 mm/frame.
-    let delta = 0;
-    for (let i = 0; i < 4; i++) {
-      const c = state.wheels[i].compression ?? 0;
-      delta += Math.abs(c - this.prevComp[i]);
-      this.prevComp[i] = c;
-    }
-    this.kerbEnv = Math.max(this.kerbEnv * 0.82, delta);
+    // per-60Hz-frame |Δcompression| spikes an order of magnitude above smooth
+    // cornering/braking weight transfer. Envelope was peak-held (with
+    // exp(-dt/55) decay) in the bookkeeping block above; dead zone 8 mm per
+    // nominal frame (sum over 4 wheels), full volume ~45 mm.
     const rumble = clamp((this.kerbEnv - 0.008) * 26, 0, 1) * speedGate;
     this.kerb.gain.gain.setTargetAtTime(rumble * 0.3, t, 0.03);
     // Thump pitch rises slightly with speed (kerb ridges arrive faster).

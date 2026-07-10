@@ -73,7 +73,12 @@ construction. Same input log ⇒ same temperatures ⇒ same grip ⇒ same hash.
 
 Rack torque (existing `sim_ffb_torque()` export, same signature):
 
-`rack = Σ_front [ Fy·(t_p_emergent + caster_trail) + Fx·scrub_radius ] / steering_ratio`
+`rack = Σ_front [ Fy·(t_p_emergent + caster_trail) + s_i·Fx·scrub_radius ] / steering_ratio`
+
+where `s_i` is the per-wheel mirror sign (+1 left, −1 right): the scrub moment
+arm mirrors about the kingpin between the two front wheels, so symmetric
+braking Fx produces equal and opposite kingpin moments that cancel at the rack
+(only left/right brake-force asymmetry tugs the wheel).
 
 Delete the old canned trail-collapse tunables (`ffb_trail0`,
 `ffb_trail_falloff`); keep `caster_trail = 0.025 m`, `scrub_radius = 0.008 m`,

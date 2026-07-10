@@ -51,18 +51,38 @@ export async function submitLap(log, name, onStage) {
   const ws = new WebSocket(`${proto}://${location.host}/api/submit`);
   ws.binaryType = "arraybuffer";
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => { ws.close(); reject(new Error("submit timeout")); }, 60_000);
+    let settled = false;
+    const timeout = setTimeout(() => { settled = true; ws.close(); reject(new Error("submit timeout")); }, 60_000);
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: "submit", pubkey: b64(pub), sig: b64(sig), name, logBytes: log.length }));
       ws.send(log.buffer);
     };
     ws.onmessage = (ev) => {
-      const m = JSON.parse(ev.data);
-      if (m.type === "ack") onStage?.(m.stage);
-      if (m.type === "result") { clearTimeout(timeout); ws.close(); resolve(m); }
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.type === "ack") onStage?.(m.stage);
+        if (m.type === "result") { settled = true; clearTimeout(timeout); ws.close(); resolve(m); }
+      } catch (err) {
+        settled = true;
+        clearTimeout(timeout);
+        ws.close();
+        reject(new Error("malformed referee response"));
+      }
     };
-    ws.onerror = () => { clearTimeout(timeout); reject(new Error("websocket error")); };
+    ws.onerror = () => { settled = true; clearTimeout(timeout); reject(new Error("websocket error")); };
+    ws.onclose = (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(new Error("connection closed (" + e.code + ") before result — your lap is kept locally as your PB ghost; it was not accepted to the leaderboard"));
+    };
   });
+}
+
+/** Lowercase hex of this client's 32-byte Ed25519 public key. */
+export async function myPubkeyHex() {
+  const { pub } = await identity();
+  return [...pub].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export async function fetchLeaderboard() {

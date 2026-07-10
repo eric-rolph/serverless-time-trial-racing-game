@@ -87,6 +87,18 @@
   button.race { background: none; border: none; padding: 0 0 0 4px; cursor: pointer;
                 color: var(--faint); font-size: 10px; text-shadow: var(--halo); }
   button.race:hover { color: var(--ink); }
+  /* weekly reset countdown under the caption (element built by app.js) */
+  #board .reset { font-size: 9px; letter-spacing: .18em; text-transform: uppercase;
+                  color: var(--faint); margin: -3px 0 6px; }
+  /* whole row is a ghost-race affordance: pointer cursor + a quiet hover hint
+     floating just left of the board (the ▶ button keeps working) */
+  #entries li[data-i] { cursor: pointer; position: relative; }
+  #entries li[data-i]:hover::before { content: "race ▸"; position: absolute; right: 100%; top: 2px;
+                  margin-right: 10px; font-size: 9px; letter-spacing: .18em; text-transform: uppercase;
+                  color: var(--muted); text-shadow: var(--halo); white-space: nowrap; }
+  /* YOU — the player's own row: bold + a quiet 2px cyan tick on the left edge */
+  #entries li.you { font-weight: 700; color: var(--ink);
+                    border-left: 2px solid var(--accent); padding-left: 8px; }
 
   /* --- tire temps: car-schematic glyph, wheel fill = temp scale --- */
   #tireTemps { left: 24px; bottom: 258px; width: 34px; height: 58px; display: none; }

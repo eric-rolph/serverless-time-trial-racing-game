@@ -999,10 +999,13 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 
 			// FFB rack torque (front axle only, output-only): lateral force
 			// behind the steering axis by the EMERGENT pneumatic trail plus
-			// mechanical caster (docs/TIRE-MODEL.md §3).
+			// mechanical caster (docs/TIRE-MODEL.md §3). The scrub moment arm
+			// mirrors about the kingpin (left/right wheels are reflections), so
+			// the fx term carries the per-wheel mirror sign: symmetric braking
+			// fx on both fronts cancels at the rack instead of doubling.
 			if ( front )
 			{
-				rack_sum += fy * ( trail + t->ffb_caster_trail ) + fx * t->ffb_scrub_radius;
+				rack_sum += fy * ( trail + t->ffb_caster_trail ) + mirror * fx * t->ffb_scrub_radius;
 			}
 
 			// Thermal: friction power from the slip velocity at the patch,

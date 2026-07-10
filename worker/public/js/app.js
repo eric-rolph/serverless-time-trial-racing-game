@@ -5,6 +5,7 @@ import { Sim, STATUS, DT_MS } from "./sim.js";
 import { parseTrack, buildTrackMeshes, Minimap, fnv1a64 } from "./track.js";
 import { Input, quantize } from "./input.js";
 import { buildLapLog, submitLap, fetchLeaderboard, fetchReplay, fmtMs } from "./lap.js";
+import * as lapApi from "./lap.js";
 import { EngineAudio } from "./audio.js";
 import { buildCar, buildWheel } from "./car.js";
 import { Crumple } from "./crumple.js";
@@ -18,15 +19,30 @@ const setStatus = (text, cls = "info") => { $("statusText").textContent = text; 
 
 // ---------------------------------------------------------------- bootstrap
 setStatus("loading physics + track…");
-const [sim, trackResp] = await Promise.all([Sim.load(), fetch("/api/track/current")]);
-const trackBuf = await trackResp.arrayBuffer();
-const track = parseTrack(trackBuf);
-sim.loadTrack(new Uint8Array(trackBuf));
+// Backstop: any unhandled async failure surfaces on the status line instead of
+// dying silently in the console.
+addEventListener("unhandledrejection", (e) => {
+  setStatus(`failed to load: ${e.reason?.message ?? e.reason} — reload to retry`, "bad");
+});
+let sim, trackBuf, track;
+try {
+  const [simLoaded, trackResp] = await Promise.all([Sim.load(), fetch("/api/track/current")]);
+  // sim.wasm response .ok is checked inside Sim.load(); mirror it for the track.
+  if (!trackResp.ok) throw new Error(`track fetch failed: ${trackResp.status}`);
+  sim = simLoaded;
+  trackBuf = await trackResp.arrayBuffer();
+  track = parseTrack(trackBuf);
+  sim.loadTrack(new Uint8Array(trackBuf));
+} catch (err) {
+  setStatus(`failed to load: ${err.message} — reload to retry`, "bad");
+  throw err; // halt the module — nothing below can run without physics + track
+}
 const trackHash = fnv1a64(track.bytes);
 const trackHashHex = trackHash.toString(16).padStart(16, "0");
 
 $("name").value = localStorage.getItem("sttr-name") ?? "";
 $("name").addEventListener("change", () => localStorage.setItem("sttr-name", $("name").value));
+$("name").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.blur(); });
 
 // ---------------------------------------------------------------- three.js
 const renderer = new THREE.WebGLRenderer({ canvas: $("gl"), antialias: true });
@@ -196,6 +212,9 @@ let bestMs = null;
 let lastMs = null;
 let inputOverride = null; // test hook: (state) => RawInput
 let countdownMs = 0; // > 0 → standing start in progress
+let started = false; // armed idle until the first keydown / pointerdown / pad input
+let countdownHideTimer = 0; // pending auto-hide for the #countdown overlay
+let countdownBeepN = 0; // last countdown integer beeped (0 = none yet this run)
 // Camera seats (APEX "pick your seat"): C cycles chase → cockpit → bumper → TV.
 const CAMERA_SEATS = ["chase", "cockpit", "bumper", "tv"];
 const CAMERA_NAMES = { chase: "chase", cockpit: "cockpit", bumper: "bumper", tv: "TV" };
@@ -209,7 +228,22 @@ let sessionGhost = null; // downloaded leaderboard lap (replay viewer)
 let sessionGhostName = null;
 let sessionGhostRank = null; // leaderboard rank of the downloaded lap (1 = P1)
 
-async function resetRun() {
+/** Text overlay in the reused #countdown element — client theater only (never
+ *  touches the sim, the input quantiser, or the lap log). Big countdown type
+ *  by default; inline color/fontSize override per message, cleared on the next
+ *  resetRun. hideAfterMs > 0 auto-hides. Unboxed, per APEX. */
+function showOverlay(text, { color = "", fontSize = "", hideAfterMs = 0 } = {}) {
+  const el = $("countdown");
+  clearTimeout(countdownHideTimer);
+  el.textContent = text;
+  el.style.color = color;
+  el.style.fontSize = fontSize;
+  el.style.display = "block";
+  if (hideAfterMs) countdownHideTimer = setTimeout(() => (el.style.display = "none"), hideAfterMs);
+}
+
+async function resetRun({ countdownMs: startCountdownMs = 400 } = {}) {
+  started = true;
   sim.reset();
   prev = curr = sim.state();
   crumple.reset(); // restore the player car to pristine (undented)
@@ -224,7 +258,14 @@ async function resetRun() {
   deltaPtr = 0;
   $("delta").textContent = "";
   renderSectors([]);
-  countdownMs = 3200;
+  // Countdown length is client theater: the lap starts at tick 0 from rest
+  // either way (no ticks are stepped or logged until it hits zero). Restarts
+  // get one beat (400 ms → "1", GO); only the first run gets the full 3-2-1.
+  countdownMs = startCountdownMs;
+  countdownBeepN = 0; // re-arm the per-integer countdown beeps
+  clearTimeout(countdownHideTimer);
+  $("countdown").style.color = "";
+  $("countdown").style.fontSize = "";
 
   rolloverTicks = 0;
   ghost = sessionGhost ?? loadGhost();
@@ -245,8 +286,24 @@ async function resetRun() {
     : "";
 }
 
-addEventListener("keydown", (e) => {
+/** First-run start: leaves the armed idle, runs the full 3-2-1. The triggering
+ *  gesture (keydown/pointerdown) also unlocks the AudioContext naturally. */
+function startFirstRun() {
+  if (started) return;
   audio.start();
+  resetRun({ countdownMs: 3200 });
+}
+
+addEventListener("keydown", (e) => {
+  if (e.target.closest?.("input,textarea")) return; // typing, not driving
+  audio.start();
+  // Wheel setup must be reachable BEFORE the first run (calibration happens
+  // pre-drive), so I toggles the panel instead of arming the start.
+  if (e.code === "KeyI") {
+    $("config").style.display = $("config").style.display === "block" ? "none" : "block";
+    return;
+  }
+  if (!started) { startFirstRun(); return; }
   if (e.code === "KeyR") resetRun();
   if (e.code === "KeyC") {
     cameraMode = CAMERA_SEATS[(CAMERA_SEATS.indexOf(cameraMode) + 1) % CAMERA_SEATS.length];
@@ -255,9 +312,13 @@ addEventListener("keydown", (e) => {
   }
   if (e.code === "KeyM") setStatus(audio.toggleMute() ? "muted" : "sound on");
   if (e.code === "KeyL") setStatus(`lighting: ${lighting.cycle()}`);
-  if (e.code === "KeyI") $("config").style.display = $("config").style.display === "block" ? "none" : "block";
 });
-addEventListener("pointerdown", () => audio.start());
+addEventListener("pointerdown", (e) => {
+  audio.start();
+  // Taps on controls (name field, config panel, the whole leaderboard — its
+  // rows are ghost-race affordances now) don't launch a run.
+  if (!e.target.closest?.("input,textarea,button,select,label,.panel,#board")) startFirstRun();
+});
 
 // Calibration UI
 for (const btn of document.querySelectorAll("[data-cal]")) {
@@ -348,30 +409,84 @@ $("ffbConnect").addEventListener("click", async () => {
 $("ffbGain").addEventListener("input", () => { if (ffb) ffb.gain = Number($("ffbGain").value); });
 $("ffbInvert").addEventListener("change", () => { if (ffb) ffb.invert = $("ffbInvert").checked; });
 
+// ---------------------------------------------------------------- leaderboard
+// Full fetched board kept in memory; rendered as top-5 plus a 3-row window
+// around the player's own entry (real ranks). Quiet ranked list — the cyan
+// accent stays reserved for the record holder's time; P2+ read as
+// +gap-to-leader (exact time on hover).
 let boardEntries = [];
+let medalTargets = null; // { gold, silver, bronze } ms — client-derived from P1
+let myKeyHex = null;     // this client's pubkey, lowercase hex (matches entry.pubkey)
+
+// myPubkeyHex ships with lap.js; if an older copy lacks the export, derive the
+// same identity locally (same localStorage seed, same vendored ed25519).
+const myPubkeyHex = lapApi.myPubkeyHex ?? (async () => {
+  const seedHex = localStorage.getItem("sttr-ed25519-seed");
+  if (!seedHex) return null;
+  const ed = await import("../vendor/ed25519.js");
+  const pub = await ed.getPublicKeyAsync(new Uint8Array(seedHex.match(/../g).map((h) => parseInt(h, 16))));
+  return [...pub].map((b) => b.toString(16).padStart(2, "0")).join("");
+});
+
+const sanitizeName = (s) => String(s).replace(/[<>&]/g, "");
+
+/** Player's best lap in ms: this session's, else the stored PB ghost's. */
+function playerBestMs() {
+  if (bestMs !== null) return bestMs;
+  try {
+    const stored = localStorage.getItem(BEST_KEY);
+    if (stored) return Math.round((JSON.parse(stored).lapTicks * 1000) / 400);
+  } catch { /* corrupt PB blob — treat as no best */ }
+  return null;
+}
+
+/** One board row (i = index into boardEntries; rank = i + 1). */
+function boardRow(e, i, isYou) {
+  const time = i === 0
+    ? `<span class="t accent">${fmtMs(e.ms)}</span>`
+    : `<span class="t" title="${fmtMs(e.ms)}">+${((e.ms - boardEntries[0].ms) / 1000).toFixed(3)}</span>`;
+  return `<li data-i="${i}"${isYou ? ' class="you"' : ""}>` +
+    `<span class="rank">${i + 1}</span>${time} ${sanitizeName(e.name)}` +
+    `<button class="race" title="race this lap as a ghost">▶</button></li>`;
+}
+
 async function refreshBoard() {
   try {
-    boardEntries = (await fetchLeaderboard()).slice(0, 10);
-    // Quiet ranked list — the cyan accent is reserved for the record holder's time.
-    $("entries").innerHTML = boardEntries.length
-      ? boardEntries
-          .map(
-            (e, i) =>
-              `<li><span class="rank">${i + 1}</span><span class="t${i === 0 ? " accent" : ""}">${fmtMs(e.ms)}</span> ` +
-              `${e.name.replace(/[<>&]/g, "")}` +
-              `<button class="race" data-i="${i}" title="race this lap as a ghost">▶</button></li>`,
-          )
-          .join("")
-      : `<li class="sub">no laps yet — be first</li>`;
+    boardEntries = await fetchLeaderboard(); // keep everything the API returns
+    if (myKeyHex === null) myKeyHex = await myPubkeyHex().catch(() => null);
+    const myIdx = myKeyHex ? boardEntries.findIndex((e) => e.pubkey === myKeyHex) : -1;
+    let rows;
+    if (!boardEntries.length) {
+      rows = [`<li class="sub">no laps yet — be first</li>`];
+    } else {
+      rows = boardEntries.slice(0, 5).map((e, i) => boardRow(e, i, i === myIdx));
+      if (myIdx >= 5) {
+        // 3-row window around YOU with real ranks; '···' marks a rank gap.
+        const from = Math.max(5, myIdx - 1);
+        const to = Math.min(boardEntries.length - 1, myIdx + 1);
+        if (from > 5) rows.push(`<li class="sub">···</li>`);
+        for (let i = from; i <= to; i++) rows.push(boardRow(boardEntries[i], i, i === myIdx));
+      } else if (myIdx === -1) {
+        // Not in the fetched set: pin an unranked YOU row with the local best.
+        const mine = playerBestMs();
+        rows.push(`<li class="you"><span class="rank">YOU · —</span><span class="t">${mine !== null ? fmtMs(mine) : "—"}</span></li>`);
+      }
+    }
+    $("entries").innerHTML = rows.join("");
+    const p1 = boardEntries[0]?.ms;
+    medalTargets = p1
+      ? { gold: Math.round(p1 * 1.02), silver: Math.round(p1 * 1.08), bronze: Math.round(p1 * 1.20) }
+      : null;
+    renderTarget();
   } catch {
     $("entries").innerHTML = `<li class="sub">leaderboard unavailable</li>`;
   }
 }
+// Whole row races that ghost (the ▶ button's click bubbles to the row too).
 $("entries").addEventListener("click", (e) => {
-  const btn = e.target.closest("button.race");
-  if (btn) raceReplay(boardEntries[Number(btn.dataset.i)], Number(btn.dataset.i) + 1);
+  const li = e.target.closest("li[data-i]");
+  if (li) raceReplay(boardEntries[Number(li.dataset.i)], Number(li.dataset.i) + 1);
 });
-refreshBoard();
 
 // Sector small multiples: one thin bar per sector, width proportional to the
 // sector's duration (best-known, so proportions are stable lap to lap), fill
@@ -419,6 +534,82 @@ function renderSectors(durations) {
   $("sectorNote").className = noteCls;
 }
 
+// ---------------------------------------------------- goals & board context
+// Extra HUD lines are created here (not in index.html markup): all text-only
+// and unboxed per APEX, inheriting the #lapInfo / #board type system.
+
+// OPT — theoretical best: the sum of the stored sector bests, shown alongside
+// BEST/LAST once a best exists for every sector.
+const optWrap = document.createElement("span");
+optWrap.style.display = "none";
+optWrap.innerHTML = `<span class="lbl" style="margin-left:10px">OPT</span> <span class="val">—</span>`;
+$("lapInfo").appendChild(optWrap);
+const optVal = optWrap.querySelector(".val");
+function updateOpt() {
+  let best = [];
+  try { best = JSON.parse(localStorage.getItem(SECT_KEY) ?? "[]"); } catch { /* corrupt — treat as none */ }
+  const full = Array.isArray(best) && best.length === sectorCount && best.every((b) => Number.isFinite(b));
+  if (full) optVal.textContent = fmtMs(Math.round((best.reduce((a, b) => a + b, 0) * 1000) / 400));
+  optWrap.style.display = full ? "" : "none";
+}
+
+// Medal target line under BEST/LAST: the next unachieved tier vs the player's
+// best. Targets are client-derived from P1 (gold 102% · silver 108% ·
+// bronze 120%, ms-rounded in refreshBoard).
+const targetEl = document.createElement("div");
+$("lapInfo").appendChild(targetEl);
+const fmtTenths = (ms) => {
+  const t = Math.round(ms / 100); // tenths, rounded before splitting
+  const m = Math.floor(t / 600), s = (t % 600) / 10;
+  return `${m}:${s < 10 ? "0" : ""}${s.toFixed(1)}`;
+};
+/** Tier a lap of `ms` earns against the current targets, or null. */
+function earnedTier(ms) {
+  if (!medalTargets || ms === null) return null;
+  if (ms <= medalTargets.gold) return "GOLD";
+  if (ms <= medalTargets.silver) return "SILVER";
+  if (ms <= medalTargets.bronze) return "BRONZE";
+  return null;
+}
+function renderTarget() {
+  if (!medalTargets) {
+    targetEl.innerHTML = `<span class="lbl">TARGET</span> set the first time`;
+    return;
+  }
+  const best = playerBestMs();
+  const next = [["BRONZE", medalTargets.bronze], ["SILVER", medalTargets.silver], ["GOLD", medalTargets.gold]]
+    .find(([, ms]) => best === null || best > ms);
+  if (!next) { // gold already achieved — nothing left to chase but P1
+    targetEl.innerHTML = `<span class="lbl">TARGET · GOLD</span> <span class="val">${fmtTenths(medalTargets.gold)}</span> <span class="lbl">✓</span>`;
+    return;
+  }
+  const gap = best === null ? "" : ` <span class="lbl">(−${((best - next[1]) / 1000).toFixed(1)}s)</span>`;
+  targetEl.innerHTML = `<span class="lbl">TARGET · ${next[0]}</span> <span class="val">${fmtTenths(next[1])}</span>${gap}`;
+}
+
+// Weekly reset countdown under the board caption. One 60 s interval (created
+// once at boot, page-lifetime — no leaks) refreshes the label AND re-polls
+// the leaderboard.
+const resetEl = document.createElement("div");
+resetEl.className = "reset";
+document.querySelector("#board .caps").insertAdjacentElement("afterend", resetEl);
+function nextMondayUtc(now = new Date()) {
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  d.setUTCDate(d.getUTCDate() + ((8 - d.getUTCDay()) % 7 || 7));
+  return d;
+}
+function updateResetLabel() {
+  const left = Math.max(0, nextMondayUtc() - Date.now());
+  const dd = Math.floor(left / 86400000);
+  const hh = Math.floor((left % 86400000) / 3600000);
+  const mm = Math.floor((left % 3600000) / 60000);
+  resetEl.textContent = `resets in ${dd > 0 ? `${dd}d ${hh}h` : hh > 0 ? `${hh}h ${mm}m` : `${Math.max(mm, 1)}m`}`;
+}
+updateResetLabel();
+updateOpt();
+refreshBoard();
+setInterval(() => { updateResetLabel(); refreshBoard(); }, 60_000);
+
 async function onLapComplete() {
   frozen = true;
   if (ffb) ffb.update(0, 0.1);
@@ -426,6 +617,16 @@ async function onLapComplete() {
   lastMs = Math.round((lapTicks * 1000) / 400);
   const isPB = bestMs === null || lastMs < bestMs;
   bestMs = isPB ? lastMs : bestMs;
+  // PB fanfare: 3-note ascending arpeggio. Medal tiers get no extra sound —
+  // the status line announcement below covers them.
+  if (isPB) {
+    audio.beep(660, 90);
+    setTimeout(() => audio.beep(880, 90), 90);
+    setTimeout(() => audio.beep(1100, 90), 180);
+  }
+  // Client-derived medal for this lap (vs targets from P1), announced below.
+  const tier = earnedTier(lastMs);
+  const tierTxt = tier ? ` — ${tier} medal` : "";
 
   // Sector bests + ghost are local-first: saved regardless of server verdict.
   const boundaries = [...sectorTicks, lapTicks];
@@ -433,16 +634,17 @@ async function onLapComplete() {
   renderSectors(sectors); // final sector bar, colored against the old bests
   const prevBest = JSON.parse(localStorage.getItem(SECT_KEY) ?? "[]");
   localStorage.setItem(SECT_KEY, JSON.stringify(sectors.map((s, i) => Math.min(s, prevBest[i] ?? Infinity))));
+  updateOpt(); // sector bests may have changed → refresh the theoretical best
   if (isPB) await saveGhost(ticks, lapTicks);
 
   const log = buildLapLog(track.bytes, ticks.slice(0, lapTicks), sim.stateHash(), lapTicks);
-  setStatus(`lap ${fmtMs(lastMs)} — submitting for edge validation…`);
+  setStatus(`lap ${fmtMs(lastMs)}${tierTxt} — submitting for edge validation…`);
   try {
     const result = await submitLap(log, $("name").value || "anon", (stage) => setStatus(`lap ${fmtMs(lastMs)} — referee: ${stage}…`));
     if (result.status === "accepted") {
-      setStatus(`ACCEPTED ✔ ${fmtMs(result.lapTimeMs)} — world rank #${result.rank}. Press R to go again.`, "ok");
+      setStatus(`ACCEPTED ✔ ${fmtMs(result.lapTimeMs)}${tierTxt} — world rank #${result.rank}. Press R to go again.`, "ok");
     } else if (result.status === "pending") {
-      setStatus(`lap ${fmtMs(lastMs)} queued — validated within ~30 min (free-tier mode). Press R.`, "info");
+      setStatus(`lap ${fmtMs(lastMs)}${tierTxt} queued — validated within ~30 min (free-tier mode). Press R.`, "info");
     } else {
       setStatus(`rejected: ${result.reason}${result.detail ? ` (${result.detail})` : ""} — press R`, "bad");
     }
@@ -539,6 +741,7 @@ function detectImpact(prevS, currS) {
       _dv.set(0, 0, front >= rear ? -1 : 1);
     }
     crumple.applyImpact(_dv, severity);
+    audio.impact(severity); // crunch + body thump scaled to the same severity
     return;
   }
 
@@ -548,26 +751,46 @@ function detectImpact(prevS, currS) {
   if (dv < IMPACT_DV) return;
   const severity = Math.min(1.5, (dv - IMPACT_DV) / IMPACT_SEV_SCALE + 0.25);
   crumple.applyImpact(_dv, severity);
+  audio.impact(severity); // crunch + body thump scaled to the same severity
   impactCooldown = IMPACT_COOLDOWN;
 }
 
 /** Step physics by dtMs of wall time. Extracted from the rAF handler so tests
  *  (and the debug hook below) can pump the sim when rAF is throttled. */
 function advance(dtMs) {
+  if (!started) return; // armed idle — waiting for the first gesture
   if (countdownMs > 0) {
+    // Skip-on-input: an eager driver cuts the theater short. Pure client-side
+    // presentation — the lap still starts at tick 0 from rest.
+    const raw = inputOverride ? inputOverride(curr) : input.sample(dtMs / 1000);
+    if (raw.throttle > 0.5 || Math.abs(raw.steer) > 0.5) countdownMs = Math.min(countdownMs, 1);
     countdownMs -= dtMs;
     const n = Math.ceil(countdownMs / 1000);
     $("countdown").textContent = countdownMs <= 0 ? "GO" : String(n);
     $("countdown").style.display = "block";
+    // Countdown beeps track the DISPLAYED number: one short blip per integer
+    // (fast 400 ms restarts get exactly one "1" blip), long high blip on GO.
+    if (countdownMs > 0 && n !== countdownBeepN) {
+      countdownBeepN = n;
+      audio.beep(660, 80);
+    }
     if (countdownMs <= 0) {
+      audio.beep(880, 300);
       setStatus("GO — set a time; it will be validated at the edge", "ok");
-      setTimeout(() => ($("countdown").style.display = "none"), 700);
+      clearTimeout(countdownHideTimer);
+      countdownHideTimer = setTimeout(() => ($("countdown").style.display = "none"), 700);
     }
     return;
   }
   if (frozen) return;
   acc += dtMs;
+  let substeps = 0;
   while (acc >= DT_MS) {
+    // Cap physics work per frame (background-tab / long-stall spiral guard):
+    // sim time falls behind wall clock smoothly instead of freezing the frame.
+    // Every tick that DOES execute below is stepped and logged exactly as
+    // always — no protocol or determinism impact.
+    if (++substeps > 32) { acc = 0; break; }
     acc -= DT_MS;
     const raw = inputOverride ? inputOverride(curr) : input.sample(DT_MS / 1000);
     lastThrottle = raw.throttle;
@@ -591,16 +814,35 @@ function advance(dtMs) {
     if (curr.checkpoints !== prevCpMask) {
       sectorTicks.push(ticks.length);
       prevCpMask = curr.checkpoints;
-      renderSectors(sectorTicks.map((t, i) => t - (sectorTicks[i - 1] ?? 0)));
+      const durations = sectorTicks.map((t, i) => t - (sectorTicks[i - 1] ?? 0));
+      renderSectors(durations);
+      // Two-tone sector chime, matching the bar colors: higher pair when at or
+      // under the stored best (or no best yet — first completion reads as a
+      // win), lower pair when over it. Same localStorage bests renderSectors
+      // reads; no new sim state touched.
+      const si = durations.length - 1;
+      let bestSect = [];
+      try { bestSect = JSON.parse(localStorage.getItem(SECT_KEY) ?? "[]"); } catch { /* corrupt — treat as none */ }
+      const faster = !(bestSect[si] > 0) || durations[si] - bestSect[si] <= 0;
+      const [c1, c2] = faster ? [880, 1320] : [440, 330];
+      audio.beep(c1, 90, "sine", 0.12);
+      setTimeout(() => audio.beep(c2, 90, "sine", 0.12), 90);
     }
 
     if (status & STATUS.LAP_INVALID && !invalid) {
       invalid = true;
+      audio.beep(220, 250, "sawtooth"); // low buzz — the "no" sound
       setStatus("lap invalidated (corner cut) — press R to restart", "bad");
+      showOverlay("LAP INVALID — R to restart", { color: "var(--bad)", fontSize: "42px", hideAfterMs: 1500 });
     }
     if (status & STATUS.LAP_COMPLETE) {
       if (!invalid) onLapComplete();
-      else frozen = true;
+      else {
+        frozen = true;
+        // Crossed the line on an invalidated lap: say so, persistently.
+        setStatus("lap invalid (corner cut) — not submitted; press R to restart", "bad");
+        showOverlay("LAP INVALID — R to restart", { color: "var(--bad)", fontSize: "42px" });
+      }
       break;
     }
     if (ticks.length >= 72000) {
@@ -638,6 +880,12 @@ function frame(now) {
   const dtMs = Math.min(now - last, 250); // anti-spiral clamp
   last = now;
   input.tickCalibration();
+  if (!started) {
+    // Armed idle: gamepad/wheel activity also starts the first run (keydown
+    // and pointerdown are handled by their listeners above).
+    const raw = input.sample(dtMs / 1000);
+    if (raw.throttle > 0.5 || raw.brake > 0.5 || Math.abs(raw.steer) > 0.5 || raw.handbrake) startFirstRun();
+  }
   advance(dtMs);
 
   const alpha = Math.min(acc / DT_MS, 1);
@@ -715,7 +963,9 @@ function frame(now) {
   renderer.render(scene, camera);
 
   // ---- side channels: audio + FFB (read-only on sim state)
-  audio.update(curr, lastThrottle, sim);
+  // idle = post-lap freeze, countdown, or armed idle before the first gesture:
+  // engine settles to tickover instead of droning at its last pitch.
+  audio.update(curr, lastThrottle, sim, dtMs, frozen || countdownMs > 0 || !started);
   if (ffb) {
     const ffbFade = Math.min(1, Math.max(0, (curr.speed - 1.5) / 3)); // standstill fade
     ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque() * ffbFade, dtMs / 1000);
@@ -788,7 +1038,18 @@ function frame(now) {
   }
 }
 
-await resetRun();
+// Armed idle: no auto-countdown at boot. The first gesture (keydown /
+// pointerdown / gamepad input) starts the full 3-2-1 — and doubles as the
+// AudioContext unlock. Text-only prompt in the reused #countdown element.
+showOverlay(
+  "press any key to start · W/↑ throttle · A/D steer · S/↓ brake · full keys below",
+  { fontSize: "20px" },
+);
+setStatus(
+  matchMedia("(pointer: coarse)").matches
+    ? "built for keyboard, gamepad or wheel — best on a computer"
+    : "ready",
+);
 requestAnimationFrame(frame);
 
 // Debug/test hook: lets automated checks pump physics when the tab is
@@ -798,7 +1059,7 @@ window.__sttr = {
   advance,
   renderOnce: () => frame(performance.now()),
   skipCountdown: () => (countdownMs = 1),
-  info: () => ({ ticks: ticks.length, frozen, invalid, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, camera: cameraMode, ffbNm: sim.ffbTorque() }),
+  info: () => ({ ticks: ticks.length, frozen, invalid, started, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, camera: cameraMode, ffbNm: sim.ffbTorque() }),
   track: { center: track.center, tangent: track.tangent },
   reset: resetRun,
   setInputOverride: (fn) => (inputOverride = fn),

@@ -25,11 +25,14 @@ jobs:
         with:
           submodules: recursive
 
+      # Cron seeds are salted +700000 so they can never collide with manually
+      # burned dev seeds (which are raw ISO year+week values, e.g. 202629).
+      # A manual workflow_dispatch seed override passes through unsalted.
       - name: Compute weekly seed
         id: seed
         run: |
           SEED="${{ github.event.inputs.seed }}"
-          [ -z "$SEED" ] && SEED=$(date -u +%G%V)
+          [ -z "$SEED" ] && SEED=$(( $(date -u +%G%V) + 700000 ))
           echo "seed=$SEED" >> "$GITHUB_OUTPUT"
           echo "Track seed: $SEED"
 
@@ -38,12 +41,37 @@ jobs:
           python-version: "3.12"
       - run: pip install -r trackgen/requirements.txt
 
-      - name: Generate track
+      # The generator's geometric lint gate can reject a seed outright (it
+      # raises SystemExit after exhausting its internal attempts). Try SEED,
+      # SEED+1, SEED+2 and take the first that generates AND packs; fail the
+      # job only if all three fail. The winning seed is exported as
+      # steps.gen.outputs.seed — all later steps must use it, not steps.seed.
+      - name: Generate track (retry up to 3 seeds)
+        id: gen
         run: |
-          python trackgen/generate_track.py --seed ${{ steps.seed.outputs.seed }} \
-            --out-dir assets/tracks/week-${{ steps.seed.outputs.seed }}
-          python trackgen/pack_track.py \
-            assets/tracks/week-${{ steps.seed.outputs.seed }}/track.json
+          BASE=${{ steps.seed.outputs.seed }}
+          GEN_SEED=""
+          for OFFSET in 0 1 2; do
+            TRY=$(( BASE + OFFSET ))
+            echo "::group::Generating track for seed $TRY"
+            if python trackgen/generate_track.py --seed "$TRY" \
+                 --out-dir "assets/tracks/week-$TRY" \
+               && python trackgen/pack_track.py "assets/tracks/week-$TRY/track.json"
+            then
+              echo "::endgroup::"
+              GEN_SEED=$TRY
+              break
+            fi
+            echo "::endgroup::"
+            echo "Seed $TRY rejected by generator lint gate, trying next"
+            rm -rf "assets/tracks/week-$TRY"
+          done
+          if [ -z "$GEN_SEED" ]; then
+            echo "::error::All three seeds ($BASE, $((BASE + 1)), $((BASE + 2))) failed track generation"
+            exit 1
+          fi
+          echo "seed=$GEN_SEED" >> "$GITHUB_OUTPUT"
+          echo "Generated track with seed $GEN_SEED"
 
       - uses: mymindstorm/setup-emsdk@v14
         with:
@@ -60,7 +88,7 @@ jobs:
           mkdir -p worker/assets
           cp physics/out/sim.wasm worker/assets/sim.wasm
           cp physics/out/sim.wasm worker/assets/sim_wasm.bin
-          cp assets/tracks/week-${{ steps.seed.outputs.seed }}/track.bin worker/assets/track.bin
+          cp assets/tracks/week-${{ steps.gen.outputs.seed }}/track.bin worker/assets/track.bin
 
       - uses: actions/setup-node@v4
         with:
@@ -69,6 +97,30 @@ jobs:
           cache-dependency-path: worker/package-lock.json
       - run: npm ci
         working-directory: worker
+
+      # Raceability gate: the autopilot must complete a lap on the exact
+      # staged wasm + track pair before we deploy. A track that loads but
+      # cannot be lapped fails here, leaving last week's track live (correct).
+      # The lap time must also land in a sane 25-240 s band (the tool itself
+      # hard-caps the drive at 180 s, so the upper bound is belt-and-braces).
+      - name: Raceability gate (autopilot lap on staged assets)
+        run: |
+          set -o pipefail
+          node tools/autopilot_lap.mjs \
+            --wasm worker/assets/sim.wasm \
+            --track worker/assets/track.bin \
+            --out /tmp/gate.laplog \
+            --max-seconds 180 | tee /tmp/autopilot.log
+          LAP=$(grep -oE 'LAP COMPLETE: [0-9]+\.[0-9]+' /tmp/autopilot.log | grep -oE '[0-9]+\.[0-9]+' | head -n 1)
+          if [ -z "$LAP" ]; then
+            echo "::error::Autopilot produced no LAP COMPLETE line"
+            exit 1
+          fi
+          if ! awk -v t="$LAP" 'BEGIN { exit !(t >= 25 && t <= 240) }'; then
+            echo "::error::Autopilot lap time ${LAP}s outside sane band [25, 240] s"
+            exit 1
+          fi
+          echo "Raceability gate passed: autopilot lap ${LAP}s"
 
       - name: Deploy referee Worker globally
         run: npx wrangler deploy
@@ -81,5 +133,5 @@ jobs:
           git config user.name "game-master[bot]"
           git config user.email "game-master@users.noreply.github.com"
           git add assets/tracks/
-          git diff --cached --quiet || git commit -m "Weekly track rotation: seed ${{ steps.seed.outputs.seed }}"
+          git diff --cached --quiet || git commit -m "Weekly track rotation: seed ${{ steps.gen.outputs.seed }}"
           git push

@@ -38,12 +38,40 @@ const trackBytes = new Uint8Array(TRACK_BIN as ArrayBuffer);
 // Computed once per isolate; identity of the currently deployed track.
 const trackHash = fnv1a64(trackBytes);
 const trackHashHex = hex64(trackHash);
+// Same idea for the served sim binary (identity of the deployed kernel).
+const simHashHex = hex64(fnv1a64(new Uint8Array(SIM_WASM_BYTES as ArrayBuffer)));
 
 const json = (obj: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(obj), {
     status,
     headers: { "content-type": "application/json", "access-control-allow-origin": "*", ...headers },
   });
+
+/** Serve a per-deploy binary artifact with ETag revalidation. The URLs are
+ *  mutable (same path, new bytes after a deploy), so no-cache + etag — the
+ *  browser revalidates every load and gets a body-less 304 unless the deploy
+ *  changed the artifact. Never max-age/immutable here. */
+const binaryWithEtag = (
+  request: Request,
+  body: BodyInit,
+  contentType: string,
+  hashHeader: string,
+  hashHex: string,
+): Response => {
+  const etag = `"${hashHex}"`;
+  const headers: Record<string, string> = {
+    "content-type": contentType,
+    [hashHeader]: hashHex,
+    etag,
+    "cache-control": "no-cache",
+    "access-control-allow-origin": "*",
+  };
+  const inm = request.headers.get("if-none-match");
+  if (inm && inm.split(",").some((t) => t.trim().replace(/^W\//, "") === etag || t.trim() === "*")) {
+    return new Response(null, { status: 304, headers });
+  }
+  return new Response(body, { headers });
+};
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -59,13 +87,7 @@ export default {
         });
 
       case "/api/sim/current":
-        return new Response(SIM_WASM_BYTES, {
-          headers: {
-            "content-type": "application/wasm",
-            "x-sim-hash": hex64(fnv1a64(new Uint8Array(SIM_WASM_BYTES as ArrayBuffer))),
-            "access-control-allow-origin": "*",
-          },
-        });
+        return binaryWithEtag(request, SIM_WASM_BYTES as ArrayBuffer, "application/wasm", "x-sim-hash", simHashHex);
 
       case "/api/diag": {
         // Remote-debug drop box: the setup panel uploads device state here so
@@ -92,13 +114,7 @@ export default {
       }
 
       case "/api/track/current":
-        return new Response(trackBytes, {
-          headers: {
-            "content-type": "application/octet-stream",
-            "x-track-hash": trackHashHex,
-            "access-control-allow-origin": "*",
-          },
-        });
+        return binaryWithEtag(request, trackBytes, "application/octet-stream", "x-track-hash", trackHashHex);
 
       case "/api/leaderboard": {
         const track = url.searchParams.get("track") ?? trackHashHex;

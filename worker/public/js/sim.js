@@ -12,7 +12,13 @@ export class Sim {
     if (!cachedModule) {
       const resp = await fetch("/api/sim/current");
       if (!resp.ok) throw new Error(`sim fetch failed: ${resp.status}`);
-      cachedModule = await WebAssembly.compile(await resp.arrayBuffer());
+      // Streaming compile overlaps download and compilation, but the engine
+      // requires content-type application/wasm. Branch BEFORE touching the
+      // body — a Response body is single-use.
+      const mime = (resp.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+      cachedModule = mime === "application/wasm" && typeof WebAssembly.compileStreaming === "function"
+        ? await WebAssembly.compileStreaming(resp)
+        : await WebAssembly.compile(await resp.arrayBuffer());
     }
     return Sim.instantiate();
   }
@@ -32,6 +38,33 @@ export class Sim {
 
   constructor(exports) {
     this.e = exports;
+    // Two persistent snapshot buffers for state() — the app holds exactly a
+    // prev/curr pair, so alternating between two reusable objects avoids
+    // rebuilding the whole object graph 400×/s without ever aliasing the
+    // caller's pair. Read-side copy only: wasm memory, stepping and logs are
+    // untouched, so determinism/replay are unaffected.
+    this._stateBufs = [Sim._blankState(), Sim._blankState()];
+    this._stateFlip = 0;
+  }
+
+  /** One reusable SimStateV1 snapshot object (field names/shapes are the
+   *  public contract — keep in lockstep with state() below). */
+  static _blankState() {
+    const wheels = [];
+    for (let w = 0; w < 4; w++) {
+      wheels.push({ pos: [0, 0, 0], spin: 0, steer: 0, compression: 0, slipRatio: 0, slipAngle: 0 });
+    }
+    return {
+      tick: 0,
+      pos: [0, 0, 0],
+      quat: [0, 0, 0, 0],
+      linVel: [0, 0, 0],
+      wheels,
+      speed: 0,
+      lapProgress: 0,
+      checkpoints: 0,
+      lapTicks: 0,
+    };
   }
 
   loadTrack(trackBytes) {
@@ -47,35 +80,39 @@ export class Sim {
     return this.e.sim_step(steer, throttle, brake, flags) >>> 0;
   }
 
-  /** Copy SimStateV1 (200 bytes, CONTRACTS §1.2) out of wasm memory. */
+  /** Copy SimStateV1 (200 bytes, CONTRACTS §1.2) out of wasm memory.
+   *  Fills one of two persistent buffers in place, alternating per call —
+   *  each returned object stays valid until the call after next. */
   state() {
     const dv = new DataView(this.e.memory.buffer, this.e.sim_state_ptr(), 200);
-    const wheels = [];
+    this._stateFlip ^= 1;
+    const s = this._stateBufs[this._stateFlip];
+    s.tick = dv.getUint32(0, true);
+    const p = s.pos;
+    p[0] = dv.getFloat32(4, true); p[1] = dv.getFloat32(8, true); p[2] = dv.getFloat32(12, true);
+    const q = s.quat;
+    q[0] = dv.getFloat32(16, true); q[1] = dv.getFloat32(20, true); q[2] = dv.getFloat32(24, true); q[3] = dv.getFloat32(28, true);
+    // Chassis linear velocity (world frame, m/s). Read for the cosmetic
+    // crash-deformation trigger only — never fed back into the sim, so
+    // determinism/replay are untouched (CONTRACTS §1.2, offset 32).
+    const v = s.linVel;
+    v[0] = dv.getFloat32(32, true); v[1] = dv.getFloat32(36, true); v[2] = dv.getFloat32(40, true);
     for (let w = 0; w < 4; w++) {
       const o = 56 + w * 32;
-      wheels.push({
-        pos: [dv.getFloat32(o, true), dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true)],
-        spin: dv.getFloat32(o + 12, true),
-        steer: dv.getFloat32(o + 16, true),
-        compression: dv.getFloat32(o + 20, true),
-        slipRatio: dv.getFloat32(o + 24, true),
-        slipAngle: dv.getFloat32(o + 28, true),
-      });
+      const wh = s.wheels[w];
+      const wp = wh.pos;
+      wp[0] = dv.getFloat32(o, true); wp[1] = dv.getFloat32(o + 4, true); wp[2] = dv.getFloat32(o + 8, true);
+      wh.spin = dv.getFloat32(o + 12, true);
+      wh.steer = dv.getFloat32(o + 16, true);
+      wh.compression = dv.getFloat32(o + 20, true);
+      wh.slipRatio = dv.getFloat32(o + 24, true);
+      wh.slipAngle = dv.getFloat32(o + 28, true);
     }
-    return {
-      tick: dv.getUint32(0, true),
-      pos: [dv.getFloat32(4, true), dv.getFloat32(8, true), dv.getFloat32(12, true)],
-      quat: [dv.getFloat32(16, true), dv.getFloat32(20, true), dv.getFloat32(24, true), dv.getFloat32(28, true)],
-      // Chassis linear velocity (world frame, m/s). Read for the cosmetic
-      // crash-deformation trigger only — never fed back into the sim, so
-      // determinism/replay are untouched (CONTRACTS §1.2, offset 32).
-      linVel: [dv.getFloat32(32, true), dv.getFloat32(36, true), dv.getFloat32(40, true)],
-      wheels,
-      speed: dv.getFloat32(184, true),
-      lapProgress: dv.getFloat32(188, true),
-      checkpoints: dv.getUint32(192, true),
-      lapTicks: dv.getUint32(196, true),
-    };
+    s.speed = dv.getFloat32(184, true);
+    s.lapProgress = dv.getFloat32(188, true);
+    s.checkpoints = dv.getUint32(192, true);
+    s.lapTicks = dv.getUint32(196, true);
+    return s;
   }
 
   stateHash() {
