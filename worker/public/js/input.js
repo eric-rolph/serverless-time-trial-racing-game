@@ -369,8 +369,12 @@ export class Input {
 
   /** Latest sample as floats: steer -1..1, throttle/brake 0..1, plus the
    *  momentary shift buttons (booleans — quantize() packs them into flags). */
-  sample(dtSec) {
+  sample(dtSec = 1 / 60) {
     // One navigator.getGamepads() snapshot per tick — threaded through helpers.
+    // A single NaN dtSec would poison the slew accumulators permanently.
+    if (!Number.isFinite(dtSec) || dtSec < 0) dtSec = 1 / 60;
+    if (!Number.isFinite(this.kSteer)) this.kSteer = 0;
+    if (!Number.isFinite(this.kBrake)) this.kBrake = 0;
     const pads = this.gamepads();
     const s = this.steerSettings;
     const shape = (v) => Math.max(-1, Math.min(1, v * s.sensitivity * (s.invert ? -1 : 1)));

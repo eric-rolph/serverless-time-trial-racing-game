@@ -18,6 +18,12 @@
 //   4. GRASS DRIVE  — on a v2 track the car can drive off the corridor onto
 //                     grass: OFF_TRACK fires, the car does NOT fall into the
 //                     void, and it keeps rolling (drivable, just slow).
+//   5. TERRAIN RAY  — docs/TERRAIN.md §2: off-corridor wheels raycast the
+//                     static landscape mesh (props excluded) and follow a
+//                     sloped test mesh; ray miss keeps the flat ground_y
+//                     plane bit-identically; on-corridor drives match a
+//                     pre-change capture; a v2 excursion log is
+//                     step==step==replay bit-identical.
 
 #include "make_test_track.h"
 #include "road.h"	 // src/, not the public include/ surface
@@ -79,16 +85,10 @@ static void put_f32( uint8_t* p, float v )
 }
 
 // declared_count is written into the blob; records_written records actually
-// follow (differing values build deliberately truncated blobs).
-static uint8_t* make_v2_track( size_t* out_len, uint32_t declared_count, const PropRec* props,
-							   uint32_t records_written )
+// follow (differing values build deliberately truncated blobs). Consumes v1.
+static uint8_t* make_v2_from( uint8_t* v1, size_t v1_len, size_t* out_len, uint32_t declared_count,
+							  const PropRec* props, uint32_t records_written )
 {
-	size_t v1_len = 0;
-	uint8_t* v1 = make_test_track( &v1_len );
-	if ( v1 == NULL )
-	{
-		return NULL;
-	}
 
 	size_t len = v1_len + 4 + (size_t)36 * records_written;
 	uint8_t* blob = (uint8_t*)malloc( len );
@@ -119,6 +119,30 @@ static uint8_t* make_v2_track( size_t* out_len, uint32_t declared_count, const P
 
 	*out_len = len;
 	return blob;
+}
+
+static uint8_t* make_v2_track( size_t* out_len, uint32_t declared_count, const PropRec* props,
+							   uint32_t records_written )
+{
+	size_t v1_len = 0;
+	uint8_t* v1 = make_test_track( &v1_len );
+	if ( v1 == NULL )
+	{
+		return NULL;
+	}
+	return make_v2_from( v1, v1_len, out_len, declared_count, props, records_written );
+}
+
+// v2 variant of the sloped-terrain oval (docs/TERRAIN.md §2 test track).
+static uint8_t* make_v2_track_sloped( size_t* out_len )
+{
+	size_t v1_len = 0;
+	uint8_t* v1 = make_test_track_sloped( &v1_len );
+	if ( v1 == NULL )
+	{
+		return NULL;
+	}
+	return make_v2_from( v1, v1_len, out_len, 0, NULL, 0 );
 }
 
 // ---------------------------------------------------------------------------
@@ -511,12 +535,248 @@ static void test_grass_drive( void )
 	free( blob );
 }
 
+// ---------------------------------------------------------------------------
+// 5. TERRAIN RAYCAST (docs/TERRAIN.md §2) — off-corridor wheels ride the real
+// static collision mesh via a straight-down ray (landscape only, props
+// excluded); ray miss falls back to the flat ground_y plane; on-corridor
+// behavior is bit-identical to the pre-raycast kernel (capture-compare); and
+// a v2 excursion log replays step==step==replay bit-identically.
+// ---------------------------------------------------------------------------
+
+// Pre-change captures (recorded from the kernel BEFORE the TERRAIN.md §2
+// raycast landed, scratch harness, %016llx). If a later DELIBERATE physics
+// change breaks these, re-capture with a straight full-throttle drive from
+// spawn: 800 ticks on-corridor, and 2400 ticks with a lift to 40% throttle
+// once pos.x > 50 for the excursion (the failure output prints the actuals).
+#define CAPTURE_ONCORRIDOR_800 0x6e684a737810541eull
+#define CAPTURE_EXCURSION_MISS_2400 0x0da900df0055f8d1ull
+
+static uint64_t v2_state_hash( void )
+{
+	return ( (uint64_t)sim_state_hash_hi() << 32 ) | (uint64_t)sim_state_hash_lo();
+}
+
+// Expected slope surface height under (x): the sloped quad of
+// make_test_track_sloped, which starts exactly at the flat oval's ground_y.
+static float slope_y_at( float x )
+{
+	return TT_SLOPE_BASE_Y + TT_SLOPE_K * ( x - TT_SLOPE_X0 );
+}
+
+// Straight full-throttle drive from spawn; lift to 40% once pos.x > 50 (same
+// excursion script as test_grass_drive). Records quantized inputs into log
+// (8-byte packed records) when log != NULL. Returns ticks run.
+static int drive_straight( int ticks, unsigned char* log )
+{
+	const SimStateV1* s = sim_state();
+	for ( int t = 0; t < ticks; ++t )
+	{
+		uint32_t throttle = s->pos[0] > 50.0f ? 26214u : 65535u;
+		if ( log != NULL )
+		{
+			int16_t st16 = 0;
+			uint16_t th16 = (uint16_t)throttle, br16 = 0, fl16 = 0;
+			memcpy( log + 8 * (size_t)t + 0, &st16, 2 );
+			memcpy( log + 8 * (size_t)t + 2, &th16, 2 );
+			memcpy( log + 8 * (size_t)t + 4, &br16, 2 );
+			memcpy( log + 8 * (size_t)t + 6, &fl16, 2 );
+		}
+		uint32_t status = sim_step( 0, throttle, 0, 0 );
+		if ( status & SIM_STATUS_ERROR )
+		{
+			return t;
+		}
+	}
+	return ticks;
+}
+
+static void test_terrain_raycast( void )
+{
+	// --- (a) On-corridor capture-compare: 800 ticks straight from spawn on a
+	// v2 track never leave the corridor, so the terrain ray never fires and
+	// the final hash must be BIT-IDENTICAL to the pre-raycast kernel — on the
+	// standard oval AND on the sloped oval (the extra off-corridor mesh and
+	// the SIM_CAT_MESH category bit must not perturb on-corridor physics). ---
+	{
+		size_t len = 0;
+		uint8_t* blob = make_v2_track( &len, 0, NULL, 0 );
+		if ( blob == NULL || sim_load_track( (sim_ptr_t)blob, (uint32_t)len ) != 0 )
+		{
+			fprintf( stderr, "FAIL: could not load v2 track (capture a)\n" );
+			g_failures++;
+			free( blob );
+			return;
+		}
+		sim_reset();
+		drive_straight( 800, NULL );
+		uint64_t h = v2_state_hash();
+		printf( "terrain raycast: on-corridor std hash %016llx (capture %016llx)\n", (unsigned long long)h,
+				(unsigned long long)CAPTURE_ONCORRIDOR_800 );
+		CHECK( h == CAPTURE_ONCORRIDOR_800, "on-corridor v2 drive bit-identical to pre-raycast capture (std oval)" );
+		free( blob );
+	}
+	{
+		size_t len = 0;
+		uint8_t* blob = make_v2_track_sloped( &len );
+		if ( blob == NULL || sim_load_track( (sim_ptr_t)blob, (uint32_t)len ) != 0 )
+		{
+			fprintf( stderr, "FAIL: could not load sloped v2 track\n" );
+			g_failures++;
+			free( blob );
+			return;
+		}
+		sim_reset();
+		drive_straight( 800, NULL );
+		uint64_t h = v2_state_hash();
+		printf( "terrain raycast: on-corridor slp hash %016llx\n", (unsigned long long)h );
+		CHECK( h == CAPTURE_ONCORRIDOR_800,
+			   "on-corridor v2 drive bit-identical to pre-raycast capture (sloped oval)" );
+		free( blob );
+	}
+
+	// --- (b) Ray-miss fallback: the standard oval's mesh is only a ±7 m
+	// strip, so the excursion's off-corridor rays all MISS and the wheels
+	// must ride the flat ground_y plane EXACTLY as before the raycast —
+	// bit-identical excursion hash. ---
+	{
+		size_t len = 0;
+		uint8_t* blob = make_v2_track( &len, 0, NULL, 0 );
+		if ( blob == NULL || sim_load_track( (sim_ptr_t)blob, (uint32_t)len ) != 0 )
+		{
+			fprintf( stderr, "FAIL: could not load v2 track (capture b)\n" );
+			g_failures++;
+			free( blob );
+			return;
+		}
+		sim_reset();
+		drive_straight( 2400, NULL );
+		uint64_t h = v2_state_hash();
+		printf( "terrain raycast: miss-excursion hash %016llx (capture %016llx)\n", (unsigned long long)h,
+				(unsigned long long)CAPTURE_EXCURSION_MISS_2400 );
+		CHECK( h == CAPTURE_EXCURSION_MISS_2400,
+			   "ray-miss excursion (no off-corridor mesh) bit-identical to the flat-plane kernel" );
+		free( blob );
+	}
+
+	// --- (c) Sloped mesh: the same excursion on the sloped oval must ride UP
+	// the slope on its WHEELS — chassis height tracks the mesh (not the flat
+	// plane at ground_y), the suspension carries load, and the chassis never
+	// touches the mesh (zero damage). Pre-raycast this drive belly-slid on
+	// the chassis hull with fully drooped wheels. ---
+	static unsigned char slope_log[2400 * 8];
+	uint64_t h_record;
+	{
+		size_t len = 0;
+		uint8_t* blob = make_v2_track_sloped( &len );
+		if ( blob == NULL || sim_load_track( (sim_ptr_t)blob, (uint32_t)len ) != 0 )
+		{
+			fprintf( stderr, "FAIL: could not load sloped v2 track (drive)\n" );
+			g_failures++;
+			free( blob );
+			return;
+		}
+		const SimStateV1* s = sim_state();
+		sim_reset();
+
+		int settled_ticks = 0;	  // ticks spent settled on the slope (x > 58)
+		int follow_violations = 0; // chassis-vs-slope offset out of band
+		int load_violations = 0;   // any wheel unloaded while settled
+		float max_x = -1000.0f;
+		int error_seen = 0;
+
+		for ( int t = 0; t < 2400; ++t )
+		{
+			uint32_t throttle = s->pos[0] > 50.0f ? 26214u : 65535u;
+			int16_t st16 = 0;
+			uint16_t th16 = (uint16_t)throttle, br16 = 0, fl16 = 0;
+			memcpy( slope_log + 8 * (size_t)t + 0, &st16, 2 );
+			memcpy( slope_log + 8 * (size_t)t + 2, &th16, 2 );
+			memcpy( slope_log + 8 * (size_t)t + 4, &br16, 2 );
+			memcpy( slope_log + 8 * (size_t)t + 6, &fl16, 2 );
+			uint32_t status = sim_step( 0, throttle, 0, 0 );
+			if ( status & SIM_STATUS_ERROR )
+			{
+				error_seen = 1;
+				break;
+			}
+			if ( s->pos[0] > max_x )
+			{
+				max_x = s->pos[0];
+			}
+			if ( s->pos[0] > 58.0f )
+			{
+				settled_ticks++;
+				if ( settled_ticks > 150 ) // let the skirt-drop bounce die out
+				{
+					// Chassis center rides ~0.80 m above the surface it stands
+					// on (measured on the flat grass plane). Following the
+					// SLOPE means the offset vs slope_y stays in a tight band;
+					// the flat plane would put it 2+ m below.
+					float offset = s->pos[1] - slope_y_at( s->pos[0] );
+					if ( offset < 0.45f || offset > 1.15f )
+					{
+						follow_violations++;
+					}
+					for ( int w = 0; w < SIM_WHEEL_COUNT; ++w )
+					{
+						if ( s->wheels[w].susp_compression < 0.005f )
+						{
+							load_violations++;
+						}
+					}
+				}
+			}
+		}
+		h_record = v2_state_hash();
+
+		printf( "terrain raycast: slope drive final pos=(%.2f, %.2f, %.2f) speed=%.2f settled=%d follow_viol=%d "
+				"load_viol=%d dmg=%.3f hash=%016llx\n",
+				(double)s->pos[0], (double)s->pos[1], (double)s->pos[2], (double)s->speed, settled_ticks,
+				follow_violations, load_violations, (double)sim_damage( 0 ), (unsigned long long)h_record );
+
+		CHECK( !error_seen, "no ERROR during the slope excursion" );
+		CHECK( max_x > 70.0f, "car climbs well up the slope (drivable on wheels)" );
+		CHECK( settled_ticks > 400, "car spends real time settled on the slope" );
+		CHECK( follow_violations == 0, "chassis height follows the SLOPE mesh (not the flat plane)" );
+		CHECK( load_violations == 0, "all four wheels stay loaded on the slope (wheel-borne, not belly-slide)" );
+		CHECK( sim_damage( 0 ) == 0.0f, "chassis never strikes the slope mesh (zero damage)" );
+		CHECK( s->pos[1] > slope_y_at( s->pos[0] ) + 0.4f, "final height is slope-relative, far above the plane" );
+
+		// --- (d) step == step == replay on the recorded v2 excursion log. ---
+		sim_reset();
+		for ( int t = 0; t < 2400; ++t )
+		{
+			int16_t st16;
+			uint16_t th16, br16, fl16;
+			memcpy( &st16, slope_log + 8 * (size_t)t + 0, 2 );
+			memcpy( &th16, slope_log + 8 * (size_t)t + 2, 2 );
+			memcpy( &br16, slope_log + 8 * (size_t)t + 4, 2 );
+			memcpy( &fl16, slope_log + 8 * (size_t)t + 6, 2 );
+			sim_step( st16, th16, br16, fl16 );
+		}
+		uint64_t h_step = v2_state_hash();
+
+		sim_reset();
+		uint32_t st = sim_replay( (sim_ptr_t)slope_log, 2400 );
+		CHECK( !( st & SIM_STATUS_ERROR ), "sim_replay of the slope excursion log runs clean" );
+		uint64_t h_replay = v2_state_hash();
+
+		printf( "terrain raycast: excursion log record=%016llx step=%016llx replay=%016llx\n",
+				(unsigned long long)h_record, (unsigned long long)h_step, (unsigned long long)h_replay );
+		CHECK( h_record == h_step, "v2 excursion: recording and sim_step playback hashes identical" );
+		CHECK( h_step == h_replay, "v2 excursion: sim_step and sim_replay hashes identical" );
+
+		free( blob );
+	}
+}
+
 int main( void )
 {
 	test_format();
 	test_prop_collision();
 	test_grass_query();
 	test_grass_drive();
+	test_terrain_raycast();
 
 	if ( g_failures != 0 )
 	{

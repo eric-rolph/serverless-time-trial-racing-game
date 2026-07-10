@@ -52,3 +52,54 @@ Raycaster, build-time only) instead of assuming the flat ground plane.
 4. step==replay equality on the new track with an excursion-heavy log.
 5. Visual: no skirts on v2, trees grounded on slopes, no z-fighting at the
    apron/ground-quad seam (share the exact ground_y).
+
+## Status (2026-07-09)
+
+- **§2 physics = the mesh: DONE** (kernel wave, bundled with the drivetrain
+  deploy — one board rotation). Off-corridor wheels on v2 tracks cast one
+  straight-down ray per wheel per TICK against the static collision world,
+  filtered to the landscape mesh only (`SIM_CAT_MESH` category bit on the
+  mesh shape; prop boxes deliberately excluded — wheels cannot ride a tire
+  stack, the chassis still crashes into props as before). The hit's tangent
+  plane is the wheel surface for all 4 substeps (the hardpoint is frozen
+  within a tick, so a per-substep ray would return the identical hit — the
+  tick-level ray is exact, not an approximation). Grass classification
+  (kind = 1, μ×0.55 + rolling drag) keys off the corridor test exactly as
+  before; ray miss falls back to the flat ground_y plane bit-identically.
+  Version gate proven: wasm smoke hash `7acf8c978fae724b` unchanged (the
+  smoke oval is v1 WITH an off-corridor wheel excursion). Sloped-mesh
+  follow + on-corridor capture-compare + v2 excursion step==replay live in
+  physics/tests/test_track_v2.c §5. Measured cost: ≈0.5 µs/tick native with
+  all four wheels raycasting (~0.02 % of the 2.5 ms tick budget); ray API
+  caveats in physics/NOTES.md.
+- **§1 apron geometry (trackgen): DONE** (trackgen wave, bundled with the
+  same drivetrain deploy). `assemble_circuit` (v2/circuit path ONLY — the v1
+  `generate()` ribbon is frozen; dev5 regen byte-identity `162adead4bdf1931`
+  re-proven post-change) appends 4 apron rows per side at geometric spacing
+  (gaps W·(1,2,4,8)/15), heights on the C1 cosine falloff, W = clamp(gap/2,
+  10, 45) from the nearest non-adjacent (index distance > 40) shoulder edge,
+  circularly smoothed over 15 samples. **Fold cap (spec refinement)**: on the
+  inside of a corner the offset rays converge at the local curvature center;
+  W is additionally capped at 0.8·(1/|κ_raw,max-in-window| − lat_edge) on the
+  converging side (re-applied after smoothing), and this cap may undercut the
+  10 m floor — without it the ruled surface folds over itself (284 flipped,
+  back-face-culled triangles the wheel ray would miss; measured before the
+  fix). Hairpin inside bottoms out at W = 1.61 m (a steep funnel — still
+  strictly better than the vertical skirt it replaces). Vertex layout: apron
+  block at [4S, 12S), v(i,side,row) = 4S + i·8 + side·4 + row; kerbs then
+  ground quad follow. Z-fight choice: far apron row at ground_y − 0.001, quad
+  exactly at ground_y (1 mm resolves in-depth out to ~40 m at near=0.1;
+  beyond that the seam sliver is dark-green-on-dark-green). circuit1
+  regenerated in place: 555 276 bytes, track_hash `79a40d1c2b08fbe0` (was
+  `99f5ea59bd905065`) — centerline/props/ground_y bit-identical, mesh
+  +8 verts/+16 tris per sample (V 14 856, T 26 952). Gates live in
+  trackgen/check_apron.py (mesh integrity/normals, corridor intersection,
+  prop clearance, apron stats); W min/max/mean = 1.61/45.00/38.91 m, outer
+  edge step 0.001 m. Autopilot on the staged wasm completes (142.977 s,
+  target-speed 22) with a final state hash bit-identical to the pre-apron
+  mesh — on-corridor physics untouched. track.js mottling extended to the
+  apron rows (stepped slightly darker toward the plain).
+- **§3 client (ambience.js): DONE** (same bundle) — skirt walls skipped on
+  v2 tracks (apron replaces them; v1 path keeps them), trees and stands
+  grounded by a single build-time raycast against the real terrain mesh
+  (aprons included automatically), trees on slopes > 20° skipped.

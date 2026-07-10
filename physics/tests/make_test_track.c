@@ -50,13 +50,18 @@ static void wr_f32( Writer* w, float v )
 	wr( w, &v, 4 );
 }
 
-uint8_t* make_test_track_ex( size_t* out_len, float rx, float rz, uint32_t samples, float width,
-							 float terrain_half )
+// Core builder: standard flat oval, optionally followed by extra collision
+// geometry (extra_verts = xyz float triples appended after the strip vertices,
+// extra_tris = index triples RELATIVE to the extra-vertex base). Used by
+// make_test_track_ex (no extras) and make_test_track_sloped (sloped quad).
+static uint8_t* make_track_core( size_t* out_len, float rx, float rz, uint32_t samples, float width,
+								 float terrain_half, uint32_t extra_vert_count, const float* extra_verts,
+								 uint32_t extra_tri_count, const uint32_t* extra_tris )
 {
 	const uint32_t S = samples;
 	const uint32_t C = TT_CHECKPOINTS;
-	const uint32_t V = 2 * S;
-	const uint32_t T = 2 * S;
+	const uint32_t V = 2 * S + extra_vert_count;
+	const uint32_t T = 2 * S + extra_tri_count;
 
 	size_t len = 28 + (size_t)40 * S + (size_t)4 * C + (size_t)12 * V + (size_t)12 * T + 12;
 	uint8_t* blob = (uint8_t*)malloc( len );
@@ -143,6 +148,12 @@ uint8_t* make_test_track_ex( size_t* out_len, float rx, float rz, uint32_t sampl
 		wr_f32( &w, pz[i] + terrain_half * sz[i] );
 	}
 
+	// Extra collision vertices (sloped variant), appended after the strip.
+	for ( uint32_t i = 0; i < 3 * extra_vert_count; ++i )
+	{
+		wr_f32( &w, extra_verts[i] );
+	}
+
 	// Terrain triangles: quad per segment (wraps), wound so normals face +Y.
 	for ( uint32_t i = 0; i < S; ++i )
 	{
@@ -183,6 +194,13 @@ uint8_t* make_test_track_ex( size_t* out_len, float rx, float rz, uint32_t sampl
 		}
 	}
 
+	// Extra collision triangles (sloped variant): indices are relative to the
+	// extra-vertex base (2S). Caller supplies upward-facing winding.
+	for ( uint32_t i = 0; i < 3 * extra_tri_count; ++i )
+	{
+		wr_u32( &w, 2 * S + extra_tris[i] );
+	}
+
 	// Spawn pose: sample 0, yaw from its tangent (forward = +Z at yaw 0,
 	// rotating about +Y: fwd = (sin yaw, 0, cos yaw) → yaw = atan2(tx, tz)).
 	wr_u32( &w, 0 );
@@ -194,7 +212,32 @@ uint8_t* make_test_track_ex( size_t* out_len, float rx, float rz, uint32_t sampl
 	return blob;
 }
 
+uint8_t* make_test_track_ex( size_t* out_len, float rx, float rz, uint32_t samples, float width,
+							 float terrain_half )
+{
+	return make_track_core( out_len, rx, rz, samples, width, terrain_half, 0, NULL, 0, NULL );
+}
+
 uint8_t* make_test_track( size_t* out_len )
 {
 	return make_test_track_ex( out_len, TT_RX, TT_RZ, TT_SAMPLES, TT_WIDTH, TT_TERRAIN_HALF );
+}
+
+uint8_t* make_test_track_sloped( size_t* out_len )
+{
+	// Sloped rectangle beyond the corridor on the outside of the spawn
+	// straight (the standard grass-excursion exit): y rises linearly with x
+	// from the flat oval's ground_y. Two triangles, wound so cross(b−a, c−a)
+	// faces +Y (the mesh raycast is back-face culled — see NOTES.md).
+	const float y0 = TT_SLOPE_BASE_Y;
+	const float y1 = TT_SLOPE_BASE_Y + TT_SLOPE_K * ( TT_SLOPE_X1 - TT_SLOPE_X0 );
+	const float verts[4 * 3] = {
+		TT_SLOPE_X0, y0, TT_SLOPE_Z0, // 0
+		TT_SLOPE_X1, y1, TT_SLOPE_Z0, // 1
+		TT_SLOPE_X1, y1, TT_SLOPE_Z1, // 2
+		TT_SLOPE_X0, y0, TT_SLOPE_Z1, // 3
+	};
+	// (0,2,1): cross(v2−v0, v1−v0).y = 30·76 − 76·0 > 0; (0,3,2) likewise.
+	const uint32_t tris[2 * 3] = { 0, 2, 1, 0, 3, 2 };
+	return make_track_core( out_len, TT_RX, TT_RZ, TT_SAMPLES, TT_WIDTH, TT_TERRAIN_HALF, 4, verts, 2, tris );
 }

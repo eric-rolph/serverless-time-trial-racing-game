@@ -3,7 +3,11 @@
 // track always dresses itself the same way and no assets are shipped:
 //   • low-poly trees (InstancedMesh trunk + canopy) on both sides, outside
 //     the shoulder zone (lateral offset 12–25 m past width/2), every 10–20 m,
-//     skipped where they'd land on another part of the loop;
+//     skipped where they'd land on another part of the loop; on v2 tracks
+//     trees and grandstands are grounded on the real terrain (build-time
+//     raycast against track.verts/tris — TERRAIN.md §3) and steep apron
+//     slopes (> ~20°) are rejected; v1 keeps the flat ground plane. Skirt
+//     walls are v1-only — the v2 terrain apron replaces them;
 //   • red/white tire-stack barriers lining the OUTSIDE of the tightest
 //     corners (same smoothed-curvature rule the kerb paint uses);
 //     — EXCEPT on TRK1 v2 tracks: tire stacks, Armco and concrete walls are
@@ -34,6 +38,13 @@ export function buildAmbience(track, hash = null) {
   group.userData.glowMaterials = glowMaterials;
   const n = track.S;
 
+  // TRK1 v2 signal: parseTrack (track.js) does not expose the version field —
+  // props is the only v2 marker it returns (the prop table is parsed solely
+  // when version === 2). A hypothetical prop-less v2 track therefore degrades
+  // to the v1 visuals, consistent with the barrier heuristics below which
+  // already branch on the same condition.
+  const props = track.props && track.props.length ? track.props : null;
+
   // Deterministic PRNG seeded from the track identity.
   let seed = (Number((hash ?? fnv1a64(track.bytes)) & 0xffffffffn) >>> 0) || 1;
   const rand = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32;
@@ -58,9 +69,10 @@ export function buildAmbience(track, hash = null) {
   // The world beyond the 8 m shoulders is void — give it a ground plane at
   // shoulder-base level so trees stand on something and the horizon reads as
   // land, not outer space. Trees sit ON this plane.
-  let minY = Infinity, cx = 0, cz = 0, maxR = 0;
+  let minY = Infinity, maxCY = -Infinity, cx = 0, cz = 0, maxR = 0;
   for (const c of track.center) {
     minY = Math.min(minY, c[1]);
+    maxCY = Math.max(maxCY, c[1]);
     cx += c[0] / n; cz += c[2] / n;
   }
   for (const c of track.center) maxR = Math.max(maxR, Math.hypot(c[0] - cx, c[2] - cz));
@@ -71,12 +83,13 @@ export function buildAmbience(track, hash = null) {
   ground.position.set(cx, groundY, cz);
   group.add(ground);
 
-  // Skirts: the terrain strip ends at the shoulders' outer edges, which float
-  // above the ground plane wherever the track climbs — connect each outer
-  // edge down to the plane with a wall strip so road and land read as one
-  // world. Terrain vertex layout (trackgen): v(i,row) = i*4+row, rows 0/3 are
-  // the outer shoulder edges.
-  {
+  // Skirts (v1 ONLY): the v1 terrain strip ends at the shoulders' outer
+  // edges, which float above the ground plane wherever the track climbs —
+  // connect each outer edge down to the plane with a wall strip so road and
+  // land read as one world. Terrain vertex layout (trackgen): v(i,row) =
+  // i*4+row, rows 0/3 are the outer shoulder edges. On v2 tracks the terrain
+  // apron (TERRAIN.md §1/§3) replaces the skirts — skip them entirely.
+  if (!props) {
     const skirtMat = new THREE.MeshLambertMaterial({ color: 0x2d3b31, side: THREE.DoubleSide });
     for (const row of [0, 3]) {
       const pos = new Float32Array(n * 2 * 3);
@@ -98,6 +111,34 @@ export function buildAmbience(track, hash = null) {
       group.add(new THREE.Mesh(g, skirtMat));
     }
   }
+
+  // ---------------------------------------------- terrain height sampling
+  // v2 tracks: trees/stands must sit ON the terrain (apron slopes,
+  // TERRAIN.md §3), not on the flat ground plane. One three.js Raycaster +
+  // one throwaway mesh built from the track's own collision geometry —
+  // track.verts/track.tris, the exact mesh buildTrackMeshes renders (apron
+  // rows and ground quad included once trackgen bakes them) — cast straight
+  // down at placement time. Build-time only: nothing here runs per frame,
+  // and the mesh is never added to the scene (no GPU upload, no dispose
+  // needed). v1 tracks keep the flat-plane placement bit-for-bit (sampler
+  // disabled — their mesh ends at the shoulders anyway).
+  const APRON_COS = Math.cos((20 * Math.PI) / 180); // max slope trees/stands accept
+  const groundHit = (() => {
+    if (!props) return () => null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(track.verts, 3));
+    g.setIndex(new THREE.BufferAttribute(track.tris, 1));
+    const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }));
+    const ray = new THREE.Raycaster();
+    ray.ray.direction.set(0, -1, 0);
+    return (x, z) => {
+      // Origin safely above everything: banking can lift edge verts ~1–2 m
+      // over the centerline, kerbs a few cm — 25 m of headroom covers all.
+      ray.ray.origin.set(x, maxCY + 25, z);
+      const hits = ray.intersectObject(mesh, false);
+      return hits.length ? hits[0] : null; // closest = highest surface below
+    };
+  })();
 
   // ------------------------------------------- curvature + corner zones
   // Shared by gravel traps, Armco, tire stacks, brake boards and stands.
@@ -155,11 +196,19 @@ export function buildAmbience(track, hash = null) {
       const th = f.t.clone().setY(0).normalize();
       const sh = new THREE.Vector3().crossVectors(upY, th).normalize();
       const base = f.c.clone().addScaledVector(sh, out * dist);
-      base.y = groundY;
+      base.y = groundY; // flat-plane default (v1 always; v2 ray-miss fallback)
       const depth = tiers * STEP_D + 2.5;
       for (const [dl, dd] of [[0, 0], [-L / 2, 0], [L / 2, 0], [0, depth]]) {
         const p = base.clone().addScaledVector(th, dl).addScaledVector(sh, out * dd);
         if (!clearOfTrack(p)) return false;
+      }
+      // v2: ground the stand on the terrain (sampled at the front edge). A
+      // stand on a steep apron slope would hang off a cliff — reject it so
+      // the caller falls back to the other side / next corner.
+      const hit = groundHit(base.x, base.z);
+      if (hit) {
+        if (Math.abs(hit.face.normal.y) < APRON_COS) return false;
+        base.y = hit.point.y;
       }
       standDefs.push({ base, th, sh, out, L, tiers });
       standFootprints.push({
@@ -268,10 +317,19 @@ export function buildAmbience(track, hash = null) {
       const p = f.c.clone()
         .addScaledVector(f.side, s * lat)
         .addScaledVector(f.t, (rand() - 0.5) * 4);
-      p.y = groundY; // stand on the ground plane (world beyond shoulders is flat)
+      p.y = groundY; // flat-plane default (v1 always; v2 ray-miss fallback)
       if (!clearOfTrack(p)) continue;
       if (standFootprints.some((fp) =>
         (p.x - fp.x) * (p.x - fp.x) + (p.z - fp.z) * (p.z - fp.z) < fp.r * fp.r)) continue;
+      // v2: ground the tree on the terrain. Trees on a steep apron slope
+      // (> ~20°) read as cliffside mistakes — skip those candidates. Skips
+      // are pure geometry (raycast on the static track mesh), so placement
+      // stays fully deterministic per track.
+      const hit = groundHit(p.x, p.z);
+      if (hit) {
+        if (Math.abs(hit.face.normal.y) < APRON_COS) continue;
+        p.y = hit.point.y;
+      }
       trees.push({ p, scale: [0.8, 1.0, 1.35][(rand() * 3) | 0], rot: rand() * Math.PI * 2 });
     }
   }
@@ -302,7 +360,7 @@ export function buildAmbience(track, hash = null) {
   // tile each box exactly — what you see is what you hit (never protruding
   // more than ~10 cm past the box, never visibly inside it). One InstancedMesh
   // per type family. v1 tracks (empty props) keep the curvature heuristics.
-  const props = track.props && track.props.length ? track.props : null;
+  // (`props` is the v2 signal defined at the top of buildAmbience.)
   const upY2 = new THREE.Vector3(0, 1, 0);
 
   // ------------------------------------------- tire-stack barriers

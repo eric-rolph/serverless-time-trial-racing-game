@@ -542,6 +542,21 @@ static float sClampMag( float x, float m )
 #define SIM_GRASS_DRAG_COEF 30.0f // N per (m/s) of in-plane patch velocity
 								  // (~600 N per wheel at 20 m/s, linear in speed)
 
+// Off-corridor terrain raycast (docs/TERRAIN.md §2, v2 tracks only): one
+// straight-down world-space ray per off-corridor wheel per TICK against the
+// landscape mesh (SIM_CAT_MESH — prop boxes excluded, you cannot drive on a
+// tire stack). Origin SIM_TERRAIN_RAY_UP above the hardpoint (immune to a
+// hardpoint momentarily below a slope after a hard landing), total length
+// SIM_TERRAIN_RAY_LEN (reaches RAY_LEN − RAY_UP below the hardpoint — anything
+// farther is far out of suspension reach anyway). Ray miss falls back to the
+// flat ground_y grass plane from the road query — exactly the pre-raycast
+// surface. One ray per tick, not per substep: the ray origin is the hardpoint,
+// which is FROZEN within the tick (the chassis integrates at tick level), so a
+// per-substep ray against static geometry would return the identical hit 4x —
+// the tick-level hit plane is exact, not an approximation.
+#define SIM_TERRAIN_RAY_UP 5.0f
+#define SIM_TERRAIN_RAY_LEN 10.0f
+
 void vehicle_apply_impact( Vehicle* v, float approachSpeed, b3Vec3 localPoint )
 {
 	if ( approachSpeed <= SIM_DAMAGE_THRESHOLD )
@@ -1176,6 +1191,13 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 	rayFilter.categoryBits = SIM_CAT_CHASSIS;
 	rayFilter.maskBits = SIM_CAT_TERRAIN;
 
+	// Off-corridor terrain ray (docs/TERRAIN.md §2): landscape mesh ONLY —
+	// prop boxes are not wheel-ridable. The legacy fallback ray above keeps
+	// masking SIM_CAT_TERRAIN (mesh + props), bit-identical to before.
+	b3QueryFilter meshRayFilter = b3DefaultQueryFilter();
+	meshRayFilter.categoryBits = SIM_CAT_CHASSIS;
+	meshRayFilter.maskBits = SIM_CAT_MESH;
+
 	const float ray_len = t->rest_length + t->wheel_radius;
 	const float sub_dt = SIM_DT / (float)SIM_TIRE_SUBSTEPS;
 
@@ -1231,27 +1253,56 @@ void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer,
 
 			// On v2 tracks the query is total (docs/ROAD-SURFACE.md §6):
 			// corridor answers are bit-identical to before, off-corridor is
-			// the flat grass plane at ground_y. On v1 tracks off-corridor
-			// queries still report !on_road with kind ASPHALT, so this
-			// condition — and everything downstream — reduces exactly to the
-			// legacy `if (rq.on_road)` control flow (bit-identical replays).
-			// A surface facing away from the ray (rolled car) still ends up
-			// airborne, exactly as before; chassis mesh collision handles it.
+			// kind GRASS — the wheel then rides the real landscape mesh via
+			// the terrain raycast below (docs/TERRAIN.md §2), with the flat
+			// ground_y plane in rq as the ray-miss fallback. On v1 tracks
+			// off-corridor queries still report !on_road with kind ASPHALT,
+			// so this condition — and everything downstream — reduces exactly
+			// to the legacy `if (rq.on_road)` control flow (bit-identical
+			// replays). A surface facing away from the ray (rolled car) still
+			// ends up airborne, exactly as before; chassis mesh collision
+			// handles it.
 			if ( rq.on_road || rq.kind == ROAD_KIND_GRASS )
 			{
 				need_mesh_fallback = 0;
+				b3Vec3 surf_point = rq.point;
+				b3Vec3 surf_normal = rq.normal;
+
+				if ( rq.kind == ROAD_KIND_GRASS )
+				{
+					// Off-corridor on a v2 track (GRASS never occurs on v1):
+					// ride the REAL landscape (docs/TERRAIN.md §2) — cast
+					// straight down from above the hardpoint against the
+					// static mesh only (SIM_CAT_MESH; props excluded) and use
+					// the hit's tangent plane as the wheel surface. The plane
+					// is a per-tick constant reused across the 4 substeps,
+					// exactly like the analytic corridor surface. A miss
+					// keeps the flat ground_y plane already in rq — the
+					// pre-raycast behavior, bit-identical.
+					b3Pos ray_origin = origin;
+					ray_origin.y += SIM_TERRAIN_RAY_UP;
+					b3Vec3 ray_translation = { 0.0f, -SIM_TERRAIN_RAY_LEN, 0.0f };
+					b3RayResult tray = b3World_CastRayClosest( world, ray_origin, ray_translation, meshRayFilter );
+					if ( tray.hit )
+					{
+						surf_point = tray.point;
+						surf_normal = tray.normal; // unit, up-facing (the mesh
+												   // raycast is back-face culled)
+					}
+				}
+
 				// Suspension ray x(d) = origin - d·up against the local
-				// tangent plane (point rq.point, normal rq.normal).
-				float facing = b3Dot( up, rq.normal );
+				// tangent plane (point surf_point, normal surf_normal).
+				float facing = b3Dot( up, surf_normal );
 				if ( facing > 0.2f ) // surface must face the ray
 				{
-					float d = b3Dot( b3Sub( origin, rq.point ), rq.normal ) / facing;
+					float d = b3Dot( b3Sub( origin, surf_point ), surf_normal ) / facing;
 					if ( d <= ray_len )
 					{
 						have_contact = 1;
 						hit_dist = d > 0.0f ? d : 0.0f; // below surface → full compression
 						contact_point = b3MulAdd( origin, -hit_dist, up );
-						contact_normal = rq.normal;
+						contact_normal = surf_normal;
 						grass = ( rq.kind == ROAD_KIND_GRASS );
 					}
 				}

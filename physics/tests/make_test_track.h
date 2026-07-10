@@ -22,6 +22,21 @@ uint8_t* make_test_track( size_t* out_len );
 uint8_t* make_test_track_ex( size_t* out_len, float rx, float rz, uint32_t samples, float width,
 							 float terrain_half );
 
+// Sloped-terrain variant (docs/TERRAIN.md §2 raycast test): the standard flat
+// oval PLUS a large sloped rectangle in the collision mesh, placed OFF the
+// corridor on the outside of the spawn straight (where the grass-excursion
+// drive exits). Height is linear in x:
+//   y(x) = TT_SLOPE_BASE_Y + TT_SLOPE_K * (x - TT_SLOPE_X0)
+// TT_SLOPE_BASE_Y equals the oval's ground_y (min sample y - 1.35), so the
+// slope takes over exactly where the flat grass plane would be. Caller frees.
+#define TT_SLOPE_X0 44.0f
+#define TT_SLOPE_X1 120.0f
+#define TT_SLOPE_Z0 30.0f
+#define TT_SLOPE_Z1 60.0f
+#define TT_SLOPE_K 0.08f		   // rise per meter of x (~4.6 deg, drivable)
+#define TT_SLOPE_BASE_Y ( -1.35f ) // == ground_y of the flat oval
+uint8_t* make_test_track_sloped( size_t* out_len );
+
 #ifdef __cplusplus
 }
 #endif

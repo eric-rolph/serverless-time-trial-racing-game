@@ -12,6 +12,12 @@
 // Collision filter categories
 #define SIM_CAT_TERRAIN 0x0001ull
 #define SIM_CAT_CHASSIS 0x0002ull
+// The landscape MESH shape carries SIM_CAT_MESH in ADDITION to SIM_CAT_TERRAIN
+// (prop boxes carry SIM_CAT_TERRAIN only), so the off-corridor wheel ray
+// (docs/TERRAIN.md §2) can ride the terrain without ever standing on a prop.
+// Category bits only gate boolean filter checks — adding a bit changes no
+// float math, so v1 replays are untouched (proven by the smoke hash).
+#define SIM_CAT_MESH 0x0004ull
 
 typedef struct WheelRuntime
 {
@@ -100,9 +106,11 @@ void vehicle_reset( b3WorldId world, Vehicle* v, b3Vec3 pos, float yaw );
 // Per-tick force computation, before b3World_Step. Inputs are unquantized
 // floats: steer [-1,1], throttle [0,1], brake [0,1], flags bitfield.
 // `road` is the analytic surface the wheels contact (docs/ROAD-SURFACE.md).
-// On v2 tracks the query is total (§6): off-corridor wheels ride the flat
-// grass plane (reduced friction + rolling drag). On v1 tracks off-corridor
-// wheels keep the legacy mesh raycast fallback — bit-identical replays.
+// On v2 tracks the query is total (§6): off-corridor wheels ride the real
+// landscape mesh via a straight-down terrain ray (docs/TERRAIN.md §2, props
+// excluded; ray miss → the flat ground_y grass plane) with reduced friction
+// + rolling drag. On v1 tracks off-corridor wheels keep the legacy mesh
+// raycast fallback — bit-identical replays.
 void vehicle_update( b3WorldId world, Vehicle* v, const Road* road, float steer, float throttle, float brake,
 					 uint32_t flags );
 

@@ -437,7 +437,11 @@ int32_t sim_load_track( sim_ptr_t ptr, uint32_t len )
 	b3ShapeDef groundShape = b3DefaultShapeDef();
 	groundShape.baseMaterial.friction = 1.0f;
 	groundShape.baseMaterial.restitution = 0.0f;
-	groundShape.filter.categoryBits = SIM_CAT_TERRAIN;
+	// SIM_CAT_MESH marks the landscape mesh for the off-corridor wheel ray
+	// (docs/TERRAIN.md §2): wheels may ride the mesh, never the prop boxes.
+	// Pair/query filtering is boolean-only, so the extra category bit changes
+	// nothing for existing masks (chassis + legacy wheel rays use TERRAIN).
+	groundShape.filter.categoryBits = SIM_CAT_TERRAIN | SIM_CAT_MESH;
 	groundShape.filter.maskBits = ~0ull;
 	b3CreateMeshShape( ground, &groundShape, t->mesh, b3Vec3_one );
 

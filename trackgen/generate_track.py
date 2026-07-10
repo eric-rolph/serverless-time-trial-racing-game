@@ -598,6 +598,95 @@ TIRE_HALF = (1.1, 0.55, 1.1)
 ARMCO_HALF = (2.0, 0.38, 0.15)
 ARMCO_PITCH = 4.15  # 4 m segment + 0.15 m gap, along the offset curve
 
+# Apron (TERRAIN.md §1): 4 extra vertex rows per side beyond the shoulders,
+# blending shoulder-edge height -> ground_y with a C1 cosine falloff — the
+# collision mesh the wheels raycast off-corridor (kernel wave, TERRAIN.md §2).
+# CIRCUIT/v2 PATH ONLY: generate() and its ribbon are frozen (dev5 regen
+# byte-identity is a release gate).
+APRON_ROWS = 4
+APRON_W_MIN_M = 10.0
+APRON_W_MAX_M = 45.0
+APRON_ADJ_WINDOW = 40  # samples: circular index distance <= 40 = "adjacent"
+APRON_SMOOTH_WINDOW = 15  # moving-average window for W along the centerline
+# Geometric row spacing (ratio 2): rows cluster near the shoulder where the
+# cosine profile bends; gaps of W*(1,2,4,8)/15.
+APRON_ROW_FRACTIONS = (1.0 / 15.0, 3.0 / 15.0, 7.0 / 15.0, 1.0)
+# Z-fight guard (chosen option): the far apron row sits 1 mm BELOW ground_y;
+# the ground quad stays exactly at ground_y as today. The 1 mm step is the
+# "worst remaining height discontinuity" at the apron outer edge.
+APRON_ZFIGHT_EPS_M = 0.001
+
+
+APRON_FOLD_MARGIN = 0.8  # fraction of the fold-limit radius the apron may use
+APRON_W_FLOOR_M = 1.0  # absolute floor (keeps the 4 rows non-degenerate)
+
+
+def apron_safe_width(pos: np.ndarray, side: np.ndarray, half: np.ndarray):
+    """Per-sample, per-side safe apron width W (n x 2, columns = left/right).
+
+    gap = horizontal distance from this sample's shoulder edge to the nearest
+    NON-ADJACENT sample's shoulder edge (either side, wrap-aware; adjacent =
+    circular index distance <= APRON_ADJ_WINDOW). W = clamp(gap/2, 10, 45),
+    then circularly moving-averaged (~15 samples) so apron edges don't zigzag.
+
+    FOLD CAP (self-intersection guard the gap term cannot see): on the INSIDE
+    of a corner the per-sample offset rays converge at the local center of
+    curvature — any lateral offset beyond 1/|kappa| from the centerline sweeps
+    retrograde and the ruled surface folds over itself (flipped, back-face-
+    culled triangles the wheel raycast would miss). On the converging side W
+    is therefore additionally capped at APRON_FOLD_MARGIN * (1/|kappa_max| -
+    lat_edge), where |kappa_max| is the worst raw per-sample curvature within
+    the smoothing half-window. This cap MAY undercut the 10 m clamp floor
+    (e.g. the hairpin inside, edge radius ~2 m — the pre-apron skirt there was
+    a vertical wall; a steep narrow apron strictly improves it). The cap is
+    re-applied after smoothing so the moving average cannot lift W back over
+    the fold limit.
+    """
+    n = len(pos)
+    edge_l = (pos - side * (half + SHOULDER_WIDTH_M))[:, [0, 2]]
+    edge_r = (pos + side * (half + SHOULDER_WIDTH_M))[:, [0, 2]]
+    pts = np.stack([edge_l, edge_r], axis=1).reshape(-1, 2)  # (2n,2): L0,R0,L1,R1,...
+    owner = np.repeat(np.arange(n), 2)
+    diff = np.abs(owner[:, None] - owner[None, :])
+    circ = np.minimum(diff, n - diff)
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+    d[circ <= APRON_ADJ_WINDOW] = np.inf
+    gap = d.min(axis=1).reshape(n, 2)
+
+    # Fold cap. Raw (unsmoothed) curvature magnitude + the side it converges
+    # toward (sign convention-free: dot the tangent derivative with side).
+    tangent = np.roll(pos, -1, axis=0) - np.roll(pos, 1, axis=0)
+    tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)
+    t_next = np.roll(tangent, -1, axis=0)
+    kmag = np.abs(tangent[:, 0] * t_next[:, 2] - tangent[:, 2] * t_next[:, 0]) / SAMPLE_SPACING_M
+    dtan = np.roll(tangent, -1, axis=0) - np.roll(tangent, 1, axis=0)
+    conv_r = (dtan[:, 0] * side[:, 0] + dtan[:, 2] * side[:, 2]) > 0.0  # curves toward +side
+    k_l = np.where(~conv_r, kmag, 0.0)  # curvature converging on the left col
+    k_r = np.where(conv_r, kmag, 0.0)
+    hw = APRON_SMOOTH_WINDOW // 2
+    for shift in range(-hw, hw + 1):
+        if shift:
+            k_l = np.maximum(k_l, np.roll(np.where(~conv_r, kmag, 0.0), shift))
+            k_r = np.maximum(k_r, np.roll(np.where(conv_r, kmag, 0.0), shift))
+    lat_edge = half[:, 0] + SHOULDER_WIDTH_M
+    with np.errstate(divide="ignore"):
+        cap = np.stack(
+            [
+                np.where(k_l > 1e-9, APRON_FOLD_MARGIN * (1.0 / np.maximum(k_l, 1e-9) - lat_edge), np.inf),
+                np.where(k_r > 1e-9, APRON_FOLD_MARGIN * (1.0 / np.maximum(k_r, 1e-9) - lat_edge), np.inf),
+            ],
+            axis=1,
+        )
+    cap = np.maximum(cap, APRON_W_FLOOR_M)
+
+    w = np.clip(gap * 0.5, APRON_W_MIN_M, APRON_W_MAX_M)
+    w = np.minimum(w, cap)
+    kern = np.ones(APRON_SMOOTH_WINDOW) / APRON_SMOOTH_WINDOW
+    for c in range(2):
+        w[:, c] = np.convolve(np.tile(w[:, c], 3), kern, mode="same")[n:2 * n]
+    w = np.minimum(w, cap)  # smoothing must not lift W back over the fold limit
+    return np.maximum(w, APRON_W_FLOOR_M)
+
 
 def _shoulder_surface(pos_i, side_i, half_w: float, lateral: float):
     """Exact mesh-shoulder surface point at |lateral| in [half, half+8] —
@@ -711,6 +800,54 @@ def assemble_circuit(pos: np.ndarray, sections, seed: int) -> dict:
             tris.append([a, c, b])
             tris.append([b, c, d])
 
+    # Apron (TERRAIN.md §1 — kills the cliff): 4 vertex rows per side beyond
+    # the shoulder edge, height h(d) = ground_y + (h_edge - ground_y) *
+    # 0.5*(1 + cos(pi*d/W)) — C1 at both ends. W is the per-sample per-side
+    # safe width so aprons in tight loop interiors meet mid-gap (valley)
+    # instead of crossing the opposing corridor. Vertex layout: the apron
+    # block sits at [4n, 12n) — v(i, side, row) = 4n + i*8 + side*4 + row
+    # (side 0 = left, 1 = right; row 0..3 outward) — so the client can find
+    # it deterministically; kerb verts append AFTER the apron block.
+    ground_y = float(pos[:, 1].min()) - GROUND_DROP_M
+    w_safe = apron_safe_width(pos, side, half)
+    dir_xz = side[:, [0, 2]] / np.linalg.norm(side[:, [0, 2]], axis=1, keepdims=True)
+    fr = np.array(APRON_ROW_FRACTIONS)
+    blend = 0.5 * (1.0 + np.cos(math.pi * fr))
+    apron = np.empty((n, 2 * APRON_ROWS, 3))
+    for scol, sgn in ((0, -1.0), (1, 1.0)):
+        edge = rows[0] if scol == 0 else rows[3]  # shoulder outer row (n,3)
+        for k in range(APRON_ROWS):
+            lat = fr[k] * w_safe[:, scol]  # horizontal distance beyond the edge
+            if k == APRON_ROWS - 1:
+                y = np.full(n, ground_y - APRON_ZFIGHT_EPS_M)  # z-fight guard
+            else:
+                y = ground_y + (edge[:, 1] - ground_y) * blend[k]
+            col = scol * APRON_ROWS + k
+            apron[:, col, 0] = edge[:, 0] + sgn * dir_xz[:, 0] * lat
+            apron[:, col, 1] = y
+            apron[:, col, 2] = edge[:, 2] + sgn * dir_xz[:, 1] * lat
+    apron_base = len(verts)  # == 4n
+    verts = np.vstack([verts, apron.reshape(-1, 3)])
+    for i in range(n):
+        j = (i + 1) % n
+        for scol, sgn in ((0, -1.0), (1, 1.0)):
+            outer_row = 0 if scol == 0 else 3
+            prev_i, prev_j = i * 4 + outer_row, j * 4 + outer_row
+            for k in range(APRON_ROWS):
+                a, c = prev_i, prev_j
+                b = apron_base + i * 8 + scol * 4 + k
+                d = apron_base + j * 8 + scol * 4 + k
+                # a/c = inner pair, b/d = outer pair; same winding rule as the
+                # kerbs so face normals point +Y on both sides.
+                tris += [[a, c, b], [b, c, d]] if sgn > 0 else [[a, b, c], [b, d, c]]
+                prev_i, prev_j = b, d
+    apron_stats = {
+        "width_min_m": float(w_safe.min()),
+        "width_max_m": float(w_safe.max()),
+        "width_mean_m": float(w_safe.mean()),
+        "outer_edge_step_m": APRON_ZFIGHT_EPS_M,
+    }
+
     # Kerbs (identical to generate(): tooth 0.02 — MUST stay in sync with
     # road.c's analytic band; "heavy" kerbs are made by sustaining |kappa|
     # deep past KERB_KAPPA so the band paints long and fully).
@@ -744,8 +881,9 @@ def assemble_circuit(pos: np.ndarray, sections, seed: int) -> dict:
     verts = np.vstack(verts_list)
 
     # Ground quad: the solid landscape, baked into the COLLISION mesh at
-    # ground_y (shared formula with road.c fallback and ambience.js disc).
-    ground_y = float(pos[:, 1].min()) - GROUND_DROP_M
+    # ground_y (shared formula with road.c fallback and ambience.js disc;
+    # computed above for the apron). The quad stays exactly at ground_y — the
+    # apron's far row sits APRON_ZFIGHT_EPS_M below it (stated z-fight choice).
     centroid = pos[:, [0, 2]].mean(axis=0)
     max_r = float(np.max(np.hypot(pos[:, 0] - centroid[0], pos[:, 2] - centroid[1])))
     h_side = max_r + 120.0
@@ -811,6 +949,7 @@ def assemble_circuit(pos: np.ndarray, sections, seed: int) -> dict:
         },
         "spawn": {"index": 0, "yaw": yaw},
         "ground_y": ground_y,
+        "apron": apron_stats,
         "props": props,
         "sections": [
             {"name": s["name"], "s0": round(s["s0"], 2), "s1": round(s["s1"], 2),
@@ -1031,6 +1170,12 @@ def main() -> None:
         f"{track['width_max_m']:.1f}m elev-range={track['elevation_range_m']:.1f}m "
         f"props={len(track.get('props', []))} -> {out}"
     )
+    if "apron" in track:
+        a = track["apron"]
+        print(
+            f"apron: W min={a['width_min_m']:.2f}m max={a['width_max_m']:.2f}m "
+            f"mean={a['width_mean_m']:.2f}m outer-edge step={a['outer_edge_step_m']:.3f}m"
+        )
 
 
 if __name__ == "__main__":

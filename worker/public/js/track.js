@@ -128,14 +128,20 @@ export function buildTrackMeshes(track) {
 
   // Terrain (shoulders + surface base) — dark green with subtle per-vertex
   // grass mottling (APEX §3 run-off variation), deterministic from the track
-  // hash. Kerb rumble verts (appended after the 4-row ribbon) keep the flat
-  // base tone; their visible paint is the red/white overlay below anyway.
+  // hash. Apron tracks (TERRAIN.md §1) append 8 apron verts per sample right
+  // after the 4-row ribbon — v(i,side,row) = 4S + i*8 + side*4 + row, rows
+  // 0..3 outward — mottled like the shoulders but stepped slightly darker
+  // toward the plain. Kerb rumble verts (appended after ribbon + apron) keep
+  // the flat base tone; their visible paint is the red/white overlay anyway.
   const terrainGeo = new THREE.BufferGeometry();
   terrainGeo.setAttribute("position", new THREE.BufferAttribute(track.verts.slice(), 3));
   terrainGeo.setIndex(new THREE.BufferAttribute(track.tris.slice(), 1));
   terrainGeo.computeVertexNormals();
   {
     const vcount = track.verts.length / 3;
+    // Apron detection is structural: ribbon(4S) + apron(8S) + ground quad(4)
+    // is only reachable with the apron block (kerbs alone cap at +4S).
+    const apronEnd = vcount >= track.S * 12 + 4 ? track.S * 12 : track.S * 4;
     const colors = new Float32Array(vcount * 3);
     let s = (Number(fnv1a64(track.bytes) & 0xffffffffn) >>> 0) || 1;
     const rnd = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32;
@@ -146,6 +152,12 @@ export function buildTrackMeshes(track) {
         colors[v * 3] = base.r * (1 + m * 0.7);
         colors[v * 3 + 1] = base.g * (1 + m);
         colors[v * 3 + 2] = base.b * (1 + m * 0.5);
+      } else if (v < apronEnd) {
+        const m = (rnd() - 0.5) * 0.16;
+        const shade = 1 - 0.045 * (((v - track.S * 4) % 4) + 1); // darker toward the plain
+        colors[v * 3] = base.r * (1 + m * 0.7) * shade;
+        colors[v * 3 + 1] = base.g * (1 + m) * shade;
+        colors[v * 3 + 2] = base.b * (1 + m * 0.5) * shade;
       } else {
         colors[v * 3] = base.r; colors[v * 3 + 1] = base.g; colors[v * 3 + 2] = base.b;
       }

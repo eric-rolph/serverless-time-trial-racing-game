@@ -661,3 +661,115 @@ tests/test_tire.c (extended), tests/test_suspension.c (f_arb arg),
 tests/test_track_v2.c (grass input), tests/make_test_track.{h,c}
 (make_test_track_ex), docs/CONTRACTS.md (§1.1, §2), docs/DRIVETRAIN.md
 (§6.5), docs/TIRE-MODEL.md (§6), docs/SUSPENSION.md (addendum).
+
+## Off-corridor terrain raycast (2026-07-09, docs/TERRAIN.md §2)
+
+On v2 tracks, off-corridor wheels no longer ride the flat ground_y grass
+plane: when road_query reports kind = GRASS, vehicle.c casts ONE straight-down
+world-space ray per wheel per TICK (`b3World_CastRayClosest`, origin 5 m above
+the hardpoint, 10 m long) against the landscape mesh and uses the hit
+point/normal as the wheel's surface plane. Ray miss → the ground_y plane from
+the query, bit-identically (this is also the behavior beyond the map edge).
+Grass classification (kind = 1, mu×0.55 + rolling drag) is untouched. Bundled
+with the drivetrain wave — the board rotates once.
+
+### Design decisions
+
+- **Props are NOT wheel-ridable.** The landscape mesh shape now carries
+  `SIM_CAT_MESH` (0x0004) IN ADDITION to `SIM_CAT_TERRAIN`; prop boxes stay
+  `SIM_CAT_TERRAIN` only. The terrain wheel ray masks `SIM_CAT_MESH`, so you
+  cannot drive on top of a tire stack (the chassis still crashes into props —
+  pair filtering is untouched). The LEGACY wheel fallback ray (v1 off-corridor,
+  rolled-car) keeps masking `SIM_CAT_TERRAIN` = mesh + props, bit-identical.
+  Category bits only feed boolean filter checks (`b3ShouldQueryCollide`:
+  shape.category & query.mask, plus the leaf-culling mask in the tree
+  traversal) — adding a bit changes no float math anywhere; proven by the
+  unchanged smoke hash.
+- **One ray per wheel per TICK, not per substep** (task offered 16/tick worst
+  case). Not an approximation: the ray origin is the hardpoint, which is
+  FROZEN within a tick (the chassis integrates at tick level; only strut
+  travel/omega substep, and neither moves the hardpoint), so 4 per-substep
+  rays against static geometry would return the identical hit. The hit's
+  tangent plane is reused across the 4 substeps exactly like the analytic
+  corridor plane. Worst case 4 rays/tick.
+- **v1 gate**: the GRASS kind only exists when road.grass_fallback is set
+  (v2), so v1 never executes the new branch; the corridor math was only moved
+  into locals (surf_point/surf_normal), same ops same order. Smoke hash
+  `7acf8c978fae724b` byte-identical — and the smoke oval provably dangles a
+  wheel off-corridor around tick 3741, so the gate is exercised, not vacuous.
+
+### Box3D ray API findings (determinism caveats)
+
+- `b3World_CastRayClosest(world, origin, translation, filter)` is a closed
+  query: internal callback keeps the lowest reported fraction and feeds it
+  back as the shrinking maxFraction; it IGNORES initial-overlap hits
+  (fraction == 0 is skipped — irrelevant for us, the origin is 5 m up in the
+  air). No user callback → no chance of order-dependent user logic.
+- **Mesh raycast is back-face culled** (`b3IntersectRayTriangle` rejects
+  `dot(normal, rayDelta) >= 0`): a down ray only hits up-facing triangles
+  (trackgen/test winding is up-facing; negative mesh scale would flip
+  winding, but we pass b3Vec3_one). A wheel UNDER the landscape gets a miss →
+  ground_y plane fallback, not a bogus ceiling contact.
+- **BVH traversal order and ties**: within a mesh, candidate triangles are
+  visited in a stack order fixed by the BVH (built once in `b3CreateMesh`;
+  SAH build, deterministic for identical input bytes — same reason the
+  contact BVH is deterministic) and the best hit uses STRICT `<` on the
+  fraction, so an exact tie keeps the first-visited triangle. That choice is
+  a pure function of the mesh bytes — same track blob ⇒ same triangle ⇒ same
+  hit/normal bits everywhere (ADR-001: only wasm-vs-wasm identity is
+  load-bearing anyway). Across SHAPES the world loops body-type trees in
+  fixed order with the same shrinking-maxFraction rule; with the
+  `SIM_CAT_MESH` filter exactly one shape can respond, so cross-shape ties
+  cannot exist at all.
+- The ray math is plain float mul/add/div/compare (plus the world-relative
+  re-differencing of the origin) — no transcendentals, no SIMD in our builds
+  (`BOX3D_DISABLE_SIMD`), single-threaded traversal. `b3TreeStats` counters
+  are observational only.
+
+### Measured cost
+
+Native RelWithDebInfo on the dev desktop; wasm is the shipping artifact but
+the relative cost is what matters — the budget is 2.5 ms/tick (400 Hz).
+
+- Whole tick via sim API, steady state: on-corridor 3.09 µs/tick (0 rays);
+  off-corridor all-4-wheels ray-MISS 3.12 µs/tick (+~6 ns/ray — root AABB
+  reject); off-corridor all-4-wheels ray-HIT 3.57 µs/tick (+0.48 µs/tick ≈
+  120 ns/ray on the 514-tri test mesh). Worst case is ~0.02 % of the tick
+  budget.
+- Isolated `b3World_CastRayClosest`, 1M rays: 191 ns HIT / 16 ns MISS on a
+  512-tri mesh; 241/17 ns on a 7442-tri mesh (real circuit1 = 7544 tris);
+  277/24 ns on a 32768-tri mesh (future apron-heavy scale). Log-scale BVH
+  growth — even 16 rays/tick would have been affordable, per-tick was chosen
+  for exactness, not cost.
+
+### Gates (all PASS)
+
+- All 10 ctest suites green (incl. drivetrain/launch/skidpad, no threshold
+  changes anywhere).
+- wasm rebuild (416 033 bytes): smoke step==replay hash `7acf8c978fae724b`
+  IDENTICAL to the drivetrain golden — v1 untouched, version gate holds.
+  Exports/imports unchanged (16 sim_* exports;
+  {emscripten_notify_memory_growth, fd_write}).
+- tests/test_track_v2.c §5 (new): sloped-mesh v2 oval (make_test_track_sloped,
+  4.6° plane starting at ground_y beyond the corridor) — the excursion climbs
+  the slope ON ITS WHEELS: chassis rides 0.80 m over the slope surface (band
+  0.45..1.15 asserted every settled tick), all four wheels loaded
+  (susp_compression > 5 mm), zero damage, final height slope-relative. The
+  pre-change kernel BELLY-SLID here (wheels drooped on the −1.35 plane,
+  chassis scraping the mesh: same drive ended at 4.8 m/s vs 18.4 m/s now).
+  On-corridor 800-tick capture `6e684a737810541e` bit-identical pre/post, on
+  both the standard AND sloped ovals (mesh presence + category bit change
+  don't perturb on-corridor physics). Ray-miss 2400-tick excursion capture
+  `0da900df0055f8d1` bit-identical (plane fallback exact).
+- step==replay: the 2400-tick sloped-oval excursion log runs record == re-step
+  == sim_replay, all `f8365d4507fffe7d`.
+- Autopilot sanity on real tracks through the new wasm: dev5-style default
+  50.553 s LAP COMPLETE; circuit1 (v2, 7544 tris) 56.383 s LAP COMPLETE at
+  --target-speed 18.
+- Staged: worker/assets/sim.wasm + sim_wasm.bin = out/sim.wasm (sha256
+  f52d6126fd58cddc…), AFTER all gates.
+
+Files changed: src/vehicle.{h,c} (SIM_CAT_MESH, terrain ray), src/sim.c (mesh
+shape category), tests/make_test_track.{h,c} (make_test_track_sloped + core
+refactor), tests/test_track_v2.c (§5), docs/ROAD-SURFACE.md (§6 addendum),
+docs/TERRAIN.md (status). No ABI/export changes.

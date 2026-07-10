@@ -105,6 +105,17 @@ pos.y) − 1.35`, computed once in `road_load` — the same shared formula
 trackgen uses for the ground quad baked into the collision mesh and
 `ambience.js` uses for the visual ground disc (CONTRACTS §8).
 
+**Superseded in part (2026-07-09 later wave, docs/TERRAIN.md §2)**: on v2
+tracks the flat grass plane is no longer what the wheels ride — it is only
+the RAY-MISS fallback. When `road_query` reports kind = grass, the wheel
+(vehicle.c) casts one straight-down ray per TICK against the static Box3D
+collision world, landscape mesh only (`SIM_CAT_MESH`; prop boxes are excluded
+— you cannot drive on a tire stack), and uses the hit point/normal as its
+surface plane for all 4 substeps. A miss keeps the ground_y plane above,
+bit-identically. The `road_query` contract in this section is UNCHANGED —
+the query still returns the plane; the raycast lives in the wheel-contact
+layer. Grass classification and forces below are also unchanged.
+
 Wheels on grass (vehicle.c): the brush-model bristle friction is scaled by
 **0.55** and a rolling drag of **30 N per (m/s)** of in-plane patch velocity
 (~600 N per wheel at 20 m/s, linear in speed) is applied at the patch — grass
