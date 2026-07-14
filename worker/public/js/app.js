@@ -87,12 +87,24 @@ for (let i = 0; i < 4; i++) {
 const lighting = new Lighting(scene, car, ambience.userData.glowMaterials, renderer, track);
 
 function resize() {
+  if (!innerWidth || !innerHeight) return; // mid-layout; the frame guard retries
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); // scaling can change at runtime
   renderer.setSize(innerWidth, innerHeight, false);
   camera.aspect = innerWidth / innerHeight; // aspect-native: 32:9 just works
   camera.updateProjectionMatrix();
 }
 addEventListener("resize", resize);
 resize();
+// Boot-order guard: if the page loads while the window reports 0×0 (laptop
+// display-scaling reflow, restored/background windows), the buffer is created
+// empty and no resize event ever arrives — nothing renders, "can't see the
+// car". Verify the buffer against the live viewport every frame; cheap, and
+// it also catches devicePixelRatio changes (zoom, moving between monitors).
+function ensureCanvasSize() {
+  const pr = Math.min(devicePixelRatio, 2);
+  const cv = renderer.domElement;
+  if (cv.width !== Math.floor(innerWidth * pr) || cv.height !== Math.floor(innerHeight * pr)) resize();
+}
 
 // ---------------------------------------------------------------- helpers
 const b64encode = (bytes) => {
@@ -892,6 +904,7 @@ function poseGroup(group, prevS, currS, alpha) {
 
 function frame(now) {
   requestAnimationFrame(frame);
+  ensureCanvasSize(); // heal a 0×0 boot buffer / DPR change (see resize)
   const dtMs = Math.min(now - last, 250); // anti-spiral clamp
   last = now;
   input.tickCalibration();
