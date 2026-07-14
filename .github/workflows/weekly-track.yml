@@ -41,37 +41,25 @@ jobs:
           python-version: "3.12"
       - run: pip install -r trackgen/requirements.txt
 
-      # The generator's geometric lint gate can reject a seed outright (it
-      # raises SystemExit after exhausting its internal attempts). Try SEED,
-      # SEED+1, SEED+2 and take the first that generates AND packs; fail the
-      # job only if all three fail. The winning seed is exported as
-      # steps.gen.outputs.seed — all later steps must use it, not steps.seed.
-      - name: Generate track (retry up to 3 seeds)
+      # INTERIM (until the seeded circuit composer lands): the v1 --seed path
+      # generates cliff-era tracks with no aprons and no prop colliders
+      # (TERRAIN.md — aprons/props live only in the v2 circuit path). Rotating
+      # onto one would regress the live experience, so the weekly job deploys
+      # the deterministic circuit build instead: byte-identical output means
+      # an identical track hash, so re-deploys are no-ops for the leaderboard.
+      # The seed plumbing (salt, retry, week-$SEED dirs) is kept so the seeded
+      # circuit generator can drop back in with a one-line change.
+      - name: Generate track (v2 circuit)
         id: gen
         run: |
           BASE=${{ steps.seed.outputs.seed }}
-          GEN_SEED=""
-          for OFFSET in 0 1 2; do
-            TRY=$(( BASE + OFFSET ))
-            echo "::group::Generating track for seed $TRY"
-            if python trackgen/generate_track.py --seed "$TRY" \
-                 --out-dir "assets/tracks/week-$TRY" \
-               && python trackgen/pack_track.py "assets/tracks/week-$TRY/track.json"
-            then
-              echo "::endgroup::"
-              GEN_SEED=$TRY
-              break
-            fi
-            echo "::endgroup::"
-            echo "Seed $TRY rejected by generator lint gate, trying next"
-            rm -rf "assets/tracks/week-$TRY"
-          done
-          if [ -z "$GEN_SEED" ]; then
-            echo "::error::All three seeds ($BASE, $((BASE + 1)), $((BASE + 2))) failed track generation"
-            exit 1
-          fi
-          echo "seed=$GEN_SEED" >> "$GITHUB_OUTPUT"
-          echo "Generated track with seed $GEN_SEED"
+          echo "::group::Generating circuit build for week seed $BASE"
+          python trackgen/generate_track.py --circuit circuit1 \
+            --out-dir "assets/tracks/week-$BASE"
+          python trackgen/pack_track.py "assets/tracks/week-$BASE/track.json"
+          echo "::endgroup::"
+          echo "seed=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Generated circuit track for week seed $BASE"
 
       - uses: mymindstorm/setup-emsdk@v14
         with:
