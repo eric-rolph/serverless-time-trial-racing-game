@@ -70,7 +70,11 @@ export class FanatecFFB {
     const now = performance.now();
     if (now - this.lastSent < 8) return; // ≤125 Hz on the wire
 
-    let norm = (this.smoothed / this.maxNm) * this.gain * (this.invert ? -1 : 1);
+    // Base sign −1: the kernel's rack-torque convention lands opposite the
+    // Fanatec constant-force direction (user-verified on a CSL DD, matching
+    // the rig steering-axis flip in input.js). `invert` stays a relative
+    // flip for bases that differ.
+    let norm = (this.smoothed / this.maxNm) * this.gain * -1 * (this.invert ? -1 : 1);
     norm = Math.max(-1, Math.min(1, norm));
     const s16 = Math.round(norm * 32767);
     const u16 = (s16 + 0x8000) & 0xffff;

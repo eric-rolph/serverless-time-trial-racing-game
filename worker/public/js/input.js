@@ -56,6 +56,14 @@ export class Input {
     // wheel-axis travel to full car lock. sensitivity 2 = half the physical
     // rotation reaches full lock (for high-rotation-range DD bases).
     this.steerSettings = { invert: false, sensitivity: 1.0, ...JSON.parse(localStorage.getItem(STEER_KEY) ?? "{}") };
+    // One-time migration: rig axes now default inverted at the source (see
+    // sample()); a pre-flip stored invert=true would double-flip, so land
+    // existing installs on the corrected default once and mark the blob.
+    if (!this.steerSettings.sign2) {
+      this.steerSettings.invert = false;
+      this.steerSettings.sign2 = true;
+      localStorage.setItem(STEER_KEY, JSON.stringify(this.steerSettings));
+    }
     // Gearbox mode: AUTO by default; mapping a wheel shifter flips the
     // profile to MANUAL (DRIVETRAIN §6 — wheel users shift for themselves).
     this.gearAuto = (localStorage.getItem(GEARBOX_KEY) ?? "auto") !== "manual";
@@ -397,7 +405,10 @@ export class Input {
       const rawSteer = this.readChannel("steer", true, pads);
       const rawBrake = this.readChannel("brake", false, pads);
       return {
-        steer: rawSteer !== null ? shape(rawSteer) : kbSteer,
+        // Rig axes default INVERTED (−rawSteer): Fanatec bases report the
+        // axis opposite to our world convention (user-verified on a CSL DD).
+        // The invert setting stays a relative flip for rigs that differ.
+        steer: rawSteer !== null ? shape(-rawSteer) : kbSteer,
         throttle: this.readChannel("throttle", false, pads) ?? (this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0),
         // Real pedal passes through untouched; only the keyboard fallback slews.
         brake: rawBrake !== null ? rawBrake : this.slewBrake(kbBrakeTarget, dtSec),
