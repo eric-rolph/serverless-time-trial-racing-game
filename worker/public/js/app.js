@@ -11,6 +11,7 @@ import { buildCar, buildWheel } from "./car.js";
 import { Crumple } from "./crumple.js";
 import { buildAmbience } from "./ambience.js";
 import { Lighting } from "./lighting.js";
+import { PostProcessPipeline } from "./postprocess.js";
 import { RaceEffects } from "./effects.js";
 import { TelemetryHUD } from "./telemetry.js";
 import { FanatecFFB } from "./ffb.js";
@@ -57,7 +58,7 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap; // single 2048² map (Lighting
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0e1420); // Lighting owns bg/fog from frame 0
 scene.fog = new THREE.Fog(0x0e1420, 150, 480);
-const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 800);
+const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 2400);
 
 const trackGroup = buildTrackMeshes(track);
 scene.add(trackGroup);
@@ -94,13 +95,22 @@ const lighting = new Lighting(
   ambience.userData.glowMaterials,
   renderer,
   track,
-  { asphaltMat: trackGroup.userData.asphaltMat, grassMat: trackGroup.userData.grassMat },
+  {
+    asphaltMat: trackGroup.userData.asphaltMat,
+    grassMat: trackGroup.userData.grassMat,
+    kerbMat: trackGroup.userData.kerbMat,
+    updateSurface: trackGroup.userData.updateSurface,
+  },
 );
+const postFx = new PostProcessPipeline(renderer, scene, camera);
+let postFxEnabled = localStorage.getItem("sttr-postfx") !== "false";
 
 function resize() {
   if (!innerWidth || !innerHeight) return; // mid-layout; the frame guard retries
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); // scaling can change at runtime
+  const pr = Math.min(devicePixelRatio, 2);
+  renderer.setPixelRatio(pr); // scaling can change at runtime
   renderer.setSize(innerWidth, innerHeight, false);
+  postFx.setSize(innerWidth, innerHeight, pr);
   camera.aspect = innerWidth / innerHeight; // aspect-native: 32:9 just works
   camera.updateProjectionMatrix();
 }
@@ -258,6 +268,7 @@ let countdownBeepN = 0; // last countdown integer beeped (0 = none yet this run)
 const CAMERA_SEATS = ["chase", "cockpit", "bumper", "tv"];
 const CAMERA_NAMES = { chase: "chase", cockpit: "cockpit", bumper: "bumper", tv: "TV" };
 let cameraMode = "chase";
+let snapCamera = true;
 let ffb = null;
 let lastThrottle = 0;
 let lastBrake = 0;
@@ -295,6 +306,7 @@ async function resetRun({ countdownMs: startCountdownMs = 400 } = {}) {
   lastBrake = 0;
   lastSteer = 0;
   lastOffTrack = false;
+  snapCamera = true;
   goLightUntil = 0;
   ambience.userData.setStartLights?.(0, false);
   impactCooldown = 0;
@@ -359,18 +371,40 @@ addEventListener("keydown", (e) => {
   if (e.code === "KeyC") {
     cameraMode = CAMERA_SEATS[(CAMERA_SEATS.indexOf(cameraMode) + 1) % CAMERA_SEATS.length];
     if (cameraMode === "tv") tvIdx = -1; // re-pick the nearest tripod on entry
+    snapCamera = true;
+    if ($("camTag")) $("camTag").textContent = CAMERA_NAMES[cameraMode].toUpperCase();
     setStatus(`camera: ${CAMERA_NAMES[cameraMode]}`);
   }
   if (e.code === "KeyM") setStatus(audio.toggleMute() ? "muted" : "sound on");
-  if (e.code === "KeyL") setStatus(`lighting: ${lighting.cycle()}`);
+  if (e.code === "KeyL") {
+    const mode = lighting.cycle();
+    if ($("envTag")) $("envTag").textContent = (lighting.override ?? "AUTO").toUpperCase();
+    setStatus(`lighting: ${mode}`);
+  }
   if (e.code === "KeyT") setStatus(telemetry.toggle() ? "telemetry HUD on" : "telemetry HUD hidden");
   if (e.code === "KeyX") setStatus(telemetry.exportCSV(trackHashHex) ? "exported lap telemetry CSV" : "drive a lap first to export telemetry");
 });
 addEventListener("pointerdown", (e) => {
   audio.start();
-  // Taps on controls (name field, config panel, the whole leaderboard — its
-  // rows are ghost-race affordances now) don't launch a run.
-  if (!e.target.closest?.("input,textarea,button,select,label,.panel,#board")) startFirstRun();
+  // Taps on controls (name field, config panel, quick pills, leaderboard) don't launch a run.
+  if (!e.target.closest?.("input,textarea,button,select,label,.panel,#board,#quickBar")) startFirstRun();
+});
+
+// Top-left interactive HUD pills
+$("btnCam")?.addEventListener("click", () => {
+  cameraMode = CAMERA_SEATS[(CAMERA_SEATS.indexOf(cameraMode) + 1) % CAMERA_SEATS.length];
+  if (cameraMode === "tv") tvIdx = -1;
+  snapCamera = true;
+  if ($("camTag")) $("camTag").textContent = CAMERA_NAMES[cameraMode].toUpperCase();
+  setStatus(`camera: ${CAMERA_NAMES[cameraMode]}`);
+});
+$("btnLight")?.addEventListener("click", () => {
+  const mode = lighting.cycle();
+  if ($("envTag")) $("envTag").textContent = (lighting.override ?? "AUTO").toUpperCase();
+  setStatus(`lighting: ${mode}`);
+});
+$("btnSetup")?.addEventListener("click", () => {
+  $("config").style.display = $("config").style.display === "block" ? "none" : "block";
 });
 
 // Calibration UI
@@ -393,8 +427,39 @@ $("clearCal").addEventListener("click", () => {
   input.clearCalibration();
   $("calMsg").textContent = "bindings cleared — detect each channel again";
 });
-// Steering feel: invert + sensitivity (higher = less physical rotation for
-// full lock, for high-rotation-range DD bases).
+// Steering feel & keyboard driving assists
+const kbAssistPairs = [
+  ["kbAssist", "enabled"],
+  ["kbSpeedSteer", "speedSteer"],
+  ["kbStability", "stability"],
+  ["kbTraction", "traction"],
+  ["kbAbs", "abs"],
+];
+const syncKbAssistDisabled = () => {
+  const on = input.kbAssist.enabled;
+  for (const [id] of kbAssistPairs.slice(1)) {
+    if ($(id)) $(id).disabled = !on;
+  }
+};
+for (const [id, key] of kbAssistPairs) {
+  const el = $(id);
+  if (!el) continue;
+  el.checked = !!input.kbAssist[key];
+  el.addEventListener("change", () => {
+    input.setKbAssist({ [key]: el.checked });
+    syncKbAssistDisabled();
+  });
+}
+syncKbAssistDisabled();
+
+if ($("postFx")) {
+  $("postFx").checked = postFxEnabled;
+  $("postFx").addEventListener("change", () => {
+    postFxEnabled = $("postFx").checked;
+    localStorage.setItem("sttr-postfx", String(postFxEnabled));
+  });
+}
+
 $("steerInvert").checked = input.steerSettings.invert;
 $("steerSens").value = input.steerSettings.sensitivity;
 $("steerSensVal").textContent = `${input.steerSettings.sensitivity.toFixed(1)}×`;
@@ -821,7 +886,7 @@ function advance(dtMs) {
   if (countdownMs > 0) {
     // Skip-on-input: an eager driver cuts the theater short. Pure client-side
     // presentation — the lap still starts at tick 0 from rest.
-    const raw = inputOverride ? inputOverride(curr) : input.sample(dtMs / 1000);
+    const raw = inputOverride ? inputOverride(curr) : input.sample(dtMs / 1000, curr);
     if (raw.throttle > 0.5 || Math.abs(raw.steer) > 0.5) countdownMs = Math.min(countdownMs, 1);
     countdownMs -= dtMs;
     const n = Math.ceil(countdownMs / 1000);
@@ -858,7 +923,7 @@ function advance(dtMs) {
     // always — no protocol or determinism impact.
     if (++substeps > 32) { acc = 0; break; }
     acc -= DT_MS;
-    const raw = inputOverride ? inputOverride(curr) : input.sample(DT_MS / 1000);
+    const raw = inputOverride ? inputOverride(curr) : input.sample(DT_MS / 1000, curr);
     lastThrottle = raw.throttle;
     lastBrake = raw.brake;
     lastSteer = raw.steer;
@@ -946,13 +1011,13 @@ function poseGroup(group, prevS, currS, alpha) {
 
 function renderFrame(now) {
   ensureCanvasSize(); // heal a 0×0 boot buffer / DPR change (see resize)
-  const dtMs = Math.min(now - last, 250); // anti-spiral clamp
-  last = now;
+  const dtMs = Math.max(0, Math.min(now - last, 250)); // monotonic + anti-spiral clamp
+  if (now > last) last = now;
   input.tickCalibration();
   if (!started) {
     // Armed idle: gamepad/wheel activity also starts the first run (keydown
     // and pointerdown are handled by their listeners above).
-    const raw = input.sample(dtMs / 1000);
+    const raw = input.sample(dtMs / 1000, curr);
     if (raw.throttle > 0.5 || raw.brake > 0.5 || Math.abs(raw.steer) > 0.5 || raw.handbrake) startFirstRun();
   }
   advance(dtMs);
@@ -982,7 +1047,9 @@ function renderFrame(now) {
   }
 
   const rpmNow = sim.rpm();
+  const gearNow = sim.gear() ?? 1;
   const ffbNmNow = sim.ffbTorque();
+  const timeSec = now * 0.001;
   const gForce = telemetry.sample({
     state: curr,
     throttle: lastThrottle,
@@ -990,21 +1057,11 @@ function renderFrame(now) {
     steer: lastSteer,
     ffbNm: ffbNmNow,
     rpm: rpmNow ?? (900 + curr.speed * 260),
-    gear: sim.gear() ?? 1,
+    gear: gearNow,
     sim,
     dtSec,
     idle,
     elapsedSec: ticks.length / 400,
-  });
-
-  // Live animated cockpit wheel, shift LEDs, driver helmet visibility & brake/rain light
-  car.userData.updateTelemetry?.({
-    steerAngle: lerp(prev.wheels[0].steer, curr.wheels[0].steer),
-    rpm: rpmNow ?? (900 + curr.speed * 260),
-    brake: lastBrake,
-    wetness: lighting.wetness,
-    timeSec: now * 0.001,
-    cameraMode,
   });
 
   // Camera seats (C cycles) — all posed from the interpolated render state
@@ -1012,27 +1069,37 @@ function renderFrame(now) {
   const gLatShift = Math.max(-0.22, Math.min(0.22, -gForce.latG * 0.065));
   const gLonShift = Math.max(-0.18, Math.min(0.18, -gForce.lonG * 0.055));
   if (cameraMode === "chase") {
-    const behind = _camA.set(gLatShift * 2.1, 3.15, -8.45 + gLonShift * 2.2)
+    const behind = _camA.set(gLatShift * 2.1, 2.65, -7.35 + gLonShift * 2.0)
       .applyQuaternion(car.quaternion).add(car.position);
-    camPos.lerp(behind, 1 - Math.exp(-4.5 * dtSec));
+    if (snapCamera) {
+      camPos.copy(behind);
+      camTarget.copy(car.position);
+      snapCamera = false;
+    } else {
+      const follow = Math.max(0, Math.min(1, 1 - Math.exp(-6.5 * dtSec)));
+      camPos.lerp(behind, follow);
+      camTarget.lerp(car.position, 0.65);
+    }
     camera.position.copy(camPos);
-    camTarget.lerp(car.position, 0.6);
-    camera.lookAt(camTarget.x, camTarget.y + 1.15, camTarget.z);
+    camera.lookAt(camTarget.x, camTarget.y + 0.90, camTarget.z);
   } else if (cameraMode === "cockpit") {
-    // Driver eye: looks over the animated steering wheel & through the halo
-    const eye = _camA.set(gLatShift * 0.32, 0.94, 0.24 + gLonShift * 0.24)
+    // Driver eye: seated naturally in the headrest so both the live OLED
+    // steering wheel + 15 shift LEDs AND a clean sightline down the track frame cleanly.
+    const eye = _camA.set(gLatShift * 0.26, 0.915, 0.03 + gLonShift * 0.18)
       .applyQuaternion(car.quaternion).add(car.position);
-    const ahead = _camB.set(gLatShift * 1.4, 0.96, 30)
+    const ahead = _camB.set(gLatShift * 1.4, 0.84, 30)
       .applyQuaternion(car.quaternion).add(car.position);
     camera.position.copy(eye);
     camera.lookAt(ahead);
     camPos.copy(eye);
+    snapCamera = false;
   } else if (cameraMode === "bumper") {
-    const nose = _camA.set(0, 0.35, 2.3).applyQuaternion(car.quaternion).add(car.position);
+    const nose = _camA.set(0, 0.35, 2.38).applyQuaternion(car.quaternion).add(car.position);
     const ahead = _camB.set(0, 0.45, 32).applyQuaternion(car.quaternion).add(car.position);
     camera.position.copy(nose);
     camera.lookAt(ahead);
     camPos.copy(nose);
+    snapCamera = false;
   } else {
     if (tvIdx < 0) {
       let best = 0, bestD = Infinity;
@@ -1047,6 +1114,7 @@ function renderFrame(now) {
     camera.position.copy(tvPoints[tvIdx].pos);
     camera.lookAt(car.position);
     camPos.copy(camera.position);
+    snapCamera = false;
   }
 
   // Per-seat lens: chase & bumper keep the speed-breathing FOV
@@ -1054,15 +1122,16 @@ function renderFrame(now) {
     ? 68 + 4 * Math.min(1, curr.speed / 65)
     : cameraMode === "tv"
       ? 45 - 15 * Math.min(1, Math.max(0, (camera.position.distanceTo(car.position) - 30) / 90))
-      : 62 + 8 * Math.min(1, curr.speed / 60);
-  fov += (fovTarget - fov) * (1 - Math.exp(-2.8 * dtSec));
+      : 60 + 10 * Math.min(1, curr.speed / 62);
+  fov += (fovTarget - fov) * (1 - Math.exp(-3.2 * dtSec));
   if (Math.abs(camera.fov - fov) > 0.005) {
     camera.fov = fov;
     camera.updateProjectionMatrix();
   }
 
   crumple.update();
-  lighting.update();
+  lighting.update(timeSec, camera);
+  ambience.userData.updateAmbience?.(timeSec, lighting.wetness);
   effects.update({
     state: curr,
     carGroup: car,
@@ -1070,12 +1139,42 @@ function renderFrame(now) {
     camera,
     dtSec,
     brake: lastBrake,
+    throttle: lastThrottle,
+    gear: gearNow,
     offTrack: lastOffTrack,
     wetness: lighting.wetness,
     sim,
     frozen: idle,
   });
-  renderer.render(scene, camera);
+
+  // Live animated cockpit OLED wheel, 15 shift LEDs, driver helmet, brake/rain lights & exhaust flash
+  car.userData.updateTelemetry?.({
+    steerAngle: lerp(prev.wheels[0].steer, curr.wheels[0].steer),
+    rpm: rpmNow ?? (900 + curr.speed * 260),
+    brake: lastBrake,
+    throttle: lastThrottle,
+    speed: curr.speed,
+    gear: gearNow,
+    wetness: lighting.wetness,
+    timeSec,
+    cameraMode,
+    backfire: effects.backfireGlow ?? 0,
+  });
+
+  if (postFxEnabled) {
+    postFx.render({
+      exposure: lighting.currentExposure ?? 1.05,
+      bloomStrength: lighting.bloomStrength ?? 0.40,
+      bloomThreshold: lighting.bloomThreshold ?? 1.05,
+      speedNorm: Math.min(1, curr.speed / 72),
+      wetness: lighting.wetness,
+      timeSec,
+    });
+  } else {
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = lighting.currentExposure ?? 1.05;
+    renderer.render(scene, camera);
+  }
 
   // ---- side channels: audio + FFB (read-only on sim state)
   audio.update(curr, lastThrottle, sim, dtMs, idle, lastOffTrack);
@@ -1167,9 +1266,20 @@ function renderFrame(now) {
     }
   }
 
+  // Live keyboard assist intervention badges (TC / ABS / STAB)
+  if (!idle && input.kbAssist.enabled) {
+    $("flagTc")?.classList.toggle("on", input.kTcEnv < 0.94);
+    $("flagAbs")?.classList.toggle("on", input.kAbsEnv < 0.94);
+    $("flagStab")?.classList.toggle("on", Math.abs(input.kCounterEnv) > 0.035);
+  } else {
+    $("flagTc")?.classList.remove("on");
+    $("flagAbs")?.classList.remove("on");
+    $("flagStab")?.classList.remove("on");
+  }
+
   if ($("config").style.display === "block") {
-    const raw = input.sample(dtMs / 1000);
-    $("mSteer").value = raw.steer;
+    const raw = input.sample(dtMs / 1000, curr);
+    $("mSteer").value = -raw.steer; // -1 left .. +1 right visually on HTML meter
     $("mThrottle").value = raw.throttle;
     $("mBrake").value = raw.brake;
     $("mHandbrake").value = raw.handbrake ? 1 : 0;
@@ -1206,7 +1316,7 @@ requestAnimationFrame(frame);
 // players just pauses the run — the accumulator clamp prevents catch-up).
 window.__sttr = {
   advance,
-  renderOnce: () => renderFrame(performance.now()),
+  renderOnce: (stepMs = 0) => renderFrame(stepMs > 0 ? Math.max(performance.now(), last + stepMs) : performance.now()),
   skipCountdown: () => (countdownMs = 1),
   info: () => ({ ticks: ticks.length, frozen, invalid, started, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, camera: cameraMode, ffbNm: sim.ffbTorque(), rpm: sim.rpm(), gear: sim.gear(), shiftMode: shiftModeLabel() }),
   track: { center: track.center, tangent: track.tangent },
@@ -1218,11 +1328,27 @@ window.__sttr = {
   // {x:0,y:0,z:-1}); severity ≈ 0..1.5. resetCrumple restores pristine.
   applyImpact: (localDir, severity) => crumple.applyImpact(localDir, severity),
   resetCrumple: () => crumple.reset(),
-  setLighting: (mode) => { lighting.override = mode; lighting.update(); },
-  setCamera: (mode) => { if (CAMERA_SEATS.includes(mode)) { cameraMode = mode; tvIdx = -1; } },
+  setLighting: (mode) => {
+    lighting.override = mode;
+    lighting.update(performance.now() * 0.001, camera);
+    if ($("envTag")) $("envTag").textContent = (mode ?? "AUTO").toUpperCase();
+  },
+  setCamera: (mode) => {
+    if (CAMERA_SEATS.includes(mode)) {
+      cameraMode = mode;
+      tvIdx = -1;
+      snapCamera = true;
+      if ($("camTag")) $("camTag").textContent = CAMERA_NAMES[mode].toUpperCase();
+    }
+  },
+  setPostFx: (v) => { postFxEnabled = !!v; },
   setTelemetryVisible: (v) => { telemetry.visible = !v; telemetry.toggle(); },
   input,
   scene,
+  lighting,
+  postFx,
+  car,
+  effects,
   FanatecFFB,
   registerHidDevice,
 };

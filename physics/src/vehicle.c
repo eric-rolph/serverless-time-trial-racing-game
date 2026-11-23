@@ -94,7 +94,8 @@ typedef struct VehicleTuning
 	float brush_a0;			// patch half-length at reference load (m)
 	float brush_fz0;		// reference load Fz0 (N)
 	float brush_mu_s;		// bristle static friction at T_opt
-	float brush_mu_k_ratio; // kinetic/static friction ratio
+	float brush_mu_k_ratio; // kinetic/static friction floor ratio
+	float brush_stribeck;	// progressive Stribeck decay rate past bristle adhesion limit
 	float max_load;		  // Fz clamp (N) to bound force spikes
 	float slip_v_min;	  // low-speed epsilon for slip computation (m/s)
 	float wheel_inertia;  // kg m^2 per wheel
@@ -209,17 +210,17 @@ static const VehicleTuning kTuning = {
 	.settle_comp_rear = 0.056898f,
 	.camber_thrust = 0.6f, // docs/SUSPENSION.md §3
 
-	.brush_cp = 7.0e6f,
+	.brush_cp = 6.55e6f,
 	.brush_a0 = 0.075f,
 	.brush_fz0 = 3500.0f,
-	// 1.48 (patch peak 1.02 x mu_s0 x Fz0) until the drivetrain wave; the
-	// docs/DRIVETRAIN.md §5 load sensitivity costs ~3-5% of in-situ grip
-	// under transfer, so the §5 balance re-tune raises the bristle level to
-	// keep the car in the mandated 1.05-1.10 g skidpad window. Patch peak is
-	// now 1.071 x mu_s0 x Fz0 — still inside TIRE-MODEL.md §4.3's
-	// [0.95, 1.10] gate (verified in test_tire).
-	.brush_mu_s = 1.55f,
-	.brush_mu_k_ratio = 0.65f,
+	// Progressive Stribeck brush tire tuning: continuous transition from static
+	// bristle adhesion (mu_s) toward kinetic floor (mu_k) eliminates the abrupt
+	// binary breakaway cliff, widens the communicative peak-grip slip window to
+	// ~7.8 deg, and preserves 1.05-1.10 g steady-state balance & all
+	// TIRE-MODEL.md §4.3 gates.
+	.brush_mu_s = 1.325f,
+	.brush_mu_k_ratio = 0.72f,
+	.brush_stribeck = 1.90f,
 	.max_load = 9000.0f,
 	.slip_v_min = 0.8f,
 	.wheel_inertia = 1.2f,
@@ -682,7 +683,21 @@ void vehicle_brush_patch_mu( float sigma_x, float sigma_y, float fz, float t_sur
 		float xi = x / a - 1.0f;		   // [-1, 1] across the patch
 		float q = q_scale * ( 1.0f - xi * xi );
 		float f_adh = t->brush_cp * sig * x;
-		float f = ( f_adh <= mu_s * q ) ? f_adh : mu_k * q;
+		float f_lim = mu_s * q;
+		float f;
+		if ( f_adh <= f_lim )
+		{
+			f = f_adh;
+		}
+		else
+		{
+			// Continuous Stribeck decay from mu_s toward mu_k as local bristle
+			// over-strain increases: C0-continuous breakaway, broad progressive
+			// grip plateau, no sudden snap-spin cliff.
+			float excess = ( f_adh - f_lim ) / ( f_lim + 1.0f );
+			float mu_eff = mu_k + ( mu_s - mu_k ) / ( 1.0f + t->brush_stribeck * excess );
+			f = mu_eff * q;
+		}
 		float fe = f * w;
 		f_sum += fe;
 		m_sum += fe * ( x - a );

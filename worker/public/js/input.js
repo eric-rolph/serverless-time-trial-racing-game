@@ -12,7 +12,9 @@ import { cancelButtonCapture, readReportBit, startButtonCapture } from "./hid-in
 
 const CAL_KEY = "sttr-input-cal-v2"; // v1 was single-device; ignored on load
 const STEER_KEY = "sttr-steer-settings"; // {invert, sensitivity}
+const KB_ASSIST_KEY = "sttr-kb-assist"; // {enabled, speedSteer, stability, traction, abs}
 const GEARBOX_KEY = "sttr-shift-mode"; // "auto" | "manual" (absent = auto, the default; key shared with the HUD's fallback read)
+const DEFAULT_KB_ASSIST = { enabled: true, speedSteer: true, stability: true, traction: true, abs: true };
 
 // Axis channels (per-device analog detect). Shifter buttons ("shiftUp" /
 // "shiftDown") live in the same calibration blob but bind (reportId, byte,
@@ -41,8 +43,12 @@ const AUTO_COOLDOWN_S = 0.25; // > the 120 ms downshift engagement; hysteresis
 export class Input {
   constructor() {
     this.keys = new Set();
-    this.kSteer = 0; // slewed keyboard steering
+    this.kSteer = 0; // slewed keyboard steering (+1 = left, -1 = right)
+    this.kThrottle = 0; // slewed keyboard throttle
     this.kBrake = 0; // slewed keyboard brake (rise ~200ms, fast release)
+    this.kTcEnv = 1; // keyboard traction-control throttle envelope
+    this.kAbsEnv = 1; // keyboard ABS brake envelope
+    this.kCounterEnv = 0; // keyboard counter-steer assist envelope
     this.cal = null; // { steer: {id, axis, rest, ext}, throttle: {...}, ... }
     try {
       const stored = JSON.parse(localStorage.getItem(CAL_KEY) ?? "null");
@@ -56,6 +62,13 @@ export class Input {
     // wheel-axis travel to full car lock. sensitivity 2 = half the physical
     // rotation reaches full lock (for high-rotation-range DD bases).
     this.steerSettings = { invert: false, sensitivity: 1.0, ...JSON.parse(localStorage.getItem(STEER_KEY) ?? "{}") };
+    // Keyboard driving assist: speed-sensitive lock + slip stability + TC + ABS
+    // (shaping runs purely before quantize(), keeping replays 100% honest).
+    try {
+      this.kbAssist = { ...DEFAULT_KB_ASSIST, ...JSON.parse(localStorage.getItem(KB_ASSIST_KEY) ?? "{}") };
+    } catch {
+      this.kbAssist = { ...DEFAULT_KB_ASSIST };
+    }
     // One-time migration: rig axes now default inverted at the source (see
     // sample()); a pre-flip stored invert=true would double-flip, so land
     // existing installs on the corrected default once and mark the blob.
@@ -375,18 +388,155 @@ export class Input {
     return signed ? Math.max(-1, Math.min(1, -n)) : Math.max(0, Math.min(1, n));
   }
 
-  /** Latest sample as floats: steer -1..1, throttle/brake 0..1, plus the
-   *  momentary shift buttons (booleans — quantize() packs them into flags). */
-  sample(dtSec = 1 / 60) {
+  /** Speed-sensitive max keyboard steering authority: full 30 deg lock below
+   *  ~30 km/h for hairpins, smoothly tapering down at highway speeds so holding
+   *  A/D carves apexes near peak tire grip instead of over-turning into a spin. */
+  speedSteerCap(speedMps) {
+    if (!this.kbAssist.enabled || !this.kbAssist.speedSteer) return 1.0;
+    const v = Math.max(0, speedMps - 8);
+    return Math.max(0.20, Math.min(1.0, 1 / (1 + 0.036 * v + 0.00042 * v * v)));
+  }
+
+  /** Read-only snapshot of live vehicle speed & wheel slip directly from either
+   *  the caller's SimStateV1 or wasm linear memory (never flips Sim._stateBufs). */
+  readLiveTelemetry(simState = null) {
+    if (simState && simState.wheels) {
+      const w = simState.wheels;
+      return {
+        speed: simState.speed || 0,
+        frontSlip: 0.5 * (w[0].slipAngle + w[1].slipAngle),
+        rearSlip: 0.5 * (w[2].slipAngle + w[3].slipAngle),
+        rearLon: Math.max(w[2].slipRatio, w[3].slipRatio),
+        frontMinLon: Math.min(w[0].slipRatio, w[1].slipRatio),
+      };
+    }
+    const sim = this.sim();
+    const e = sim?.e;
+    if (!e?.memory || !e?.sim_state_ptr) {
+      return { speed: 0, frontSlip: 0, rearSlip: 0, rearLon: 0, frontMinLon: 0 };
+    }
+    const dv = new DataView(e.memory.buffer, e.sim_state_ptr(), 200);
+    const speed = dv.getFloat32(184, true);
+    const flLon = dv.getFloat32(56 + 0 * 32 + 24, true);
+    const frLon = dv.getFloat32(56 + 1 * 32 + 24, true);
+    const rlLon = dv.getFloat32(56 + 2 * 32 + 24, true);
+    const rrLon = dv.getFloat32(56 + 3 * 32 + 24, true);
+    const flLat = dv.getFloat32(56 + 0 * 32 + 28, true);
+    const frLat = dv.getFloat32(56 + 1 * 32 + 28, true);
+    const rlLat = dv.getFloat32(56 + 2 * 32 + 28, true);
+    const rrLat = dv.getFloat32(56 + 3 * 32 + 28, true);
+    return {
+      speed,
+      frontSlip: 0.5 * (flLat + frLat),
+      rearSlip: 0.5 * (rlLat + rrLat),
+      rearLon: Math.max(rlLon, rrLon),
+      frontMinLon: Math.min(flLon, frLon),
+    };
+  }
+
+  /** Shape digital keyboard steering/throttle/brake BEFORE quantize() so
+   *  replays stay 100% canonical while preventing abrupt tire snap-slip.
+   *  Kernel convention (+Y yaw): +1 = full LEFT, -1 = full RIGHT. */
+  sampleKeyboard(dtSec, simState = null) {
+    const leftHeld = this.keys.has("ArrowLeft") || this.keys.has("KeyA");
+    const rightHeld = this.keys.has("ArrowRight") || this.keys.has("KeyD");
+    const thHeld = this.keys.has("ArrowUp") || this.keys.has("KeyW");
+    const brHeld = this.keys.has("ArrowDown") || this.keys.has("KeyS");
+    const hbHeld = this.keys.has("Space");
+
+    const tel = this.readLiveTelemetry(simState);
+    const assist = this.kbAssist.enabled;
+    const cap = this.speedSteerCap(tel.speed);
+    const sens = Math.max(0.4, Math.min(2.2, this.steerSettings.sensitivity));
+    const dir = (leftHeld ? 1 : 0) + (rightHeld ? -1 : 0);
+    const target = dir * cap;
+
+    // Progressive steering slew: responsive turn-in, fast 2.4x counter-steer
+    // snap across center, crisp self-centering on release.
+    const reversing = dir !== 0 && Math.sign(dir) !== Math.sign(this.kSteer) && Math.abs(this.kSteer) > 0.02;
+    const rate = dir === 0 ? 6.2 : reversing ? 6.8 : 2.0 + 1.45 * cap;
+    const slew = rate * sens * dtSec;
+    this.kSteer += Math.max(-slew, Math.min(slew, target - this.kSteer));
+    if (dir !== 0 && Math.abs(this.kSteer) > cap) {
+      this.kSteer += (Math.sign(this.kSteer) * cap - this.kSteer) * Math.min(1, 8 * dtSec);
+    }
+
+    // Subtle non-linear curve gives surgical tap precision near center
+    const norm = cap > 1e-3 ? Math.max(-1, Math.min(1, this.kSteer / cap)) : 0;
+    let shapedSteer = Math.sign(norm) * (0.70 * Math.abs(norm) + 0.30 * norm * norm) * cap;
+
+    // Dynamic slip-angle stability & automatic counter-steer (keyboard only)
+    if (assist && this.kbAssist.stability && tel.speed > 5.0 && !hbHeld) {
+      const absRear = Math.abs(tel.rearSlip);
+      let targetCounter = 0;
+      if (absRear > 0.085) {
+        // Rear stepping out: -sign(rearSlip) steers INTO the slide to catch it
+        targetCounter = -Math.sign(tel.rearSlip) * Math.min(0.42, (absRear - 0.085) * 1.65);
+      }
+      this.kCounterEnv += (targetCounter - this.kCounterEnv) * Math.min(1, 18 * dtSec);
+      shapedSteer += this.kCounterEnv;
+
+      // Gently damp front over-steering past peak tire grip (~8.3 deg)
+      const absFront = Math.abs(tel.frontSlip);
+      if (absFront > 0.145 && Math.sign(shapedSteer) === Math.sign(tel.frontSlip)) {
+        const excess = Math.min(1, (absFront - 0.145) / 0.14);
+        shapedSteer *= 1 - 0.30 * excess;
+      }
+    } else {
+      this.kCounterEnv *= Math.max(0, 1 - 12 * dtSec);
+    }
+
+    const steer = Math.max(-1, Math.min(1, shapedSteer * (this.steerSettings.invert ? -1 : 1)));
+
+    // Smooth throttle ramp + Traction Control (prevents RWD snap-oversteer)
+    const thSlew = (thHeld ? (assist ? 3.4 : 4.5) : 9.5) * dtSec;
+    this.kThrottle += Math.max(-thSlew, Math.min(thSlew, (thHeld ? 1 : 0) - this.kThrottle));
+    let throttle = this.kThrottle;
+    if (assist && this.kbAssist.traction && thHeld && !hbHeld) {
+      let tcTarget = 1.0;
+      if (tel.rearLon > 0.13) {
+        tcTarget = Math.min(tcTarget, Math.max(0.28, 1 - 2.6 * (tel.rearLon - 0.13)));
+      }
+      const absRear = Math.abs(tel.rearSlip);
+      if (absRear > 0.105 && tel.speed > 5.0) {
+        tcTarget = Math.min(tcTarget, Math.max(0.34, 1 - 2.4 * (absRear - 0.105)));
+      }
+      const tcRate = tcTarget < this.kTcEnv ? 28 : 9;
+      this.kTcEnv += (tcTarget - this.kTcEnv) * Math.min(1, tcRate * dtSec);
+      throttle *= this.kTcEnv;
+    } else {
+      this.kTcEnv += (1 - this.kTcEnv) * Math.min(1, 10 * dtSec);
+    }
+
+    // Smooth brake ramp + ABS threshold modulation
+    let brake = this.slewBrake(brHeld ? 1 : 0, dtSec);
+    if (assist && this.kbAssist.abs && brHeld && tel.speed > 4.0) {
+      let absTarget = 1.0;
+      if (tel.frontMinLon < -0.15) {
+        absTarget = Math.max(0.42, 1 - 2.8 * (-0.15 - tel.frontMinLon));
+      }
+      const absRate = absTarget < this.kAbsEnv ? 30 : 12;
+      this.kAbsEnv += (absTarget - this.kAbsEnv) * Math.min(1, absRate * dtSec);
+      brake *= this.kAbsEnv;
+    } else {
+      this.kAbsEnv += (1 - this.kAbsEnv) * Math.min(1, 12 * dtSec);
+    }
+
+    return { steer, throttle, brake, handbrake: hbHeld };
+  }
+
+  /** Latest sample as floats: steer -1..1 (+1 = LEFT, -1 = RIGHT), throttle/brake
+   *  0..1, plus the momentary shift buttons (quantize() packs them into flags). */
+  sample(dtSec = 1 / 60, simState = null) {
     // One navigator.getGamepads() snapshot per tick — threaded through helpers.
     // A single NaN dtSec would poison the slew accumulators permanently.
     if (!Number.isFinite(dtSec) || dtSec < 0) dtSec = 1 / 60;
     if (!Number.isFinite(this.kSteer)) this.kSteer = 0;
+    if (!Number.isFinite(this.kThrottle)) this.kThrottle = 0;
     if (!Number.isFinite(this.kBrake)) this.kBrake = 0;
     const pads = this.gamepads();
     const s = this.steerSettings;
     const shape = (v) => Math.max(-1, Math.min(1, v * s.sensitivity * (s.invert ? -1 : 1)));
-    const kbBrakeTarget = this.keys.has("ArrowDown") || this.keys.has("KeyS") ? 1 : 0;
     // Shift bits are path-independent: manual buttons OR the auto-shifter's
     // pulses (manual presses still work in auto — the kernel arbitrates).
     const shiftBits = this.readShiftBits(pads) | this.autoShiftBits(dtSec);
@@ -398,20 +548,19 @@ export class Input {
     if (this.cal && CHANNELS.some((ch) => this.cal[ch])) {
       const boundIds = new Set(CHANNELS.map((ch) => this.cal?.[ch]?.id).filter(Boolean));
       const present = [...boundIds].filter((id) => this.padById(id, pads)).length;
-      // Keyboard stays usable for unbound channels (e.g. steer on keys while
-      // only pedals are bound).
-      const kbSteer = (this.keys.has("ArrowLeft") || this.keys.has("KeyA") ? -1 : 0) +
-                      (this.keys.has("ArrowRight") || this.keys.has("KeyD") ? 1 : 0);
       const rawSteer = this.readChannel("steer", true, pads);
+      const rawThrottle = this.readChannel("throttle", false, pads);
       const rawBrake = this.readChannel("brake", false, pads);
+      const kb = (rawSteer === null || rawThrottle === null || rawBrake === null)
+        ? this.sampleKeyboard(dtSec, simState)
+        : null;
       return {
-        // Rig axes default INVERTED (−rawSteer): Fanatec bases report the
-        // axis opposite to our world convention (user-verified on a CSL DD).
+        // Rig axes default INVERTED (−rawSteer): readChannel returns -1 when
+        // turning left, and the kernel's +Y yaw convention uses +1 = LEFT.
         // The invert setting stays a relative flip for rigs that differ.
-        steer: rawSteer !== null ? shape(-rawSteer) : kbSteer,
-        throttle: this.readChannel("throttle", false, pads) ?? (this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0),
-        // Real pedal passes through untouched; only the keyboard fallback slews.
-        brake: rawBrake !== null ? rawBrake : this.slewBrake(kbBrakeTarget, dtSec),
+        steer: rawSteer !== null ? shape(-rawSteer) : kb.steer,
+        throttle: rawThrottle !== null ? rawThrottle : kb.throttle,
+        brake: rawBrake !== null ? rawBrake : kb.brake,
         handbrake: (this.readChannel("handbrake", false, pads) ?? 0) > 0.5 || this.keys.has("Space"),
         shiftUp,
         shiftDown,
@@ -419,11 +568,14 @@ export class Input {
       };
     }
     // Zero-config controllers: prefer a standard-mapped pad among ALL devices.
+    // W3C Gamepad axes[0] reports left = -1, right = +1 → negate for kernel (+1 = LEFT).
     const std = pads.find((g) => g.mapping === "standard");
     if (std) {
-      const dz = (v) => (Math.abs(v) < 0.08 ? 0 : v);
+      const dz = (v) => (Math.abs(v) < 0.08 ? 0 : (v - Math.sign(v) * 0.08) / 0.92);
+      const rawPad = -dz(std.axes[0] ?? 0);
+      const curved = Math.sign(rawPad) * (0.72 * Math.abs(rawPad) + 0.28 * rawPad * rawPad);
       return {
-        steer: shape(dz(std.axes[0] ?? 0)),
+        steer: shape(curved),
         throttle: std.buttons[7]?.value ?? 0,
         brake: std.buttons[6]?.value ?? 0,
         handbrake: std.buttons[0]?.pressed ?? false,
@@ -432,17 +584,13 @@ export class Input {
         device: `${std.id.slice(0, 40)} (standard mapping) — A = handbrake, LB/RB = shift`,
       };
     }
-    // Keyboard: slewed steering and brake so it's actually drivable.
-    const target = (this.keys.has("ArrowLeft") || this.keys.has("KeyA") ? -1 : 0) +
-                   (this.keys.has("ArrowRight") || this.keys.has("KeyD") ? 1 : 0);
-    const slew = 3.0 * dtSec;
-    this.kSteer += Math.max(-slew, Math.min(slew, target - this.kSteer));
-    if (target === 0) this.kSteer *= Math.max(0, 1 - 6 * dtSec);
+    // Keyboard: speed-sensitive progressive steering + optional TC/ABS/stability.
+    const kb = this.sampleKeyboard(dtSec, simState);
     return {
-      steer: this.kSteer,
-      throttle: this.keys.has("ArrowUp") || this.keys.has("KeyW") ? 1 : 0,
-      brake: this.slewBrake(kbBrakeTarget, dtSec),
-      handbrake: this.keys.has("Space"),
+      steer: kb.steer,
+      throttle: kb.throttle,
+      brake: kb.brake,
+      handbrake: kb.handbrake,
       shiftUp,
       shiftDown,
       device: pads.length ? `keyboard (${pads.length} device(s) seen — press I to bind)` : "keyboard",
@@ -452,6 +600,11 @@ export class Input {
   setSteerSettings(patch) {
     this.steerSettings = { ...this.steerSettings, ...patch };
     localStorage.setItem(STEER_KEY, JSON.stringify(this.steerSettings));
+  }
+
+  setKbAssist(patch) {
+    this.kbAssist = { ...this.kbAssist, ...patch };
+    localStorage.setItem(KB_ASSIST_KEY, JSON.stringify(this.kbAssist));
   }
 
   clearCalibration() {

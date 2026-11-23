@@ -543,13 +543,12 @@ static void test_grass_drive( void )
 // a v2 excursion log replays step==step==replay bit-identically.
 // ---------------------------------------------------------------------------
 
-// Pre-change captures (recorded from the kernel BEFORE the TERRAIN.md §2
-// raycast landed, scratch harness, %016llx). If a later DELIBERATE physics
-// change breaks these, re-capture with a straight full-throttle drive from
-// spawn: 800 ticks on-corridor, and 2400 ticks with a lift to 40% throttle
-// once pos.x > 50 for the excursion (the failure output prints the actuals).
-#define CAPTURE_ONCORRIDOR_800 0x6e684a737810541eull
-#define CAPTURE_EXCURSION_MISS_2400 0x0da900df0055f8d1ull
+// Captures for the Stribeck brush-tire kernel (re-captured after the
+// deliberate progressive Stribeck sliding transition landed in vehicle.c):
+// straight full-throttle drive from spawn — 800 ticks on-corridor, and 2400
+// ticks with a lift to 40% throttle once pos.x > 50 for the excursion.
+#define CAPTURE_ONCORRIDOR_800 0x77d60661d50191b5ull
+#define CAPTURE_EXCURSION_MISS_2400 0x00b703c084c79a47ull
 
 static uint64_t v2_state_hash( void )
 {

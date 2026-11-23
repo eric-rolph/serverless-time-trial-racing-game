@@ -285,9 +285,10 @@ impl KeyboardInput {
 
     /// Advance smoothing by `dt` seconds and return the state. Split out from
     /// `sample()` so tests can drive time deterministically.
+    /// Kernel convention (+Y yaw): +1.0 = full left, -1.0 = full right.
     fn advance(&self, dt: f32) -> RawInput {
         let mut s = self.state.lock().unwrap();
-        let target_steer = (s.right as i32 - s.left as i32) as f32;
+        let target_steer = (s.left as i32 - s.right as i32) as f32;
 
         let rate = if target_steer == 0.0 { STEER_RECENTER } else { STEER_SLEW };
         let max_delta = rate * dt;
@@ -337,23 +338,27 @@ mod tests {
     #[test]
     fn keyboard_steer_slews_at_3_per_second() {
         let kb = KeyboardInput::new();
-        kb.set_control(Control::SteerRight, true);
-        // 0.1 s at 3/s -> 0.3
+        kb.set_control(Control::SteerLeft, true);
+        // 0.1 s at 3/s -> +0.3 (kernel +Y yaw: +1 = left, -1 = right)
         let r = kb.advance(0.1);
         assert!((r.steer - 0.3).abs() < 1e-5, "steer = {}", r.steer);
-        // saturates at 1.0
+        // saturates at +1.0
         for _ in 0..10 {
             kb.advance(0.1);
         }
         assert!((kb.advance(0.0).steer - 1.0).abs() < 1e-5);
         // release: recenters (faster than slew), never overshoots
-        kb.set_control(Control::SteerRight, false);
+        kb.set_control(Control::SteerLeft, false);
         let r = kb.advance(0.1);
         assert!(r.steer < 1.0 && r.steer > 0.0);
         for _ in 0..10 {
             kb.advance(0.1);
         }
         assert_eq!(kb.advance(0.0).steer, 0.0);
+        // steer right -> negative steer
+        kb.set_control(Control::SteerRight, true);
+        let r = kb.advance(0.1);
+        assert!((r.steer + 0.3).abs() < 1e-5, "steer right = {}", r.steer);
     }
 
     #[test]
