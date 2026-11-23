@@ -1,55 +1,128 @@
-// Trackside ambience — procedural, seeded, cheap. Everything is derived
-// deterministically from the track bytes (fnv1a64 hash → LCG), so a given
-// track always dresses itself the same way and no assets are shipped:
-//   • low-poly trees (InstancedMesh trunk + canopy) on both sides, outside
-//     the shoulder zone (lateral offset 12–25 m past width/2), every 10–20 m,
-//     skipped where they'd land on another part of the loop; on v2 tracks
-//     trees and grandstands are grounded on the real terrain (build-time
-//     raycast against track.verts/tris — TERRAIN.md §3) and steep apron
-//     slopes (> ~20°) are rejected; v1 keeps the flat ground plane. Skirt
-//     walls are v1-only — the v2 terrain apron replaces them;
-//   • red/white tire-stack barriers lining the OUTSIDE of the tightest
-//     corners (same smoothed-curvature rule the kerb paint uses);
-//     — EXCEPT on TRK1 v2 tracks: tire stacks, Armco and concrete walls are
-//     then placed from track.props (the kernel's collision boxes) so the
-//     visuals match the physics exactly; heuristics remain the v1 fallback.
-//     Trees/gantry/grandstands/brake-boards stay heuristic (no collision,
-//     far off-line by design);
-//   • a start/finish gantry at sample 0 with an emissive strip + banner
-//     (materials exposed via group.userData.glowMaterials so the time-of-day
-//     lighting can boost them at night);
-//   • 3 braking marker boards at 150/100/50 m (60/40/20 samples) before the
-//     tightest corner, striped 3/2/1.
-// APEX "Build the world" layer order, read from the white line outward:
-// white line → kerb → run-off (gravel beds on the two tightest corners,
-// mottled grass elsewhere — see track.js) → barrier (tire stacks on the
-// tightest corners, instanced Armco on the medium ones) → grandstand + crowd
-// (one main stand on the start straight, smaller stands at signature corners).
+// Trackside ambience — procedural, seeded, PBR-upgraded circuit world.
+// Deterministic from track bytes (fnv1a64 → LCG), zero external assets:
+//   • Textured ground plain + distant multi-harmonic alpine mountain horizon ring;
+//   • Multi-tier evergreen conifers + broadleaf clusters (InstancedMesh PBR),
+//     terrain-grounded on v2 tracks with apron slope rejection;
+//   • Collision-exact tire stacks, corrugated W-profile Armco & concrete walls
+//     on v2 tracks (heuristic fallback on v1);
+//   • Gravel-trap run-off beds + apex chevron sightline boards on tight corners;
+//   • FIA start/finish gantry with live 5-red-light F1 start sequence synced to
+//     countdown via group.userData.setStartLights(litCount, isGo);
+//   • High-contrast 150 / 100 / 50 m braking boards before ALL major heavy
+//     braking zones (up to 4 distinct corners around the circuit).
 import * as THREE from "../vendor/three.module.js";
-import { fnv1a64, smoothedCurvature, KERB_KAPPA } from "./track.js";
+import { fnv1a64, smoothedCurvature, KERB_KAPPA, grassTexture } from "./track.js";
 
 const v3 = (a) => new THREE.Vector3(a[0], a[1], a[2]);
 
-/** @returns THREE.Group (userData.glowMaterials = materials the night
- *  lighting may brighten). hash: precomputed fnv1a64 of track.bytes. */
+/** Merge an array of non-indexed or indexed BufferGeometries (positions + normals). */
+function mergeSimpleGeos(geos) {
+  const expanded = geos.map((g) => (g.index ? g.toNonIndexed() : g));
+  let totalVerts = 0;
+  for (const g of expanded) totalVerts += g.attributes.position.count;
+  const pos = new Float32Array(totalVerts * 3);
+  const nrm = new Float32Array(totalVerts * 3);
+  let off = 0;
+  for (const g of expanded) {
+    if (!g.attributes.normal) g.computeVertexNormals();
+    pos.set(g.attributes.position.array, off * 3);
+    nrm.set(g.attributes.normal.array, off * 3);
+    off += g.attributes.position.count;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  out.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
+  return out;
+}
+
+/** Procedural crisp FIA distance board face ("150", "100", "50" with stripes). */
+function brakeBoardTexture(meters, bars) {
+  const c = document.createElement("canvas");
+  c.width = 256; c.height = 176;
+  const g = c.getContext("2d");
+  g.fillStyle = "#f2f4f7";
+  g.fillRect(0, 0, 256, 176);
+  g.strokeStyle = "#1a1f28";
+  g.lineWidth = 8;
+  g.strokeRect(4, 4, 248, 168);
+  // Diagonal FIA red countdown stripes on left third
+  g.fillStyle = "#d9342b";
+  for (let k = 0; k < bars; k++) {
+    g.fillRect(18 + k * 24, 22, 14, 132);
+  }
+  // Bold distance numeral on right
+  g.fillStyle = "#11161f";
+  g.font = "900 84px sans-serif";
+  g.textAlign = "right";
+  g.textBaseline = "middle";
+  g.fillText(String(meters), 240, 94);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/** Procedural high-visibility yellow/black apex chevron board. */
+function chevronTexture(dirSign) {
+  const c = document.createElement("canvas");
+  c.width = 256; c.height = 128;
+  const g = c.getContext("2d");
+  g.fillStyle = "#f0c824";
+  g.fillRect(0, 0, 256, 128);
+  g.fillStyle = "#14181f";
+  for (let k = -1; k < 4; k++) {
+    const x0 = k * 72 + 12;
+    g.beginPath();
+    if (dirSign >= 0) {
+      g.moveTo(x0, 0); g.lineTo(x0 + 36, 0); g.lineTo(x0 + 68, 64);
+      g.lineTo(x0 + 36, 128); g.lineTo(x0, 128); g.lineTo(x0 + 32, 64);
+    } else {
+      g.moveTo(x0 + 68, 0); g.lineTo(x0 + 32, 0); g.lineTo(x0, 64);
+      g.lineTo(x0 + 32, 128); g.lineTo(x0 + 68, 128); g.lineTo(x0 + 36, 64);
+    }
+    g.closePath();
+    g.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Start gantry header banner texture. */
+function gantryBannerTexture() {
+  const c = document.createElement("canvas");
+  c.width = 512; c.height = 128;
+  const g = c.getContext("2d");
+  g.fillStyle = "#0b1019";
+  g.fillRect(0, 0, 512, 128);
+  g.fillStyle = "#22e0d0";
+  g.fillRect(0, 0, 512, 8);
+  g.fillRect(0, 120, 512, 8);
+  g.fillStyle = "#eef4fb";
+  g.font = "900 48px sans-serif";
+  g.textAlign = "center";
+  g.textBaseline = "middle";
+  g.fillText("STTR · APEX CIRCUIT", 256, 56);
+  g.fillStyle = "#22e0d0";
+  g.font = "700 20px monospace";
+  g.fillText("400 HZ DETERMINISTIC TIME TRIAL", 256, 98);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/** @returns THREE.Group (userData.glowMaterials + userData.setStartLights). */
 export function buildAmbience(track, hash = null) {
   const group = new THREE.Group();
   const glowMaterials = [];
   group.userData.glowMaterials = glowMaterials;
   const n = track.S;
-
-  // TRK1 v2 signal: parseTrack (track.js) does not expose the version field —
-  // props is the only v2 marker it returns (the prop table is parsed solely
-  // when version === 2). A hypothetical prop-less v2 track therefore degrades
-  // to the v1 visuals, consistent with the barrier heuristics below which
-  // already branch on the same condition.
   const props = track.props && track.props.length ? track.props : null;
 
-  // Deterministic PRNG seeded from the track identity.
   let seed = (Number((hash ?? fnv1a64(track.bytes)) & 0xffffffffn) >>> 0) || 1;
   const rand = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32;
 
-  // Local frame at sample i: side = up × tangent (lateral), all normalized.
   const frame = (i) => {
     const c = v3(track.center[i]);
     const u = v3(track.up[i]).normalize();
@@ -57,18 +130,13 @@ export function buildAmbience(track, hash = null) {
     const side = new THREE.Vector3().crossVectors(u, t).normalize();
     return { c, u, t, side };
   };
-  // The curvature vector (tangent[i+1] − tangent[i]) points INTO the turn;
-  // its sign along `side` tells us which lateral direction is inside.
   const insideSign = (i) => {
     const f = frame(i);
     const t2 = v3(track.tangent[(i + 1) % n]);
     return Math.sign(t2.sub(f.t).dot(f.side)) || 1;
   };
 
-  // ------------------------------------------------------------- ground
-  // The world beyond the 8 m shoulders is void — give it a ground plane at
-  // shoulder-base level so trees stand on something and the horizon reads as
-  // land, not outer space. Trees sit ON this plane.
+  // ------------------------------------------------------------- ground + mountain horizon
   let minY = Infinity, maxCY = -Infinity, cx = 0, cz = 0, maxR = 0;
   for (const c of track.center) {
     minY = Math.min(minY, c[1]);
@@ -76,21 +144,70 @@ export function buildAmbience(track, hash = null) {
     cx += c[0] / n; cz += c[2] / n;
   }
   for (const c of track.center) maxR = Math.max(maxR, Math.hypot(c[0] - cx, c[2] - cz));
-  const groundY = minY - 1.35; // just under the shoulder drop (-1.2)
-  const groundGeo = new THREE.CircleGeometry(maxR + 120, 40);
+  const groundY = minY - 1.35;
+
+  const groundTex = grassTexture();
+  groundTex.repeat.set(36, 36);
+  const groundGeo = new THREE.CircleGeometry(maxR + 360, 48);
   groundGeo.rotateX(-Math.PI / 2);
-  const ground = new THREE.Mesh(groundGeo, new THREE.MeshLambertMaterial({ color: 0x2d3b31 }));
-  ground.position.set(cx, groundY, cz);
+  const ground = new THREE.Mesh(
+    groundGeo,
+    new THREE.MeshStandardMaterial({ color: 0x2c3c30, map: groundTex, roughness: 0.96, metalness: 0.0, envMapIntensity: 0.3 }),
+  );
+  ground.position.set(cx, groundY - 0.02, cz);
   group.add(ground);
 
-  // Skirts (v1 ONLY): the v1 terrain strip ends at the shoulders' outer
-  // edges, which float above the ground plane wherever the track climbs —
-  // connect each outer edge down to the plane with a wall strip so road and
-  // land read as one world. Terrain vertex layout (trackgen): v(i,row) =
-  // i*4+row, rows 0/3 are the outer shoulder edges. On v2 tracks the terrain
-  // apron (TERRAIN.md §1/§3) replaces the skirts — skip them entirely.
+  // Distant rolling mountain silhouette ring — encircles the horizon past the
+  // circuit so the world feels like a real alpine valley circuit (Spa/Red Bull Ring).
+  {
+    const segs = 72;
+    const rIn = maxR + 135;
+    const rPeak = maxR + 235;
+    const rOut = maxR + 340;
+    const p1 = rand() * 6.28, p2 = rand() * 6.28, p3 = rand() * 6.28;
+    const mPos = new Float32Array(segs * 3 * 3);
+    const mCol = new Float32Array(segs * 3 * 3);
+    const mIdx = [];
+    const baseCol = new THREE.Color(0x28382f);
+    const ridgeCol = new THREE.Color(0x3a4952);
+    const peakCol = new THREE.Color(0x566470);
+    for (let k = 0; k < segs; k++) {
+      const a = (k / segs) * Math.PI * 2;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const ridgeH = 26
+        + 18 * Math.sin(3 * a + p1)
+        + 11 * Math.sin(7 * a + p2)
+        + 6 * Math.cos(13 * a + p3)
+        + 4 * Math.sin(19 * a + p1 * 1.7);
+      const h = Math.max(10, ridgeH);
+      const b0 = k * 9;
+      mPos.set([cx + ca * rIn, groundY - 1.5, cz + sa * rIn], b0);
+      mPos.set([cx + ca * rPeak, groundY + h, cz + sa * rPeak], b0 + 3);
+      mPos.set([cx + ca * rOut, groundY - 4.0, cz + sa * rOut], b0 + 6);
+      const peakMix = Math.min(1, Math.max(0, (h - 24) / 30));
+      const rc = ridgeCol.clone().lerp(peakCol, peakMix);
+      mCol.set([baseCol.r, baseCol.g, baseCol.b], b0);
+      mCol.set([rc.r, rc.g, rc.b], b0 + 3);
+      mCol.set([baseCol.r * 0.7, baseCol.g * 0.75, baseCol.b * 0.85], b0 + 6);
+      const nk = (k + 1) % segs;
+      const i0 = k * 3, i1 = nk * 3;
+      mIdx.push(i0, i1, i0 + 1, i0 + 1, i1, i1 + 1);
+      mIdx.push(i0 + 1, i1 + 1, i0 + 2, i0 + 2, i1 + 1, i1 + 2);
+    }
+    const mg = new THREE.BufferGeometry();
+    mg.setAttribute("position", new THREE.BufferAttribute(mPos, 3));
+    mg.setAttribute("color", new THREE.BufferAttribute(mCol, 3));
+    mg.setIndex(mIdx);
+    mg.computeVertexNormals();
+    const mountains = new THREE.Mesh(mg, new THREE.MeshStandardMaterial({
+      vertexColors: true, roughness: 0.96, metalness: 0.0, envMapIntensity: 0.25,
+    }));
+    group.add(mountains);
+  }
+
+  // Skirts (v1 ONLY)
   if (!props) {
-    const skirtMat = new THREE.MeshLambertMaterial({ color: 0x2d3b31, side: THREE.DoubleSide });
+    const skirtMat = new THREE.MeshStandardMaterial({ color: 0x2d3b31, roughness: 0.94, metalness: 0.0, side: THREE.DoubleSide });
     for (const row of [0, 3]) {
       const pos = new Float32Array(n * 2 * 3);
       for (let i = 0; i < n; i++) {
@@ -112,17 +229,8 @@ export function buildAmbience(track, hash = null) {
     }
   }
 
-  // ---------------------------------------------- terrain height sampling
-  // v2 tracks: trees/stands must sit ON the terrain (apron slopes,
-  // TERRAIN.md §3), not on the flat ground plane. One three.js Raycaster +
-  // one throwaway mesh built from the track's own collision geometry —
-  // track.verts/track.tris, the exact mesh buildTrackMeshes renders (apron
-  // rows and ground quad included once trackgen bakes them) — cast straight
-  // down at placement time. Build-time only: nothing here runs per frame,
-  // and the mesh is never added to the scene (no GPU upload, no dispose
-  // needed). v1 tracks keep the flat-plane placement bit-for-bit (sampler
-  // disabled — their mesh ends at the shoulders anyway).
-  const APRON_COS = Math.cos((20 * Math.PI) / 180); // max slope trees/stands accept
+  // ---------------------------------------------- terrain height sampling (v2)
+  const APRON_COS = Math.cos((20 * Math.PI) / 180);
   const groundHit = (() => {
     if (!props) return () => null;
     const g = new THREE.BufferGeometry();
@@ -132,18 +240,14 @@ export function buildAmbience(track, hash = null) {
     const ray = new THREE.Raycaster();
     ray.ray.direction.set(0, -1, 0);
     return (x, z) => {
-      // Origin safely above everything: banking can lift edge verts ~1–2 m
-      // over the centerline, kerbs a few cm — 25 m of headroom covers all.
       ray.ray.origin.set(x, maxCY + 25, z);
       const hits = ray.intersectObject(mesh, false);
-      return hits.length ? hits[0] : null; // closest = highest surface below
+      return hits.length ? hits[0] : null;
     };
   })();
 
   // ------------------------------------------- curvature + corner zones
-  // Shared by gravel traps, Armco, tire stacks, brake boards and stands.
   const kappa = smoothedCurvature(track);
-  // Contiguous |κ| > KERB_KAPPA runs (wrap-aware), ranked tightest-first.
   const zones = (() => {
     let a = 0;
     while (a < n && Math.abs(kappa[a]) > KERB_KAPPA) a++;
@@ -167,9 +271,6 @@ export function buildAmbience(track, hash = null) {
     return out;
   })();
 
-  // A point 10–25 m off one segment can still sit ON another segment of the
-  // loop (hairpins, straights folding back) — reject anything within
-  // width/2 + 7 m of any centerline sample. Used by trees and stands.
   const clearOfTrack = (p) => {
     for (let i = 0; i < n; i += 2) {
       const c = track.center[i];
@@ -181,12 +282,7 @@ export function buildAmbience(track, hash = null) {
   };
 
   // ------------------------------------------- grandstands + crowd
-  // Placed BEFORE the trees so tree candidates inside a stand footprint can
-  // be culled. One main tiered stand along the start straight (sample 0) +
-  // up to 3 smaller stands at the signature (tightest) corners. All boxes go
-  // through two InstancedMeshes (grey structure, carbon-dark roofs); the
-  // crowd is one merged quad mesh with a shared random-pixel canvas texture.
-  const standFootprints = []; // {x, z, r} — tree exclusion circles
+  const standFootprints = [];
   {
     const upY = new THREE.Vector3(0, 1, 0);
     const STEP_H = 0.55, STEP_D = 1.3;
@@ -196,15 +292,12 @@ export function buildAmbience(track, hash = null) {
       const th = f.t.clone().setY(0).normalize();
       const sh = new THREE.Vector3().crossVectors(upY, th).normalize();
       const base = f.c.clone().addScaledVector(sh, out * dist);
-      base.y = groundY; // flat-plane default (v1 always; v2 ray-miss fallback)
+      base.y = groundY;
       const depth = tiers * STEP_D + 2.5;
       for (const [dl, dd] of [[0, 0], [-L / 2, 0], [L / 2, 0], [0, depth]]) {
         const p = base.clone().addScaledVector(th, dl).addScaledVector(sh, out * dd);
         if (!clearOfTrack(p)) return false;
       }
-      // v2: ground the stand on the terrain (sampled at the front edge). A
-      // stand on a steep apron slope would hang off a cliff — reject it so
-      // the caller falls back to the other side / next corner.
       const hit = groundHit(base.x, base.z);
       if (hit) {
         if (Math.abs(hit.face.normal.y) < APRON_COS) return false;
@@ -217,13 +310,11 @@ export function buildAmbience(track, hash = null) {
       });
       return true;
     };
-    // Main grandstand: sized to the flat run around sample 0 (start straight).
     let run = 1;
     while (run < 15 && Math.abs(kappa[run % n]) < 0.008 && Math.abs(kappa[(n - run) % n]) < 0.008) run++;
     const mainL = Math.max(30, Math.min(72, run * 2 * 2.5 * 0.8));
     const d0 = track.width[0] / 2 + 11;
     tryStand(0, 1, mainL, 5, d0) || tryStand(0, -1, mainL, 5, d0);
-    // Smaller stands at the tightest corners, on the outside past the run-off.
     let small = 0;
     for (const z of zones) {
       if (small >= 3) break;
@@ -239,21 +330,20 @@ export function buildAmbience(track, hash = null) {
           new THREE.Matrix4().makeBasis(th, upY, new THREE.Vector3().crossVectors(th, upY)));
         const at = (dAlong, dOut, y) =>
           base.clone().addScaledVector(th, dAlong).addScaledVector(sh, out * dOut).setY(base.y + y);
-        for (let k = 0; k < tiers; k++) { // solid steps rising away from track
+        for (let k = 0; k < tiers; k++) {
           const h = (k + 1) * STEP_H;
           structXf.push({ p: at(0, k * STEP_D + STEP_D / 2, h / 2), q, s: new THREE.Vector3(L, h, STEP_D) });
         }
-        const wallH = tiers * STEP_H + 1.4; // back wall
+        const wallH = tiers * STEP_H + 1.4;
         structXf.push({ p: at(0, tiers * STEP_D + 0.25, wallH / 2), q, s: new THREE.Vector3(L, wallH, 0.5) });
-        const roofY = tiers * STEP_H + 2.6; // front roof posts
+        const roofY = tiers * STEP_H + 2.6;
         for (const dl of [-L / 2 + 0.4, L / 2 - 0.4]) {
           structXf.push({ p: at(dl, 0.3, roofY / 2), q, s: new THREE.Vector3(0.22, roofY, 0.22) });
         }
-        roofXf.push({ // carbon-dark slab with a slight front overhang
+        roofXf.push({
           p: at(0, tiers * STEP_D / 2 - 0.4, roofY + 0.09), q,
           s: new THREE.Vector3(L + 1.2, 0.18, tiers * STEP_D + 2.0),
         });
-        // crowd band: one inclined quad laid over the steps
         const vbase = crowdPos.length / 3;
         for (const [dOut, y] of [[0.25, STEP_H + 0.35], [(tiers - 1) * STEP_D + 0.9, tiers * STEP_H + 0.4]]) {
           for (const dl of [-L / 2, L / 2]) {
@@ -261,22 +351,21 @@ export function buildAmbience(track, hash = null) {
             crowdPos.push(p.x, p.y, p.z);
           }
         }
-        const rep = L / 24; // one texture repeat / 24 m of seating
+        const rep = L / 24;
         crowdUv.push(0, 0, rep, 0, 0, 1, rep, 1);
         crowdIdx.push(vbase, vbase + 1, vbase + 2, vbase + 1, vbase + 3, vbase + 2);
       }
       const boxGeo = new THREE.BoxGeometry(1, 1, 1);
       const m4 = new THREE.Matrix4();
       const structMesh = new THREE.InstancedMesh(boxGeo,
-        new THREE.MeshStandardMaterial({ color: 0x767e88, roughness: 0.85, metalness: 0.1 }),
+        new THREE.MeshStandardMaterial({ color: 0x767e88, roughness: 0.85, metalness: 0.12 }),
         structXf.length);
       structXf.forEach((xf, k) => { m4.compose(xf.p, xf.q, xf.s); structMesh.setMatrixAt(k, m4); });
       const roofMesh = new THREE.InstancedMesh(boxGeo,
-        new THREE.MeshStandardMaterial({ color: 0x14171c, roughness: 0.55, metalness: 0.35 }),
+        new THREE.MeshStandardMaterial({ color: 0x161a21, roughness: 0.48, metalness: 0.45 }),
         roofXf.length);
       roofXf.forEach((xf, k) => { m4.compose(xf.p, xf.q, xf.s); roofMesh.setMatrixAt(k, m4); });
-      // Crowd texture: random colored pixel blobs in seat rows — reads as
-      // people from track distance. Shared by every stand. Emissive: none.
+
       const cvs = document.createElement("canvas");
       cvs.width = 192; cvs.height = 64;
       const g2d = cvs.getContext("2d");
@@ -302,95 +391,102 @@ export function buildAmbience(track, hash = null) {
       cg.setIndex(crowdIdx);
       cg.computeVertexNormals();
       const crowdMesh = new THREE.Mesh(cg,
-        new THREE.MeshLambertMaterial({ map: crowdTex, side: THREE.DoubleSide }));
+        new THREE.MeshStandardMaterial({ map: crowdTex, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide }));
       group.add(structMesh, roofMesh, crowdMesh);
     }
   }
 
-  // ------------------------------------------------------------- trees
-  const trees = [];
-  for (let i = 0; i < n; i += 4 + ((rand() * 4) | 0)) { // every 10–20 m
+  // ------------------------------------------------------------- multi-tier PBR trees
+  const conifers = [], broads = [];
+  for (let i = 0; i < n; i += 4 + ((rand() * 3) | 0)) {
     for (const s of [-1, 1]) {
-      if (rand() < 0.25) continue; // density jitter
+      if (rand() < 0.22) continue;
       const f = frame(i);
-      const lat = track.width[i] / 2 + 12 + rand() * 13; // 12–25 m past edge
+      const lat = track.width[i] / 2 + 12 + rand() * 16;
       const p = f.c.clone()
         .addScaledVector(f.side, s * lat)
-        .addScaledVector(f.t, (rand() - 0.5) * 4);
-      p.y = groundY; // flat-plane default (v1 always; v2 ray-miss fallback)
+        .addScaledVector(f.t, (rand() - 0.5) * 4.5);
+      p.y = groundY;
       if (!clearOfTrack(p)) continue;
       if (standFootprints.some((fp) =>
         (p.x - fp.x) * (p.x - fp.x) + (p.z - fp.z) * (p.z - fp.z) < fp.r * fp.r)) continue;
-      // v2: ground the tree on the terrain. Trees on a steep apron slope
-      // (> ~20°) read as cliffside mistakes — skip those candidates. Skips
-      // are pure geometry (raycast on the static track mesh), so placement
-      // stays fully deterministic per track.
       const hit = groundHit(p.x, p.z);
       if (hit) {
         if (Math.abs(hit.face.normal.y) < APRON_COS) continue;
         p.y = hit.point.y;
       }
-      trees.push({ p, scale: [0.8, 1.0, 1.35][(rand() * 3) | 0], rot: rand() * Math.PI * 2 });
+      const entry = { p, scale: 0.82 + rand() * 0.72, rot: rand() * Math.PI * 2 };
+      (rand() < 0.68 ? conifers : broads).push(entry);
     }
   }
-  if (trees.length) {
-    const trunkGeo = new THREE.CylinderGeometry(0.15, 0.22, 1.2, 6);
-    trunkGeo.translate(0, 0.6, 0); // base at y=0
-    const canopyGeo = new THREE.ConeGeometry(1.2, 3.2, 7);
-    canopyGeo.translate(0, 2.6, 0); // sits on the trunk
-    const trunks = new THREE.InstancedMesh(
-      trunkGeo, new THREE.MeshLambertMaterial({ color: 0x3a2f26 }), trees.length);
-    const canopies = new THREE.InstancedMesh(
-      canopyGeo, new THREE.MeshLambertMaterial({ color: 0xffffff }), trees.length);
-    const greens = [0x1e3227, 0x24402c, 0x1a2b22].map((c) => new THREE.Color(c));
-    const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
-    trees.forEach((tr, k) => {
-      q.setFromAxisAngle(up, tr.rot);
-      m4.compose(tr.p, q, new THREE.Vector3(tr.scale, tr.scale, tr.scale));
-      trunks.setMatrixAt(k, m4);
-      canopies.setMatrixAt(k, m4);
-      canopies.setColorAt(k, greens[(rand() * greens.length) | 0]);
+  const barkMat = new THREE.MeshStandardMaterial({ color: 0x3b2e24, roughness: 0.95, metalness: 0.0 });
+  const leafMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88, metalness: 0.0, envMapIntensity: 0.4 });
+  const m4t = new THREE.Matrix4(), qt = new THREE.Quaternion(), upY = new THREE.Vector3(0, 1, 0);
+
+  if (conifers.length) {
+    const trunkGeo = new THREE.CylinderGeometry(0.14, 0.24, 1.4, 6);
+    trunkGeo.translate(0, 0.7, 0);
+    // 3-tier layered evergreen crown
+    const c1 = new THREE.ConeGeometry(1.45, 2.2, 7); c1.translate(0, 2.1, 0);
+    const c2 = new THREE.ConeGeometry(1.15, 2.0, 7); c2.translate(0, 3.25, 0);
+    const c3 = new THREE.ConeGeometry(0.75, 1.7, 7); c3.translate(0, 4.35, 0);
+    const canopyGeo = mergeSimpleGeos([c1, c2, c3]);
+    const trunks = new THREE.InstancedMesh(trunkGeo, barkMat, conifers.length);
+    const canopies = new THREE.InstancedMesh(canopyGeo, leafMat, conifers.length);
+    const pineCols = [0x1c3426, 0x22422d, 0x182d22, 0x284930].map((c) => new THREE.Color(c));
+    conifers.forEach((tr, k) => {
+      qt.setFromAxisAngle(upY, tr.rot);
+      m4t.compose(tr.p, qt, new THREE.Vector3(tr.scale, tr.scale * (0.95 + rand() * 0.2), tr.scale));
+      trunks.setMatrixAt(k, m4t);
+      canopies.setMatrixAt(k, m4t);
+      canopies.setColorAt(k, pineCols[(rand() * pineCols.length) | 0]);
     });
     group.add(trunks, canopies);
   }
 
-  // ------------------------------------------- collision-prop barriers (v2)
-  // TRK1 v2 tracks carry authored collision boxes (track.props); each becomes
-  // ONE static box in the physics kernel, so the visuals below are sized to
-  // tile each box exactly — what you see is what you hit (never protruding
-  // more than ~10 cm past the box, never visibly inside it). One InstancedMesh
-  // per type family. v1 tracks (empty props) keep the curvature heuristics.
-  // (`props` is the v2 signal defined at the top of buildAmbience.)
-  const upY2 = new THREE.Vector3(0, 1, 0);
+  if (broads.length) {
+    const trunkGeo = new THREE.CylinderGeometry(0.16, 0.26, 1.8, 6);
+    trunkGeo.translate(0, 0.9, 0);
+    const b1 = new THREE.DodecahedronGeometry(1.25, 0); b1.translate(0, 2.8, 0);
+    const b2 = new THREE.DodecahedronGeometry(0.88, 0); b2.translate(0.65, 2.4, 0.35);
+    const b3 = new THREE.DodecahedronGeometry(0.82, 0); b3.translate(-0.55, 2.55, -0.4);
+    const crownGeo = mergeSimpleGeos([b1, b2, b3]);
+    const trunks = new THREE.InstancedMesh(trunkGeo, barkMat, broads.length);
+    const crowns = new THREE.InstancedMesh(crownGeo, leafMat, broads.length);
+    const broadCols = [0x2c4b2b, 0x3b592e, 0x4b5c2d, 0x5c532a].map((c) => new THREE.Color(c));
+    broads.forEach((tr, k) => {
+      qt.setFromAxisAngle(upY, tr.rot);
+      m4t.compose(tr.p, qt, new THREE.Vector3(tr.scale, tr.scale, tr.scale));
+      trunks.setMatrixAt(k, m4t);
+      crowns.setMatrixAt(k, m4t);
+      crowns.setColorAt(k, broadCols[(rand() * broadCols.length) | 0]);
+    });
+    group.add(trunks, crowns);
+  }
 
-  // ------------------------------------------- tire-stack barriers
+  // ------------------------------------------- collision-prop barriers (v2) / heuristics (v1)
+  const upY2 = new THREE.Vector3(0, 1, 0);
+  const tireMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.78, metalness: 0.04 });
+
   if (props) {
-    // type 0 → red/white tire stacks. The box is approximated by a row of
-    // stacked cylinders: radius = the box's narrow horizontal half-extent
-    // (so each tire spans the full barrier depth), column count = round(
-    // long/2r) with per-column length-radius stretched so the row spans the
-    // box's long axis edge-to-edge, level count/height chosen the same way
-    // vertically (~0.55 m tires). Cylinders inscribe the box: flush at the
-    // row ends, top and faces; only the gaps between circles sit inside it.
     const items = [];
     for (const pr of props) {
       if (pr.type !== 0) continue;
       const [hx, hy, hz] = pr.half;
-      const alongX = hx >= hz; // row runs down the box's long local axis
+      const alongX = hx >= hz;
       const halfLong = Math.max(alongX ? hx : hz, 0.05);
-      const r = Math.max(0.05, Math.min(hx, hz)); // tire radius = narrow half
+      const r = Math.max(0.05, Math.min(hx, hz));
       const cols = Math.max(1, Math.min(96, Math.round(halfLong / r)));
-      const rLong = halfLong / cols; // per-column half-length along the row
+      const rLong = halfLong / cols;
       const levels = Math.max(1, Math.min(8, Math.round((2 * hy) / 0.55)));
       const levelH = Math.max(0.1, (2 * hy) / levels);
       items.push({ pr, alongX, halfLong, r, cols, rLong, levels, levelH });
     }
     const total = items.reduce((s, it) => s + it.cols * it.levels, 0);
     if (total) {
-      const tireGeo = new THREE.CylinderGeometry(1, 1, 1, 10); // unit; scaled per instance
-      const barrier = new THREE.InstancedMesh(
-        tireGeo, new THREE.MeshLambertMaterial({ color: 0xffffff }), total);
-      const red = new THREE.Color(0xb8352b), white = new THREE.Color(0xd9dde2);
+      const tireGeo = new THREE.CylinderGeometry(1, 1, 1, 12);
+      const barrier = new THREE.InstancedMesh(tireGeo, tireMat, total);
+      const red = new THREE.Color(0xc43127), white = new THREE.Color(0xe1e5ea);
       const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
       const dir = new THREE.Vector3(), p = new THREE.Vector3(), s = new THREE.Vector3();
       let k = 0;
@@ -415,9 +511,6 @@ export function buildAmbience(track, hash = null) {
       group.add(barrier);
     }
   } else {
-    // Heuristic (v1): outside of every corner the kerb painter flags
-    // (|smoothed κ| > 0.022), one stack (2 cylinders high, alternating
-    // red/white) every ~5 m. Visual only — no collision on v1 tracks.
     const stacks = [];
     for (let i = 0; i < n; i += 2) {
       if (Math.abs(kappa[i]) <= KERB_KAPPA) continue;
@@ -428,10 +521,9 @@ export function buildAmbience(track, hash = null) {
       stacks.push({ p, u: f.u });
     }
     if (stacks.length) {
-      const tireGeo = new THREE.CylinderGeometry(0.55, 0.55, 0.55, 10);
-      const barrier = new THREE.InstancedMesh(
-        tireGeo, new THREE.MeshLambertMaterial({ color: 0xffffff }), stacks.length * 2);
-      const red = new THREE.Color(0xb8352b), white = new THREE.Color(0xd9dde2);
+      const tireGeo = new THREE.CylinderGeometry(0.55, 0.55, 0.55, 12);
+      const barrier = new THREE.InstancedMesh(tireGeo, tireMat, stacks.length * 2);
+      const red = new THREE.Color(0xc43127), white = new THREE.Color(0xe1e5ea);
       const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), one = new THREE.Vector3(1, 1, 1);
       const pos = new THREE.Vector3();
       stacks.forEach((st, k) => {
@@ -447,14 +539,10 @@ export function buildAmbience(track, hash = null) {
   }
 
   // ------------------------------------------- gravel-trap run-off beds
-  // Sandy beds on the OUTSIDE of the two tightest corners. The physics
-  // terrain mesh is untouched — this is a thin visual lid draped over the
-  // shoulder using the terrain's own vertices (rows 0/1 = −side shoulder,
-  // rows 2/3 = +side; trackgen layout v(i,row) = i*4+row), lifted 5 cm.
   {
     const pos = [], col = [], gidx = [];
-    const sand = new THREE.Color(0x8a7f63);
-    for (const z of zones.slice(0, 2)) {
+    const sand = new THREE.Color(0x8e8264);
+    for (const z of zones.slice(0, 3)) {
       const out = -insideSign(z.peakIdx);
       const rIn = out > 0 ? 2 : 1, rOut = out > 0 ? 3 : 0;
       const i0 = (z.start - 3 + n) % n;
@@ -466,10 +554,10 @@ export function buildAmbience(track, hash = null) {
         u.set(track.up[i][0], track.up[i][1], track.up[i][2]);
         A.fromArray(track.verts, (i * 4 + rIn) * 3);
         B.fromArray(track.verts, (i * 4 + rOut) * 3);
-        for (const f of [0.05, 0.5, 0.92]) { // 3 columns → mottle across width
+        for (const f of [0.05, 0.5, 0.92]) {
           const p = A.clone().lerp(B, f).addScaledVector(u, 0.05);
           pos.push(p.x, p.y, p.z);
-          const m = 1 + (rand() - 0.5) * 0.22; // vertex-color grain
+          const m = 1 + (rand() - 0.5) * 0.24;
           col.push(sand.r * m, sand.g * m, sand.b * (m + (rand() - 0.5) * 0.1));
         }
         if (s) {
@@ -485,23 +573,15 @@ export function buildAmbience(track, hash = null) {
       g.setIndex(gidx);
       g.computeVertexNormals();
       group.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({
-        vertexColors: true, roughness: 1.0, metalness: 0.0, side: THREE.DoubleSide })));
+        vertexColors: true, roughness: 0.98, metalness: 0.0, side: THREE.DoubleSide,
+      })));
     }
   }
 
-  // ------------------------------------------- Armco guardrails
+  // ------------------------------------------- Armco guardrails + concrete walls
   if (props) {
-    // type 1 → the Apex W-profile steel rail, driven by the collision boxes.
-    // A normalized corrugated slab: the W cross-section on the front face
-    // (local +z) mirrored on the back (−z) so the ridges kiss BOTH ±hz faces
-    // of the box — correct whichever side faces the road — and the profile is
-    // stretched over the box's full height (ridge peaks flush with the box,
-    // valleys tucked ≤2·hz inside). Local space spans [−1,1]³; each instance
-    // scales by the prop's half-extents and rotates by its yaw.
     const armco = props.filter((p) => p.type === 1);
     if (armco.length) {
-      // (y, z) closed-loop cross-section, extruded along x. Front half is the
-      // heuristic rail's W profile renormalized to [−1,1]; back half mirrors.
       const loop = [
         [1, 0], [0.52, 1], [0, 0.267], [-0.52, 1], [-1, 0],
         [-0.52, -1], [0, -0.267], [0.52, -1],
@@ -522,7 +602,8 @@ export function buildAmbience(track, hash = null) {
       railGeo.setIndex(ridx);
       railGeo.computeVertexNormals();
       const railMesh = new THREE.InstancedMesh(railGeo, new THREE.MeshStandardMaterial({
-        color: 0x9ca4ad, metalness: 0.75, roughness: 0.4, side: THREE.DoubleSide }), armco.length);
+        color: 0xa4adb8, metalness: 0.82, roughness: 0.32, side: THREE.DoubleSide,
+      }), armco.length);
       const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
       const p = new THREE.Vector3(), s = new THREE.Vector3();
       armco.forEach((pr, k) => {
@@ -534,13 +615,12 @@ export function buildAmbience(track, hash = null) {
       });
       group.add(railMesh);
     }
-    // type 2 → generic concrete wall: a plain box, carbon-grey PBR, matching
-    // the collision box exactly (unit-2 cube scaled by the half-extents).
     const walls = props.filter((p) => p.type === 2);
     if (walls.length) {
       const wallGeo = new THREE.BoxGeometry(2, 2, 2);
       const wallMesh = new THREE.InstancedMesh(wallGeo, new THREE.MeshStandardMaterial({
-        color: 0x33383f, roughness: 0.78, metalness: 0.18 }), walls.length);
+        color: 0x3b4048, roughness: 0.78, metalness: 0.14,
+      }), walls.length);
       const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
       const p = new THREE.Vector3(), s = new THREE.Vector3();
       walls.forEach((pr, k) => {
@@ -553,19 +633,12 @@ export function buildAmbience(track, hash = null) {
       group.add(wallMesh);
     }
   } else {
-    // Heuristic (v1): medium-speed corners (0.011 < |κ| ≤ KERB_KAPPA) get
-    // instanced W-profile steel rail where the tire stacks are NOT (stacks
-    // own the tightest corners). One 2.55 m rail per sample (2.5 m spacing →
-    // continuous run) + one post per rail, 10–14 m off the centerline,
-    // following the shoulder slope. Capped at ~380 rails.
     const MED_LO = 0.011;
     const med = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       const ak = Math.abs(kappa[i]);
       med[i] = ak > MED_LO && ak <= KERB_KAPPA ? 1 : 0;
     }
-    // Rails 10–14 m off one segment can clip another part of the loop —
-    // reject against samples more than 14 indices away (own zone excluded).
     const clearOfOtherLoop = (p, i) => {
       for (let k = 0; k < n; k += 2) {
         const raw = Math.abs(k - i);
@@ -580,7 +653,6 @@ export function buildAmbience(track, hash = null) {
     const rails = [];
     for (let i = 0; i < n; i++) {
       if (!med[i]) continue;
-      // skip blips: require ≥5 consecutive medium samples around i
       let runLen = 1;
       for (let d = 1; d < 6 && med[(i + d) % n]; d++) runLen++;
       for (let d = 1; d < 6 && med[(i - d + n) % n]; d++) runLen++;
@@ -590,14 +662,13 @@ export function buildAmbience(track, hash = null) {
       const d = Math.min(14, Math.max(10, half + 4.5));
       const f = frame(i);
       const p = f.c.clone().addScaledVector(f.side, out * d);
-      p.y -= 1.2 * Math.min(1, Math.max(0, (d - half) / 8)); // shoulder drop
+      p.y -= 1.2 * Math.min(1, Math.max(0, (d - half) / 8));
       if (!clearOfOtherLoop(p, i)) continue;
       rails.push({ p, t: f.t, u: f.u, out });
     }
     if (rails.length) {
       const stride = Math.max(1, Math.ceil(rails.length / 380));
       const use = stride > 1 ? rails.filter((_, k) => k % stride === 0) : rails;
-      // W-profile cross-section (y up, z toward the track), extruded along x.
       const prof = [[0.78, 0.0], [0.72, 0.075], [0.655, 0.02], [0.59, 0.075], [0.53, 0.0]];
       const rp = new Float32Array(prof.length * 2 * 3);
       prof.forEach(([y, zz], k) => {
@@ -613,20 +684,22 @@ export function buildAmbience(track, hash = null) {
       railGeo.setIndex(ridx);
       railGeo.computeVertexNormals();
       const railMesh = new THREE.InstancedMesh(railGeo, new THREE.MeshStandardMaterial({
-        color: 0x9ca4ad, metalness: 0.75, roughness: 0.4, side: THREE.DoubleSide }), use.length);
+        color: 0xa4adb8, metalness: 0.82, roughness: 0.32, side: THREE.DoubleSide,
+      }), use.length);
       const postGeo = new THREE.BoxGeometry(0.14, 0.95, 0.1);
-      postGeo.translate(0, 0.32, 0); // sunk slightly, top just under the rail
+      postGeo.translate(0, 0.32, 0);
       const postMesh = new THREE.InstancedMesh(postGeo, new THREE.MeshStandardMaterial({
-        color: 0x565d66, metalness: 0.4, roughness: 0.6 }), use.length);
+        color: 0x565d66, metalness: 0.45, roughness: 0.55,
+      }), use.length);
       const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), one = new THREE.Vector3(1, 1, 1);
       const x = new THREE.Vector3(), zed = new THREE.Vector3(), po = new THREE.Vector3();
       use.forEach((st, k) => {
-        x.copy(st.t).multiplyScalar(-st.out); // right-handed: x×u = out·side
+        x.copy(st.t).multiplyScalar(-st.out);
         zed.crossVectors(x, st.u);
         q.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, st.u, zed));
         m4.compose(st.p, q, one);
         railMesh.setMatrixAt(k, m4);
-        po.copy(st.p).addScaledVector(zed, -0.06); // post tucked behind rail
+        po.copy(st.p).addScaledVector(zed, -0.06);
         m4.compose(po, q, one);
         postMesh.setMatrixAt(k, m4);
       });
@@ -634,69 +707,145 @@ export function buildAmbience(track, hash = null) {
     }
   }
 
-  // ------------------------------------------- start/finish gantry (sample 0)
+  // ------------------------------------------- start/finish gantry + 5-light FIA start rig
+  const startLightMats = [];
   {
     const f = frame(0);
     const gantry = new THREE.Group();
     gantry.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(f.side, f.u, f.t));
     gantry.position.copy(f.c);
-    const dark = new THREE.MeshLambertMaterial({ color: 0x1b2129 });
-    const postX = track.width[0] / 2 + 1.5;
+    const steel = new THREE.MeshStandardMaterial({ color: 0x1e242d, metalness: 0.65, roughness: 0.38 });
+    const postX = track.width[0] / 2 + 1.65;
     for (const s of [-1, 1]) {
-      const post = new THREE.Mesh(new THREE.BoxGeometry(0.35, 5.4, 0.35), dark);
-      post.position.set(s * postX, 2.7, 0);
+      const post = new THREE.Mesh(new THREE.BoxGeometry(0.42, 5.8, 0.48), steel);
+      post.position.set(s * postX, 2.9, 0);
       gantry.add(post);
+      // Concrete plinth base
+      const plinth = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.8, 0.85),
+        new THREE.MeshStandardMaterial({ color: 0x626973, roughness: 0.85 }));
+      plinth.position.set(s * postX, 0.3, 0);
+      gantry.add(plinth);
     }
-    const beam = new THREE.Mesh(new THREE.BoxGeometry(2 * postX + 0.35, 0.5, 0.5), dark);
-    beam.position.set(0, 5.55, 0);
+    const beam = new THREE.Mesh(new THREE.BoxGeometry(2 * postX + 0.5, 0.55, 0.6), steel);
+    beam.position.set(0, 5.85, 0);
     gantry.add(beam);
-    // Emissive strip + banner — glowMaterials so night mode can crank them.
-    const stripMat = new THREE.MeshLambertMaterial({
-      color: 0x0c0f14, emissive: 0xfff0c8, emissiveIntensity: 0.6 });
-    const strip = new THREE.Mesh(new THREE.BoxGeometry(2 * postX, 0.09, 0.09), stripMat);
-    strip.position.set(0, 5.26, 0);
-    gantry.add(strip);
-    const bannerMat = new THREE.MeshLambertMaterial({
-      color: 0x0e1522, emissive: 0x8fd3ff, emissiveIntensity: 0.5 });
-    const banner = new THREE.Mesh(new THREE.BoxGeometry(3.2, 1.1, 0.12), bannerMat);
-    banner.position.set(0, 4.7, 0);
+
+    // Overhead timing bridge banner (textured)
+    const bannerTex = gantryBannerTexture();
+    const bannerMat = new THREE.MeshStandardMaterial({
+      map: bannerTex, emissiveMap: bannerTex, emissive: 0xffffff, emissiveIntensity: 0.55,
+      roughness: 0.4, metalness: 0.1,
+    });
+    const banner = new THREE.Mesh(new THREE.BoxGeometry(6.2, 1.35, 0.24), bannerMat);
+    banner.position.set(0, 5.85, -0.22);
     gantry.add(banner);
+
+    // Underside warm floodlight strip
+    const stripMat = new THREE.MeshStandardMaterial({
+      color: 0x0c0f14, emissive: 0xfff0c8, emissiveIntensity: 0.65, roughness: 0.3,
+    });
+    const strip = new THREE.Mesh(new THREE.BoxGeometry(2 * postX - 0.6, 0.08, 0.12), stripMat);
+    strip.position.set(0, 5.54, 0);
+    gantry.add(strip);
     glowMaterials.push(stripMat, bannerMat);
+
+    // 5 FIA start-light pods suspended beneath the bridge facing approaching cars (-Z)
+    const podHousing = new THREE.Mesh(new THREE.BoxGeometry(3.5, 0.48, 0.22), steel);
+    podHousing.position.set(0, 4.78, -0.35);
+    gantry.add(podHousing);
+    const podGeo = new THREE.CircleGeometry(0.15, 16);
+    for (let k = 0; k < 5; k++) {
+      const lm = new THREE.MeshStandardMaterial({
+        color: 0x1a0808, emissive: 0xff2218, emissiveIntensity: 0.08, roughness: 0.2, metalness: 0.1,
+      });
+      const lamp = new THREE.Mesh(podGeo, lm);
+      lamp.position.set((k - 2) * 0.62, 4.78, -0.465);
+      lamp.rotation.y = Math.PI; // face approaching driver (-Z)
+      gantry.add(lamp);
+      startLightMats.push(lm);
+    }
     group.add(gantry);
   }
 
-  // ------------------------------------------- braking marker boards
-  // 150/100/50 m (60/40/20 samples @ 2.5 m) before the tightest corner, on
-  // the corner's outside — that's the braking-zone side. MeshBasicMaterial so
-  // they stay readable at night. Stripes count down 3 → 2 → 1.
-  {
-    let maxIdx = 0;
-    for (let i = 1; i < n; i++) if (Math.abs(kappa[i]) > Math.abs(kappa[maxIdx])) maxIdx = i;
-    const out = -insideSign(maxIdx);
-    const boardMat = new THREE.MeshBasicMaterial({ color: 0xf2f4f7 });
-    const barMat = new THREE.MeshBasicMaterial({ color: 0xd23b2f });
-    const postMat = new THREE.MeshLambertMaterial({ color: 0x1b2129 });
-    [[60, 3], [40, 2], [20, 1]].forEach(([back, bars]) => {
-      const bi = (maxIdx - back + n) % n;
-      const f = frame(bi);
-      const board = new THREE.Group();
-      board.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(f.side, f.u, f.t));
-      board.position.copy(f.c).addScaledVector(f.side, out * (track.width[bi] / 2 + 3));
-      const post = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.0, 0.08), postMat);
-      post.position.y = 0.5;
-      board.add(post);
-      const face = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.7, 0.06), boardMat);
-      face.position.y = 1.35;
-      board.add(face);
-      for (let k = 0; k < bars; k++) {
-        const bar = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.56, 0.02), barMat);
-        // Cars travel toward +tangent (increasing sample index), so the
-        // legible face points back down the track (local −z).
-        bar.position.set((k - (bars - 1) / 2) * 0.28, 1.35, -0.045);
-        board.add(bar);
+  /** Sync 5 FIA start gantry pods with countdown: litCount 0..5 red, or isGo = green flash. */
+  group.userData.setStartLights = (litCount, isGo = false) => {
+    for (let k = 0; k < startLightMats.length; k++) {
+      const m = startLightMats[k];
+      if (isGo) {
+        m.emissive.setHex(0x22e078);
+        m.emissiveIntensity = 3.2;
+      } else if (k < litCount) {
+        m.emissive.setHex(0xff241a);
+        m.emissiveIntensity = 3.6;
+      } else {
+        m.emissive.setHex(0x330808);
+        m.emissiveIntensity = 0.06;
       }
-      group.add(board);
-    });
+    }
+  };
+
+  // ------------------------------------------- braking boards (top 4 heavy corners) + apex chevrons
+  {
+    const tex150 = brakeBoardTexture(150, 3);
+    const tex100 = brakeBoardTexture(100, 2);
+    const tex50 = brakeBoardTexture(50, 1);
+    const boardMats = [tex150, tex100, tex50].map((tex) => new THREE.MeshBasicMaterial({ map: tex }));
+    const backMat = new THREE.MeshStandardMaterial({ color: 0x1e232b, roughness: 0.7 });
+    const postMat = new THREE.MeshStandardMaterial({ color: 0x202630, roughness: 0.6, metalness: 0.5 });
+
+    // Pick up to 4 well-separated heavy braking zones
+    const chosenZones = [];
+    for (const z of zones) {
+      if (chosenZones.length >= 4) break;
+      const farEnough = chosenZones.every((oz) => {
+        const d = Math.abs(z.start - oz.start);
+        return Math.min(d, n - d) > 55;
+      });
+      if (farEnough) chosenZones.push(z);
+    }
+
+    for (const z of chosenZones) {
+      const out = -insideSign(z.peakIdx);
+      const specs = [[60, boardMats[0]], [40, boardMats[1]], [20, boardMats[2]]];
+      for (const [back, faceMat] of specs) {
+        const bi = (z.start - back + n) % n;
+        // Skip placing a board inside another tight turn
+        if (Math.abs(kappa[bi]) > 0.018) continue;
+        const f = frame(bi);
+        const pos = f.c.clone().addScaledVector(f.side, out * (track.width[bi] / 2 + 2.8));
+        const board = new THREE.Group();
+        board.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(f.side, f.u, f.t));
+        board.position.copy(pos);
+        const post = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.05, 0.08), postMat);
+        post.position.y = 0.52;
+        board.add(post);
+        // Box faces: +x,-x,+y,-y,+z,-z — local -z faces approaching cars
+        const face = new THREE.Mesh(new THREE.BoxGeometry(1.18, 0.82, 0.06), [
+          backMat, backMat, backMat, backMat, backMat, faceMat,
+        ]);
+        face.position.y = 1.42;
+        board.add(face);
+        group.add(board);
+      }
+
+      // Apex chevron sightline board on the outside of each signature corner
+      const fApex = frame(z.peakIdx);
+      const cTex = chevronTexture(insideSign(z.peakIdx));
+      const cFaceMat = new THREE.MeshBasicMaterial({ map: cTex });
+      const chev = new THREE.Group();
+      chev.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(fApex.side, fApex.u, fApex.t));
+      chev.position.copy(fApex.c).addScaledVector(fApex.side, out * (track.width[z.peakIdx] / 2 + 3.6));
+      const cPostL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.1, 0.08), postMat);
+      cPostL.position.set(-0.75, 0.55, 0);
+      const cPostR = cPostL.clone();
+      cPostR.position.x = 0.75;
+      const cFace = new THREE.Mesh(new THREE.BoxGeometry(2.1, 0.95, 0.08), [
+        backMat, backMat, backMat, backMat, backMat, cFaceMat,
+      ]);
+      cFace.position.y = 1.45;
+      chev.add(cPostL, cPostR, cFace);
+      group.add(chev);
+    }
   }
 
   return group;

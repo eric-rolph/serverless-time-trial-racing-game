@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeSteer } from "../src/heuristics";
+import { analyzeSteer, analyzeTelemetry } from "../src/heuristics";
 
 /** Deterministic LCG so tests never flake. */
 function lcg(seed: number) {
@@ -64,5 +64,53 @@ describe("analyzeSteer", () => {
     const v = analyzeSteer(new Int16Array(500));
     expect(v.skipped).toBe(true);
     expect(v.rejected).toBe(false);
+  });
+});
+
+describe("analyzeTelemetry (multi-channel)", () => {
+  it("passes honest keyboard binary pedals + human steering with zero pedal flags", () => {
+    const steer = humanLikeSteer();
+    const throttle = new Uint16Array(N);
+    const brake = new Uint16Array(N);
+    for (let i = 0; i < N; i++) {
+      throttle[i] = i % 1000 < 700 ? 65535 : 0;
+      brake[i] = i % 1000 >= 750 && i % 1000 < 900 ? 65535 : 0;
+    }
+    const v = analyzeTelemetry(steer, throttle, brake);
+    expect(v.flags).toEqual([]);
+    expect(v.rejected).toBe(false);
+  });
+
+  it("rejects inhuman full-lock macro snaps synchronized with pedal jumps", () => {
+    const steer = humanLikeSteer();
+    const throttle = new Uint16Array(N);
+    const brake = new Uint16Array(N);
+    throttle.fill(65535);
+    // Inject 14 frame-exact simultaneous lock-to-lock + brake macro snaps
+    for (let k = 1; k <= 14; k++) {
+      const idx = k * 500;
+      steer[idx - 1] = -25000;
+      steer[idx] = 25000;
+      throttle[idx - 1] = 65535;
+      throttle[idx] = 0;
+      brake[idx - 1] = 0;
+      brake[idx] = 65535;
+    }
+    const v = analyzeTelemetry(steer, throttle, brake);
+    expect(v.flags).toContain("inhuman_slew");
+    expect(v.flags).toContain("sync_macro");
+    expect(v.rejected).toBe(true);
+  });
+
+  it("flags scripted intermediate pedal staircase macros", () => {
+    const steer = humanLikeSteer();
+    const throttle = new Uint16Array(N);
+    const brake = new Uint16Array(N);
+    const levels = [16000, 32000, 48000, 24000];
+    for (let i = 0; i < N; i++) {
+      throttle[i] = levels[Math.floor(i / 400) % levels.length];
+    }
+    const v = analyzeTelemetry(steer, throttle, brake);
+    expect(v.flags).toContain("pedal_staircase");
   });
 });

@@ -1148,15 +1148,272 @@ def generate_circuit1() -> dict:
     return track
 
 
+# --- seeded v2 procedural circuit composer -----------------------------------
+# Uses the full clothoid archetype composer + POCS loop closure + C1 elevation
+# anchors + v2 fold-capped terrain aprons + collision props. Every accepted
+# candidate passes lint, grade, self-intersection, mesh integrity (all upward
+# normals, zero degenerate tris), and prop clearance gates deterministically.
+
+def _verify_v2_gates(track: dict) -> bool:
+    """Fast deterministic gate matching check_apron.py invariants so every
+    seeded v2 circuit is guaranteed apron-clean and prop-clear."""
+    n = track["sample_count"]
+    verts = np.array(track["terrain"]["vertices"])
+    tris = np.array(track["terrain"]["triangles"])
+    ta, tb, tc = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+    nrm = np.cross(tb - ta, tc - ta)
+    area2 = np.linalg.norm(nrm, axis=1)
+    if int((area2 < 1e-9).sum()) > 0:
+        return False
+    if float((nrm[:, 1] / np.maximum(area2, 1e-12)).min()) <= 0.0:
+        return False
+
+    pos = np.array(track["centerline"]["pos"])
+    width = np.array(track["centerline"]["width"])
+    props = track.get("props", [])
+    if props:
+        seg_a = pos[:, [0, 2]]
+        seg_b = np.roll(pos, -1, axis=0)[:, [0, 2]]
+        seg_v = seg_b - seg_a
+        seg_len2 = np.maximum((seg_v ** 2).sum(1), 1e-12)
+        w_a, w_b = width, np.roll(width, -1)
+        for p in props:
+            px, _, pz = p["pos"]
+            hx, _, hz = p["half"]
+            cy, sy = math.cos(p["yaw"]), math.sin(p["yaw"])
+            for sx in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    dxl, dzl = sx * hx, sz * hz
+                    cx = px + dxl * cy + dzl * sy
+                    cz = pz - dxl * sy + dzl * cy
+                    rel = np.array([cx, cz]) - seg_a
+                    tt = np.clip((rel * seg_v).sum(1) / seg_len2, 0.0, 1.0)
+                    closest = seg_a + seg_v * tt[:, None]
+                    dist = np.hypot(cx - closest[:, 0], cz - closest[:, 1])
+                    wq = (w_a * (1.0 - tt) + w_b * tt) * 0.5
+                    if float((dist - wq).min()) < 1.2:
+                        return False
+    return True
+
+
+def _seeded_elevation(sections, rng: np.random.Generator):
+    """Seeded rolling circuit elevation profile with a dramatic corkscrew drop."""
+    S = {sec["name"]: sec for sec in sections}
+
+    def mid(name, f=0.5):
+        sec = S[name]
+        return sec["s0"] * (1.0 - f) + sec["s1"] * f
+
+    crest = float(rng.uniform(4.2, 6.4))
+    drop = float(rng.uniform(8.0, 11.8))
+    valley = crest - drop
+    roll_hi = float(rng.uniform(1.8, 4.2))
+    roll_lo = float(rng.uniform(-2.4, -0.4))
+
+    a = [
+        (0.0, 0.0),
+        (mid("main_b", 0.6), float(rng.uniform(0.3, 1.4))),
+        (S["chicane"]["s0"], float(rng.uniform(0.2, 1.2))),
+        (S["chicane"]["s1"], float(rng.uniform(0.5, 1.6))),
+        (mid("esses", 0.5), roll_hi * 0.65),
+        (S["esses"]["s1"], roll_hi * 0.85),
+        (mid("double_apex", 0.6), roll_hi),
+        (S["dec_radius"]["s0"], roll_hi * 0.65),
+        (S["dec_radius"]["s1"], float(rng.uniform(0.0, 1.0))),
+        (mid("brake", 0.6), roll_lo * 0.4),
+        (S["hairpin"]["s0"], roll_lo),
+        (S["hairpin"]["s1"], roll_lo),
+        (S["inc_radius"]["s1"], roll_lo * 0.4),
+        (mid("back", 0.5), crest * 0.3),
+        (S["back"]["s1"] - 80.0, crest * 0.68),
+    ]
+    t0 = S["corkscrew"]["s0"]
+    a.append((t0, crest))
+    a.append((t0 + 28.0, crest - drop * 0.06))
+    a.append((t0 + 58.0, crest - drop * 0.26))
+    a.append((t0 + 88.0, crest - drop * 0.46))
+    a.append((t0 + 118.0, crest - drop * 0.66))
+    a.append((t0 + 150.0, crest - drop * 0.84))
+    settle_end = min(t0 + 240.0, S["kink"]["s0"] - 5.0)
+    a.append((min(t0 + 190.0, settle_end - 25.0), crest - drop * 0.94))
+    a.append((settle_end, valley))
+    a.append((S["kink"]["s1"], valley * 0.85))
+    a.append((mid("run_home", 0.7), valley * 0.70))
+    a.append((S["g90"]["s1"], valley * 0.48))
+    return a
+
+
+def generate_seeded_circuit(seed: int) -> dict:
+    """Deterministically compose a fresh v2 apron+prop circuit from `seed`.
+
+    Varies handness (CW/CCW mirror), corner radii/angles, esses sweep rhythm,
+    spiral ratios, straight preferences, and rolling elevation/corkscrew depth
+    while enforcing exact 360-degree heading closure, POCS loop closure,
+    clothoid curvature continuity, lint/grade/self-intersection gates, and full
+    v2 apron + prop clearance verification.
+    """
+    rng = np.random.default_rng(int(seed) & 0xFFFFFFFFFFFFFFFF)
+    bounds = {
+        "main": (450.0, 740.0),
+        "brake": (175.0, 360.0),
+        "back": (320.0, 540.0),
+        "settle": (50.0, 290.0),
+        "run_home": (30.0, 290.0),
+    }
+
+    for attempt in range(64):
+        mirror = int(rng.choice([-1, 1]))
+        chi_dir = int(rng.choice([-1, 1]))
+        chi_r = float(rng.uniform(25.0, 36.0))
+        chi_a = float(rng.uniform(44.0, 58.0))
+        chi_link = float(rng.uniform(10.0, 18.0))
+
+        # Flowing alternating esses: 4 legs with seeded sweep radii & angles
+        es_a1 = float(rng.uniform(34.0, 48.0))
+        es_a2 = float(rng.uniform(18.0, 30.0))
+        es_net = 2.0 * (es_a1 - es_a2)
+        esses_legs = [
+            (+1, float(rng.uniform(98.0, 128.0)), es_a1),
+            (-1, float(rng.uniform(105.0, 138.0)), es_a2),
+            (+1, float(rng.uniform(96.0, 126.0)), es_a1),
+            (-1, float(rng.uniform(102.0, 134.0)), es_a2),
+        ]
+
+        da_a = float(rng.uniform(138.0, 162.0))
+        da_rel = float(rng.uniform(110.0, 145.0))
+        dr_a = float(rng.uniform(128.0, 152.0))
+        dr_rin = float(rng.uniform(78.0, 102.0))
+        dr_rout = float(rng.uniform(30.0, 42.0))
+        hp_r = float(rng.uniform(16.5, 22.0))
+        ir_a = float(rng.uniform(112.0, 136.0))
+        ir_rin = float(rng.uniform(34.0, 48.0))
+        ir_rout = float(rng.uniform(105.0, 135.0))
+        ck_a1 = float(rng.uniform(46.0, 60.0))
+        ck_a2 = float(rng.uniform(38.0, 50.0))
+        ck_r = float(rng.uniform(28.0, 38.0))
+        kink_a = float(rng.uniform(28.0, 44.0))
+        kink_r = float(rng.uniform(76.0, 105.0))
+        g90_r = float(rng.uniform(46.0, 68.0))
+
+        # Exact +360 deg heading closure: assign residual angle across glue1 + glue2
+        fixed_sum = (
+            es_net - da_a + dr_a + 180.0 - ir_a + (ck_a1 - ck_a2) + kink_a + 90.0
+        )
+        glue_total = 360.0 - fixed_sum
+        if not (90.0 <= glue_total <= 200.0):
+            continue
+        split = float(rng.uniform(0.36, 0.52))
+        g1_a = glue_total * split
+        g2_a = glue_total - g1_a
+
+        P = {
+            "seed": int(seed),
+            "chicane": {"first": chi_dir, "radius": chi_r, "angle": chi_a, "link": chi_link},
+            "glue1": {"direction": +1, "radius": float(rng.uniform(76.0, 104.0)), "angle": g1_a},
+            "esses_legs": esses_legs,
+            "glue2": {"direction": +1, "radius": float(rng.uniform(68.0, 96.0)), "angle": g2_a},
+            "da": {"direction": -1, "angle": da_a, "r_relief": da_rel},
+            "dr": {"direction": +1, "angle": dr_a, "r_in": dr_rin, "r_out": dr_rout},
+            "hairpin": {"direction": +1, "radius": hp_r},
+            "ir": {"direction": -1, "angle": ir_a, "r_in": ir_rin, "r_out": ir_rout},
+            "corkscrew": {"first": +1, "a1": ck_a1, "a2": ck_a2, "radius": ck_r},
+            "kink": {"direction": +1, "angle": kink_a, "radius": kink_r},
+            "g90": {"direction": +1, "radius": g90_r},
+            "straights": {
+                "main": float(rng.uniform(520.0, 680.0)),
+                "brake": float(rng.uniform(210.0, 300.0)),
+                "back": float(rng.uniform(370.0, 480.0)),
+                "link1": float(rng.uniform(16.0, 28.0)),
+                "link_da": float(rng.uniform(14.0, 24.0)),
+                "link_hp": float(rng.uniform(16.0, 26.0)),
+                "settle": float(rng.uniform(75.0, 145.0)),
+                "run_home": float(rng.uniform(45.0, 110.0)),
+            },
+        }
+
+        try:
+            L, dense, _end, sections = close_loop(
+                lambda L_cur: circuit1_layout(P, L_cur),
+                dict(P["straights"]),
+                bounds,
+                step=1.0,
+                adjustable=CIRCUIT1_ADJUSTABLE,
+            )
+        except ValueError:
+            continue
+
+        # Optional CW/CCW mirror across Z=0 (and flip prop lateral side signs cleanly)
+        if mirror < 0:
+            dense = dense.copy()
+            dense[:, 1] = -dense[:, 1]
+            for sec in sections:
+                for rule in sec.get("props", []):
+                    rule["side"] = -float(rule["side"])
+
+        pos = resample_by_arclength(
+            np.stack([dense[:, 0], np.zeros(len(dense)), dense[:, 1]], axis=1),
+            SAMPLE_SPACING_M,
+        )
+        n = len(pos)
+        total_len = sections[-1]["s1"]
+
+        # Lint gate
+        seg_v = np.roll(pos, -1, axis=0) - pos
+        seg_v /= np.linalg.norm(seg_v, axis=1, keepdims=True)
+        turn = np.degrees(np.arccos(np.clip((seg_v * np.roll(seg_v, 1, axis=0)).sum(1), -1.0, 1.0)))
+        if turn.max() > 9.0:
+            continue
+
+        # Seeded elevation + grade gate
+        s_samples = np.arange(n) * (total_len / n)
+        elev = elevation_from_anchors(_seeded_elevation(sections, rng), total_len, s_samples)
+        pos[:, 1] = elev
+
+        grade = np.abs(np.diff(elev, append=elev[:1])) / (total_len / n)
+        cs = next(s for s in sections if s["name"] == "corkscrew")
+        ck0 = int((cs["s0"] - 30) / (total_len / n))
+        ck1 = int((cs["s1"] + 260) / (total_len / n))
+        in_ck = np.zeros(n, dtype=bool)
+        in_ck[max(0, ck0):min(ck1, n)] = True
+        g_out = float(grade[~in_ck].max())
+        g_ck = float(grade[in_ck].max()) if in_ck.any() else 0.0
+        if g_out > 0.045 or g_ck > 0.095:
+            continue
+
+        track = assemble_circuit(pos, sections, int(seed))
+        width = np.array(track["centerline"]["width"])
+        if self_intersects(pos, width):
+            continue
+        if not _verify_v2_gates(track):
+            continue
+
+        track["attempt"] = attempt
+        track["circuit"] = {
+            "name": f"seeded-{seed}",
+            "mirrored": mirror < 0,
+            "straights_solved": {k: round(v, 2) for k, v in L.items()},
+            "lint_worst_turn_deg": float(turn.max()),
+            "grade_max_outside_corkscrew": g_out,
+            "grade_max_corkscrew": g_ck,
+        }
+        return track
+
+    raise SystemExit(f"no valid v2 seeded circuit found for seed {seed}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--circuit", type=str, default=None, choices=["circuit1"])
+    ap.add_argument("--circuit", type=str, default=None, choices=["circuit1", "seeded"])
     ap.add_argument("--out-dir", type=pathlib.Path, required=True)
     args = ap.parse_args()
 
     if args.circuit == "circuit1":
         track = generate_circuit1()
+    elif args.circuit == "seeded":
+        if args.seed is None:
+            raise SystemExit("--seed required with --circuit seeded")
+        track = generate_seeded_circuit(args.seed)
     else:
         if args.seed is None:
             raise SystemExit("--seed required unless --circuit is given")

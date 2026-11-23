@@ -41,25 +41,22 @@ jobs:
           python-version: "3.12"
       - run: pip install -r trackgen/requirements.txt
 
-      # INTERIM (until the seeded circuit composer lands): the v1 --seed path
-      # generates cliff-era tracks with no aprons and no prop colliders
-      # (TERRAIN.md — aprons/props live only in the v2 circuit path). Rotating
-      # onto one would regress the live experience, so the weekly job deploys
-      # the deterministic circuit build instead: byte-identical output means
-      # an identical track hash, so re-deploys are no-ops for the leaderboard.
-      # The seed plumbing (salt, retry, week-$SEED dirs) is kept so the seeded
-      # circuit generator can drop back in with a one-line change.
-      - name: Generate track (v2 circuit)
+      # Seeded v2 procedural circuit composer: every weekly seed produces a
+      # deterministic clothoid circuit with C1 cosine terrain aprons, collision
+      # props (tire barriers + Armco), elevation/grade gates, and verified
+      # apron/prop clearances via check_apron.py.
+      - name: Generate track (v2 seeded circuit)
         id: gen
         run: |
           BASE=${{ steps.seed.outputs.seed }}
-          echo "::group::Generating circuit build for week seed $BASE"
-          python trackgen/generate_track.py --circuit circuit1 \
+          echo "::group::Generating seeded v2 circuit for week seed $BASE"
+          python trackgen/generate_track.py --circuit seeded --seed "$BASE" \
             --out-dir "assets/tracks/week-$BASE"
+          python trackgen/check_apron.py "assets/tracks/week-$BASE/track.json"
           python trackgen/pack_track.py "assets/tracks/week-$BASE/track.json"
           echo "::endgroup::"
           echo "seed=$BASE" >> "$GITHUB_OUTPUT"
-          echo "Generated circuit track for week seed $BASE"
+          echo "Generated seeded v2 circuit track for week seed $BASE"
 
       - uses: mymindstorm/setup-emsdk@v14
         with:

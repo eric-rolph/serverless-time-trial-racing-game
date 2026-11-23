@@ -10,7 +10,7 @@ import SIM_WASM from "../assets/sim.wasm";
 import SIM_WASM_BYTES from "../assets/sim_wasm.bin";
 import TRACK_BIN from "../assets/track.bin";
 
-import { analyzeSteer } from "./heuristics";
+import { analyzeTelemetry } from "./heuristics";
 import { recordLap, topEntries } from "./leaderboard";
 import {
   b64decode,
@@ -224,8 +224,8 @@ async function processLog(
   }
   ws.send(JSON.stringify({ type: "ack", stage: "verified" }));
 
-  // 2. Telemetry heuristics ----------------------------------------------------
-  const verdict = analyzeSteer(log.steer);
+  // 2. Telemetry heuristics (multi-channel: steer + throttle + brake) ----------
+  const verdict = analyzeTelemetry(log.steer, log.throttle, log.brake);
   if (verdict.rejected) {
     return done({
       type: "result",

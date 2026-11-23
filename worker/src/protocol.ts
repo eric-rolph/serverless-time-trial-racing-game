@@ -11,8 +11,12 @@ export interface LapLog {
   tickRate: number;
   trackHash: bigint;
   tickCount: number;
-  /** i16 steer values, one per tick (heuristics operate on this channel) */
+  /** i16 steer values, one per tick (heuristics operate across steer/pedals) */
   steer: Int16Array;
+  /** u16 throttle values, one per tick */
+  throttle: Uint16Array;
+  /** u16 brake values, one per tick */
+  brake: Uint16Array;
   /** byte offset of the 8·N tick-record block inside the raw buffer */
   ticksByteOffset: number;
   finalStateHash: bigint;
@@ -43,9 +47,14 @@ export function parseLapLog(data: ArrayBuffer | ArrayBufferView): LapLog {
     throw new LogFormatError(`length ${buf.byteLength} != expected ${expected}`);
 
   const steer = new Int16Array(tickCount);
+  const throttle = new Uint16Array(tickCount);
+  const brake = new Uint16Array(tickCount);
   for (let i = 0; i < tickCount; i++) {
-    steer[i] = dv.getInt16(20 + 8 * i, true);
-    const flags = dv.getUint16(20 + 8 * i + 6, true);
+    const o = 20 + 8 * i;
+    steer[i] = dv.getInt16(o, true);
+    throttle[i] = dv.getUint16(o + 2, true);
+    brake[i] = dv.getUint16(o + 4, true);
+    const flags = dv.getUint16(o + 6, true);
     // CONTRACTS §2: bit 0 = handbrake, bit 1 = shift up, bit 2 = shift down
     // (drivetrain wave, DRIVETRAIN.md §1); bits 3–15 stay reserved (must be 0).
     if ((flags & ~0x0007) !== 0) throw new LogFormatError("reserved flag bits set");
@@ -56,6 +65,8 @@ export function parseLapLog(data: ArrayBuffer | ArrayBufferView): LapLog {
     trackHash,
     tickCount,
     steer,
+    throttle,
+    brake,
     ticksByteOffset: 20,
     finalStateHash: dv.getBigUint64(20 + 8 * tickCount, true),
     claimedLapTicks: dv.getUint32(28 + 8 * tickCount, true),

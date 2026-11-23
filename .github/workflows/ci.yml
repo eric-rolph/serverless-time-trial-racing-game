@@ -84,10 +84,18 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r trackgen/requirements.txt
-      - name: Same seed twice => identical binary
+      - name: Circuit1 & seeded v2 determinism + apron gates
         run: |
-          python trackgen/generate_track.py --seed 12345 --out-dir /tmp/a
-          python trackgen/generate_track.py --seed 12345 --out-dir /tmp/b
-          python trackgen/pack_track.py /tmp/a/track.json
-          python trackgen/pack_track.py /tmp/b/track.json
-          cmp /tmp/a/track.bin /tmp/b/track.bin
+          python trackgen/generate_track.py --circuit circuit1 --out-dir /tmp/c1_a
+          python trackgen/generate_track.py --circuit circuit1 --out-dir /tmp/c1_b
+          python trackgen/check_apron.py /tmp/c1_a/track.json
+          python trackgen/pack_track.py /tmp/c1_a/track.json
+          python trackgen/pack_track.py /tmp/c1_b/track.json
+          cmp /tmp/c1_a/track.bin /tmp/c1_b/track.bin
+
+          python trackgen/generate_track.py --circuit seeded --seed 902630 --out-dir /tmp/s_a
+          python trackgen/generate_track.py --circuit seeded --seed 902630 --out-dir /tmp/s_b
+          python trackgen/check_apron.py /tmp/s_a/track.json
+          python trackgen/pack_track.py /tmp/s_a/track.json
+          python trackgen/pack_track.py /tmp/s_b/track.json
+          cmp /tmp/s_a/track.bin /tmp/s_b/track.bin

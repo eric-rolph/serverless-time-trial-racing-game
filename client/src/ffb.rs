@@ -94,9 +94,9 @@ pub const DEFAULT_FFB_TOML: &str = r#"# sttr-client force feedback (docs/FFB.md 
 [ffb]
 enabled = true
 
-# Peak torque your wheel base can produce, in Nm (Fanatec CSL DD = 8.0).
-# Rack torque above this clips at full force.
-max_torque_nm = 8.0
+# Peak torque your wheel base can produce, in Nm (brush model peaks ~16-18 Nm).
+# Rack torque above this soft-limits cleanly toward full force.
+max_torque_nm = 18.0
 
 # Overall strength multiplier applied before clipping.
 gain = 0.85
@@ -254,6 +254,27 @@ impl RateLimiter {
     }
 }
 
+/// Smooth standstill attenuation (0 below 0.8 m/s -> 1 above 4.0 m/s) so
+/// direct-drive wheel bases stay calm when parked on the grid.
+pub fn standstill_scale(speed_mps: f32, enabled: bool) -> f32 {
+    if !enabled || !speed_mps.is_finite() {
+        return 1.0;
+    }
+    ((speed_mps.abs() - 0.8) / 3.2).clamp(0.0, 1.0)
+}
+
+/// Smooth soft-knee saturation above 85% normalized torque so high-load
+/// cornering preserves subtle kerb/rumble detail instead of hard square-clipping.
+pub fn soft_limit(norm: f32) -> f32 {
+    let a = norm.abs();
+    if a <= 0.85 {
+        return norm;
+    }
+    let excess = (a - 0.85) / 0.15;
+    let shaped = 0.85 + 0.15 * excess.tanh();
+    norm.signum() * shaped.min(1.0)
+}
+
 /// Map filtered rack torque (Nm) to a DirectInput constant-force magnitude in
 /// [-10000, 10000]: normalize by gain / max_torque_nm, apply the min_force
 /// floor (deadzone crossing), then invert. Pure function — see unit tests.
@@ -262,6 +283,25 @@ pub fn torque_to_magnitude(torque_nm: f32, cfg: &FfbConfig) -> i32 {
         return 0;
     }
     let mut n = torque_nm * cfg.gain / cfg.max_torque_nm;
+    if cfg.invert {
+        n = -n;
+    }
+    let a = n.abs();
+    if a < MIN_FORCE_NOISE_EPS {
+        return 0;
+    }
+    let shaped = (cfg.min_force + a * (1.0 - cfg.min_force)).clamp(0.0, 1.0);
+    (n.signum() * shaped * DI_MAX_MAGNITUDE).round() as i32
+}
+
+/// SOTA shaped FFB mapping with standstill attenuation and soft-knee headroom
+/// limiting used by the live race loop.
+pub fn shaped_torque_to_magnitude(torque_nm: f32, speed_mps: f32, cfg: &FfbConfig) -> i32 {
+    if !torque_nm.is_finite() || cfg.max_torque_nm <= 0.0 {
+        return 0;
+    }
+    let scaled = torque_nm * standstill_scale(speed_mps, cfg.standstill_reduction);
+    let mut n = soft_limit(scaled * cfg.gain / cfg.max_torque_nm);
     if cfg.invert {
         n = -n;
     }
@@ -330,13 +370,20 @@ impl Ffb {
 
     /// Feed one render frame's rack torque (Nm) through the filter chain and
     /// out to the wheel. `dt` = seconds since the previous render frame.
+    #[allow(dead_code)]
     pub fn frame(&mut self, torque_nm: f32, dt: f32) {
+        self.frame_with_speed(torque_nm, 10.0, dt);
+    }
+
+    /// Feed rack torque (Nm) + live car speed (m/s) for standstill attenuation
+    /// and soft-knee non-clipping DirectInput output.
+    pub fn frame_with_speed(&mut self, torque_nm: f32, speed_mps: f32, dt: f32) {
         let filtered = self.filter.step(torque_nm, self.cfg.smoothing_hz, dt);
         let Some(device) = self.device.as_mut() else { return };
         if !self.limiter.ready(Instant::now()) {
             return;
         }
-        let magnitude = torque_to_magnitude(filtered, &self.cfg);
+        let magnitude = shaped_torque_to_magnitude(filtered, speed_mps, &self.cfg);
         if magnitude == self.last_magnitude && self.link_ok {
             return; // nothing new for the wheel; skip the USB round-trip
         }
@@ -657,7 +704,7 @@ mod tests {
 
     #[test]
     fn docs_ffb_md_example_parses() {
-        // The exact block from docs/FFB.md §3.
+        // The exact block from docs/FFB.md §3 (8 Nm CSL DD override).
         let cfg = FfbConfig::from_toml_str(
             r#"
 [ffb]
@@ -676,7 +723,7 @@ update_hz            = 400
 "#,
         )
         .unwrap();
-        assert_eq!(cfg, FfbConfig::default());
+        assert_eq!(cfg, FfbConfig { max_torque_nm: 8.0, ..FfbConfig::default() });
     }
 
     #[test]
@@ -684,7 +731,7 @@ update_hz            = 400
         let cfg = FfbConfig::from_toml_str("[ffb]\nenabled = false\ngain = 1.0\n").unwrap();
         assert!(!cfg.enabled);
         assert_eq!(cfg.gain, 1.0);
-        assert_eq!(cfg.max_torque_nm, 8.0); // untouched fields keep defaults
+        assert_eq!(cfg.max_torque_nm, 18.0); // untouched fields keep defaults
 
         let cfg = FfbConfig::from_toml_str("").unwrap();
         assert_eq!(cfg, FfbConfig::default());
@@ -714,7 +761,22 @@ update_hz            = 400
     // -- torque -> magnitude mapping -----------------------------------------
 
     fn cfg() -> FfbConfig {
-        FfbConfig::default() // max 8 Nm, gain 0.85, min_force 0.02, no invert
+        FfbConfig { max_torque_nm: 8.0, ..FfbConfig::default() } // 8 Nm reference for math checks
+    }
+
+    #[test]
+    fn standstill_reduction_attenuates_when_stopped() {
+        let c = cfg();
+        assert_eq!(shaped_torque_to_magnitude(6.0, 0.0, &c), 0);
+        assert!(shaped_torque_to_magnitude(6.0, 10.0, &c) > 5000);
+    }
+
+    #[test]
+    fn soft_limiter_preserves_headroom_and_stays_bounded() {
+        assert!((soft_limit(0.5) - 0.5).abs() < 1e-6);
+        let hi = soft_limit(1.5);
+        assert!(hi > 0.85 && hi < 1.0);
+        assert!((soft_limit(-1.5) + hi).abs() < 1e-6);
     }
 
     #[test]

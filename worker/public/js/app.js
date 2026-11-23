@@ -11,6 +11,8 @@ import { buildCar, buildWheel } from "./car.js";
 import { Crumple } from "./crumple.js";
 import { buildAmbience } from "./ambience.js";
 import { Lighting } from "./lighting.js";
+import { RaceEffects } from "./effects.js";
+import { TelemetryHUD } from "./telemetry.js";
 import { FanatecFFB } from "./ffb.js";
 import { addHidDevices, autoReconnectHid, hidDiagnostics, hidDump, hidVirtualPads, registerHidDevice } from "./hid-input.js";
 
@@ -57,7 +59,8 @@ scene.background = new THREE.Color(0x0e1420); // Lighting owns bg/fog from frame
 scene.fog = new THREE.Fog(0x0e1420, 150, 480);
 const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 800);
 
-scene.add(buildTrackMeshes(track));
+const trackGroup = buildTrackMeshes(track);
+scene.add(trackGroup);
 // Trackside dressing — trees, tire barriers, gantry, brake boards — all
 // seeded from the track hash so placement is deterministic per track.
 const ambience = buildAmbience(track, trackHash);
@@ -78,13 +81,21 @@ for (let i = 0; i < 4; i++) {
   scene.add(holder);
   wheelMeshes.push(holder);
 }
+const effects = new RaceEffects(scene);
 
 // APEX lighting core (cosmetic; auto = local clock; L cycles the five
-// conditions). Owns sky dome + sun disc, the shadow-casting key light,
-// hemisphere fill, per-condition exposure, and the car's night headlights.
+// conditions). Owns sky dome + sun disc, PMREM sky IBL, dynamic wet tarmac,
+// shadow-casting key light, hemisphere fill, exposure, and night headlights.
 // Constructed AFTER every scene mesh (car, wheels, track, ambience) so its
 // one-time shadow cast/receive traversal sees them all.
-const lighting = new Lighting(scene, car, ambience.userData.glowMaterials, renderer, track);
+const lighting = new Lighting(
+  scene,
+  car,
+  ambience.userData.glowMaterials,
+  renderer,
+  track,
+  { asphaltMat: trackGroup.userData.asphaltMat, grassMat: trackGroup.userData.grassMat },
+);
 
 function resize() {
   if (!innerWidth || !innerHeight) return; // mid-layout; the frame guard retries
@@ -195,6 +206,7 @@ autoReconnectHid().then((n) => {
   if (n) $("calMsg").textContent = `${n} WebHID device(s) reconnected — bindings ready`;
 });
 const minimap = new Minimap($("minimap"), track);
+const telemetry = new TelemetryHUD($("telemetryCanvas"));
 const audio = new EngineAudio();
 
 // Tire glyph: the four wheel rects of the car schematic, order FL FR RL RR.
@@ -248,6 +260,10 @@ const CAMERA_NAMES = { chase: "chase", cockpit: "cockpit", bumper: "bumper", tv:
 let cameraMode = "chase";
 let ffb = null;
 let lastThrottle = 0;
+let lastBrake = 0;
+let lastSteer = 0;
+let lastOffTrack = false;
+let goLightUntil = 0;
 let sectorTicks = []; // ticks at S1/S2/S3 boundaries this run
 let prevCpMask = 0;
 let rolloverTicks = 0;
@@ -274,6 +290,13 @@ async function resetRun({ countdownMs: startCountdownMs = 400 } = {}) {
   sim.reset();
   prev = curr = sim.state();
   crumple.reset(); // restore the player car to pristine (undented)
+  effects.reset();
+  telemetry.resetLap();
+  lastBrake = 0;
+  lastSteer = 0;
+  lastOffTrack = false;
+  goLightUntil = 0;
+  ambience.userData.setStartLights?.(0, false);
   impactCooldown = 0;
   prevDamage = 0;  // sim_reset() zeroes kernel damage; rebaseline the delta trigger
   ticks = [];
@@ -284,6 +307,7 @@ async function resetRun({ countdownMs: startCountdownMs = 400 } = {}) {
   prevCpMask = 0;
   deltaPtr = 0;
   $("delta").textContent = "";
+  $("deltaBar").style.display = "none";
   renderSectors([]);
   // Countdown length is client theater: the lap starts at tick 0 from rest
   // either way (no ticks are stepped or logged until it hits zero). Restarts
@@ -339,6 +363,8 @@ addEventListener("keydown", (e) => {
   }
   if (e.code === "KeyM") setStatus(audio.toggleMute() ? "muted" : "sound on");
   if (e.code === "KeyL") setStatus(`lighting: ${lighting.cycle()}`);
+  if (e.code === "KeyT") setStatus(telemetry.toggle() ? "telemetry HUD on" : "telemetry HUD hidden");
+  if (e.code === "KeyX") setStatus(telemetry.exportCSV(trackHashHex) ? "exported lap telemetry CSV" : "drive a lap first to export telemetry");
 });
 addEventListener("pointerdown", (e) => {
   audio.start();
@@ -639,6 +665,7 @@ setInterval(() => { updateResetLabel(); refreshBoard(); }, 60_000);
 
 async function onLapComplete() {
   frozen = true;
+  telemetry.finishLap();
   if (ffb) ffb.update(0, 0.1);
   const lapTicks = sim.lapTimeTicks();
   lastMs = Math.round((lapTicks * 1000) / 400);
@@ -685,6 +712,9 @@ async function onLapComplete() {
 const tmpQa = new THREE.Quaternion(), tmpQb = new THREE.Quaternion();
 const camTarget = new THREE.Vector3(), camPos = new THREE.Vector3(0, 6, -12);
 const _camA = new THREE.Vector3(), _camB = new THREE.Vector3(); // per-frame camera scratch
+const _wheelLocals = [
+  new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(),
+];
 let fov = 62; // per-seat FOV, smoothed toward its target each frame
 
 // TV seat: ~8 fixed trackside tripods — one every S/8 centerline samples,
@@ -769,6 +799,7 @@ function detectImpact(prevS, currS) {
     }
     crumple.applyImpact(_dv, severity);
     audio.impact(severity); // crunch + body thump scaled to the same severity
+    effects.emitImpactSparks(car.position, severity);
     return;
   }
 
@@ -779,6 +810,7 @@ function detectImpact(prevS, currS) {
   const severity = Math.min(1.5, (dv - IMPACT_DV) / IMPACT_SEV_SCALE + 0.25);
   crumple.applyImpact(_dv, severity);
   audio.impact(severity); // crunch + body thump scaled to the same severity
+  effects.emitImpactSparks(car.position, severity);
   impactCooldown = IMPACT_COOLDOWN;
 }
 
@@ -795,6 +827,11 @@ function advance(dtMs) {
     const n = Math.ceil(countdownMs / 1000);
     $("countdown").textContent = countdownMs <= 0 ? "GO" : String(n);
     $("countdown").style.display = "block";
+    // Sync the 5 overhead FIA start-gantry LEDs with the countdown sequence
+    if (countdownMs > 0) {
+      const lit = Math.min(5, Math.max(1, Math.ceil(((3200 - Math.min(3200, countdownMs)) / 3200) * 5)));
+      ambience.userData.setStartLights?.(lit, false);
+    }
     // Countdown beeps track the DISPLAYED number: one short blip per integer
     // (fast 400 ms restarts get exactly one "1" blip), long high blip on GO.
     if (countdownMs > 0 && n !== countdownBeepN) {
@@ -803,6 +840,8 @@ function advance(dtMs) {
     }
     if (countdownMs <= 0) {
       audio.beep(880, 300);
+      ambience.userData.setStartLights?.(5, true);
+      goLightUntil = performance.now() + 1400;
       setStatus("GO — set a time; it will be validated at the edge", "ok");
       clearTimeout(countdownHideTimer);
       countdownHideTimer = setTimeout(() => ($("countdown").style.display = "none"), 700);
@@ -821,8 +860,11 @@ function advance(dtMs) {
     acc -= DT_MS;
     const raw = inputOverride ? inputOverride(curr) : input.sample(DT_MS / 1000);
     lastThrottle = raw.throttle;
+    lastBrake = raw.brake;
+    lastSteer = raw.steer;
     const q = quantize(raw);
     const status = sim.step(q.steer, q.throttle, q.brake, q.flags);
+    lastOffTrack = (status & STATUS.OFF_TRACK) !== 0;
     ticks.push(q);
     prev = curr;
     curr = sim.state();
@@ -902,8 +944,7 @@ function poseGroup(group, prevS, currS, alpha) {
   group.quaternion.slerpQuaternions(tmpQa, tmpQb, alpha);
 }
 
-function frame(now) {
-  requestAnimationFrame(frame);
+function renderFrame(now) {
   ensureCanvasSize(); // heal a 0×0 boot buffer / DPR change (see resize)
   const dtMs = Math.min(now - last, 250); // anti-spiral clamp
   last = now;
@@ -921,40 +962,78 @@ function frame(now) {
   poseGroup(car, prev, curr, alpha);
   if (ghostCar.visible && ghostCurr) poseGroup(ghostCar, ghostPrev, ghostCurr, alpha);
 
+  car.updateMatrixWorld(true);
   for (let i = 0; i < 4; i++) {
     const wp = prev.wheels[i], wc = curr.wheels[i];
     wheelMeshes[i].position.set(lerp(wp.pos[0], wc.pos[0]), lerp(wp.pos[1], wc.pos[1]), lerp(wp.pos[2], wc.pos[2]));
     wheelMeshes[i].quaternion.copy(car.quaternion);
     wheelMeshes[i].rotateY(lerp(wp.steer, wc.steer));
     wheelMeshes[i].rotateX(lerp(wp.spin, wc.spin));
+    _wheelLocals[i].copy(wheelMeshes[i].position);
+    car.worldToLocal(_wheelLocals[i]);
+  }
+  car.userData.updateSuspension?.(_wheelLocals);
+
+  const dtSec = dtMs * 0.001;
+  const idle = frozen || countdownMs > 0 || !started;
+  if (goLightUntil && now > goLightUntil && countdownMs <= 0) {
+    goLightUntil = 0;
+    ambience.userData.setStartLights?.(0, false);
   }
 
+  const rpmNow = sim.rpm();
+  const ffbNmNow = sim.ffbTorque();
+  const gForce = telemetry.sample({
+    state: curr,
+    throttle: lastThrottle,
+    brake: lastBrake,
+    steer: lastSteer,
+    ffbNm: ffbNmNow,
+    rpm: rpmNow ?? (900 + curr.speed * 260),
+    gear: sim.gear() ?? 1,
+    sim,
+    dtSec,
+    idle,
+    elapsedSec: ticks.length / 400,
+  });
+
+  // Live animated cockpit wheel, shift LEDs, driver helmet visibility & brake/rain light
+  car.userData.updateTelemetry?.({
+    steerAngle: lerp(prev.wheels[0].steer, curr.wheels[0].steer),
+    rpm: rpmNow ?? (900 + curr.speed * 260),
+    brake: lastBrake,
+    wetness: lighting.wetness,
+    timeSec: now * 0.001,
+    cameraMode,
+  });
+
   // Camera seats (C cycles) — all posed from the interpolated render state
-  // (car group position/quaternion), no extra physics reads.
+  // (car group position/quaternion) + subtle G-force head inertia, no physics coupling.
+  const gLatShift = Math.max(-0.22, Math.min(0.22, -gForce.latG * 0.065));
+  const gLonShift = Math.max(-0.18, Math.min(0.18, -gForce.lonG * 0.055));
   if (cameraMode === "chase") {
-    // Spring-damped chase (the default).
-    const behind = _camA.set(0, 3.2, -8.5).applyQuaternion(car.quaternion).add(car.position);
-    camPos.lerp(behind, 1 - Math.exp(-4 * (dtMs / 1000)));
+    const behind = _camA.set(gLatShift * 2.1, 3.15, -8.45 + gLonShift * 2.2)
+      .applyQuaternion(car.quaternion).add(car.position);
+    camPos.lerp(behind, 1 - Math.exp(-4.5 * dtSec));
     camera.position.copy(camPos);
     camTarget.lerp(car.position, 0.6);
-    camera.lookAt(camTarget.x, camTarget.y + 1.2, camTarget.z);
+    camera.lookAt(camTarget.x, camTarget.y + 1.15, camTarget.z);
   } else if (cameraMode === "cockpit") {
-    // Driver eye: looks forward through the halo, nose visible at frame bottom.
-    const eye = _camA.set(0, 0.95, 0.25).applyQuaternion(car.quaternion).add(car.position);
-    const ahead = _camB.set(0, 1.0, 30).applyQuaternion(car.quaternion).add(car.position);
+    // Driver eye: looks over the animated steering wheel & through the halo
+    const eye = _camA.set(gLatShift * 0.32, 0.94, 0.24 + gLonShift * 0.24)
+      .applyQuaternion(car.quaternion).add(car.position);
+    const ahead = _camB.set(gLatShift * 1.4, 0.96, 30)
+      .applyQuaternion(car.quaternion).add(car.position);
     camera.position.copy(eye);
     camera.lookAt(ahead);
     camPos.copy(eye);
   } else if (cameraMode === "bumper") {
-    // Nose level, no car in frame — the road rush sells speed.
     const nose = _camA.set(0, 0.35, 2.3).applyQuaternion(car.quaternion).add(car.position);
     const ahead = _camB.set(0, 0.45, 32).applyQuaternion(car.quaternion).add(car.position);
     camera.position.copy(nose);
     camera.lookAt(ahead);
     camPos.copy(nose);
   } else {
-    // TV: stand still on a trackside tripod and pan with the car; hand off to
-    // the next tripod once the car passes this one's track cross-section.
     if (tvIdx < 0) {
       let best = 0, bestD = Infinity;
       for (let i = 0; i < tvPoints.length; i++) {
@@ -970,33 +1049,39 @@ function frame(now) {
     camPos.copy(camera.position);
   }
 
-  // Per-seat lens: chase & bumper keep the speed-breathing FOV (62° at rest
-  // widening to 68° flat-out, ~200 km/h) so it reads as pace, never as a zoom
-  // cut; cockpit is a fixed wide 70°; TV is a 45° broadcast lens that squeezes
-  // toward 30° as the car runs away (slight tripod zoom). All exponentially
-  // smoothed; one uniform + matrix update, render cost ~zero.
+  // Per-seat lens: chase & bumper keep the speed-breathing FOV
   const fovTarget = cameraMode === "cockpit"
-    ? 70
+    ? 68 + 4 * Math.min(1, curr.speed / 65)
     : cameraMode === "tv"
       ? 45 - 15 * Math.min(1, Math.max(0, (camera.position.distanceTo(car.position) - 30) / 90))
-      : 62 + 6 * Math.min(1, curr.speed / 55);
-  fov += (fovTarget - fov) * (1 - Math.exp(-2.5 * (dtMs / 1000)));
+      : 62 + 8 * Math.min(1, curr.speed / 60);
+  fov += (fovTarget - fov) * (1 - Math.exp(-2.8 * dtSec));
   if (Math.abs(camera.fov - fov) > 0.005) {
     camera.fov = fov;
     camera.updateProjectionMatrix();
   }
 
-  crumple.update();  // settle crash dents (no-op when the car is undamaged)
-  lighting.update(); // condition blend + sky dome / shadow frustum follow the car
+  crumple.update();
+  lighting.update();
+  effects.update({
+    state: curr,
+    carGroup: car,
+    wheelMeshes,
+    camera,
+    dtSec,
+    brake: lastBrake,
+    offTrack: lastOffTrack,
+    wetness: lighting.wetness,
+    sim,
+    frozen: idle,
+  });
   renderer.render(scene, camera);
 
   // ---- side channels: audio + FFB (read-only on sim state)
-  // idle = post-lap freeze, countdown, or armed idle before the first gesture:
-  // engine settles to tickover instead of droning at its last pitch.
-  audio.update(curr, lastThrottle, sim, dtMs, frozen || countdownMs > 0 || !started);
+  audio.update(curr, lastThrottle, sim, dtMs, idle, lastOffTrack);
   if (ffb) {
-    const ffbFade = Math.min(1, Math.max(0, (curr.speed - 1.5) / 3)); // standstill fade
-    ffb.update(frozen || countdownMs > 0 ? 0 : sim.ffbTorque() * ffbFade, dtMs / 1000);
+    const ffbFade = Math.min(1, Math.max(0, (curr.speed - 1.5) / 3));
+    ffb.update(frozen || countdownMs > 0 ? 0 : ffbNmNow * ffbFade, dtSec);
     $("mFfb").value = ffb.smoothed / ffb.maxNm;
   }
 
@@ -1006,13 +1091,10 @@ function frame(now) {
   $("speed").textContent = Math.round(curr.speed * 3.6);
   $("bestVal").textContent = bestMs ? fmtMs(bestMs) : "—";
   $("lastVal").textContent = lastMs ? fmtMs(lastMs) : "—";
-  minimap.draw(car.position.toArray(), curr.checkpoints);
+  minimap.draw(car.position.toArray(), curr.checkpoints, ghostCar.visible ? ghostCar.position.toArray() : null);
+  telemetry.draw();
 
-  // Drivetrain readouts (ABI 1.4, DRIVETRAIN.md §6): gear numeral ('R' for
-  // reverse) beside the speed, thin RPM bar with its redline tick, cyan
-  // shift-light pulse ≥ 7200 rpm, and the quiet AUTO/MANUAL tag. sim.rpm()
-  // is null on pre-1.4 binaries — everything stays hidden.
-  const rpmNow = sim.rpm();
+  // Drivetrain readouts (ABI 1.4, DRIVETRAIN.md §6)
   if (rpmNow !== null) {
     if (!drivetrainHudOn) {
       drivetrainHudOn = true;
@@ -1067,8 +1149,22 @@ function frame(now) {
   if (ghost && !frozen && countdownMs <= 0 && curr.lapProgress > 0.01) {
     while (deltaPtr < ghost.lapTicks - 1 && ghost.progress[deltaPtr] < curr.lapProgress) deltaPtr++;
     const d = (ticks.length - deltaPtr) / 400;
+    const cls = d >= 0 ? "behind" : ghost === sessionGhost ? "ahead-session" : "ahead-pb";
     $("delta").textContent = `${d >= 0 ? "+" : "−"}${Math.abs(d).toFixed(2)}`;
-    $("delta").className = d >= 0 ? "behind" : ghost === sessionGhost ? "ahead-session" : "ahead-pb";
+    $("delta").className = cls;
+    const bar = $("deltaBar");
+    const fill = $("deltaBarFill");
+    bar.style.display = "block";
+    const frac = Math.min(1, Math.abs(d) / 2.0) * 50; // ±2.0 s = full half-bar
+    if (d < 0) {
+      fill.style.left = `${(50 - frac).toFixed(2)}%`;
+      fill.style.width = `${frac.toFixed(2)}%`;
+      fill.style.background = ghost === sessionGhost ? "var(--delta-session)" : "var(--delta-pb)";
+    } else {
+      fill.style.left = "50%";
+      fill.style.width = `${frac.toFixed(2)}%`;
+      fill.style.background = "var(--delta-off)";
+    }
   }
 
   if ($("config").style.display === "block") {
@@ -1099,6 +1195,10 @@ setStatus(
     ? "built for keyboard, gamepad or wheel — best on a computer"
     : "ready",
 );
+function frame(now) {
+  requestAnimationFrame(frame);
+  renderFrame(now);
+}
 requestAnimationFrame(frame);
 
 // Debug/test hook: lets automated checks pump physics when the tab is
@@ -1106,7 +1206,7 @@ requestAnimationFrame(frame);
 // players just pauses the run — the accumulator clamp prevents catch-up).
 window.__sttr = {
   advance,
-  renderOnce: () => frame(performance.now()),
+  renderOnce: () => renderFrame(performance.now()),
   skipCountdown: () => (countdownMs = 1),
   info: () => ({ ticks: ticks.length, frozen, invalid, started, countdownMs, speed: curr.speed, pos: curr.pos, quat: curr.quat, checkpoints: curr.checkpoints, lapProgress: curr.lapProgress, ghost: ghostCar.visible, camera: cameraMode, ffbNm: sim.ffbTorque(), rpm: sim.rpm(), gear: sim.gear(), shiftMode: shiftModeLabel() }),
   track: { center: track.center, tangent: track.tangent },
@@ -1118,6 +1218,9 @@ window.__sttr = {
   // {x:0,y:0,z:-1}); severity ≈ 0..1.5. resetCrumple restores pristine.
   applyImpact: (localDir, severity) => crumple.applyImpact(localDir, severity),
   resetCrumple: () => crumple.reset(),
+  setLighting: (mode) => { lighting.override = mode; lighting.update(); },
+  setCamera: (mode) => { if (CAMERA_SEATS.includes(mode)) { cameraMode = mode; tvIdx = -1; } },
+  setTelemetryVisible: (v) => { telemetry.visible = !v; telemetry.toggle(); },
   input,
   scene,
   FanatecFFB,
