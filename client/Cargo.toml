@@ -6,7 +6,7 @@ description = "Native Rust client for the serverless time-trial racing game: was
 
 [dependencies]
 # sim hosting
-wasmtime = "46"
+wasmtime = "48"
 
 # rendering
 wgpu = "25"
