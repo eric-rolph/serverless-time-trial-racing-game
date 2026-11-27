@@ -9,6 +9,9 @@ on:
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   sweep:
     runs-on: ubuntu-latest
